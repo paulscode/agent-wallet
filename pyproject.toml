@@ -68,7 +68,7 @@ dev = [
     # unpinned spec would let CI's `ruff format --check .` drift red whenever a
     # new ruff ships. Bump deliberately (reformat + re-verify) — see
     # .pre-commit-config.yaml, which must track this version.
-    "ruff==0.15.17",
+    "ruff==0.15.18",
     "fakeredis[lua]>=2.21.0",
     "pip-audit>=2.7.0",
     "grpcio-tools>=1.60,<2.0",
