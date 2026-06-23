@@ -31,7 +31,7 @@ dependencies = [
     "python-dotenv>=1.0.0,<2.0",
     "jinja2>=3.1.0,<4.0",
     "grpcio>=1.60,<2.0",
-    "protobuf>=4.25,<7.0",
+    "protobuf>=4.25,<8.0",
     "coincurve>=20,<22",
     "dnspython>=2.6,<3.0",
     # Liquid Confidential Transactions support (Liquid hop). Provides
