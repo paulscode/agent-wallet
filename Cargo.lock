@@ -671,9 +671,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-invoice"
-version = "0.34.0"
+version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b85e5e14bcdb30d746e9785b04f27938292e8944f78f26517e01e91691f6b3f2"
+checksum = "47d83bd798e04ab9eecc8bbef1fa17d3808859bcdc0406bd16c55d51c8834444"
 dependencies = [
  "bech32",
  "bitcoin",
