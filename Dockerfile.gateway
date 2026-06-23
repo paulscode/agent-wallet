@@ -8,7 +8,7 @@
 ## toolchain bloat / build-time secrets.
 
 # ─── Builder ─────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.96-slim-bookworm AS builder
 
 # protoc is required by tonic-build at compile time.
 RUN apt-get update \
