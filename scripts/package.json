@@ -14,6 +14,6 @@
     "ecpair": "2.1.0",
     "liquidjs-lib": "^6.0.2-liquid.37",
     "socks-proxy-agent": "8.0.4",
-    "tiny-secp256k1": "2.2.3"
+    "tiny-secp256k1": "2.2.4"
   }
 }
