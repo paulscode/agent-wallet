@@ -1,10 +1,10 @@
-FROM node:20-slim AS node-deps
+FROM node:26-slim AS node-deps
 WORKDIR /scripts
 COPY scripts/package.json scripts/package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci --production; else npm install --production; fi
 
 # Build Tailwind CSS at image build time
-FROM node:20-slim AS tailwind-build
+FROM node:26-slim AS tailwind-build
 WORKDIR /build
 RUN npm install -g tailwindcss@3
 COPY tailwind.config.js ./
