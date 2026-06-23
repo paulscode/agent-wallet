@@ -12,7 +12,7 @@ COPY app/dashboard/static/src/input.css ./app/dashboard/static/src/input.css
 COPY app/dashboard/templates/ ./app/dashboard/templates/
 RUN npx tailwindcss -i ./app/dashboard/static/src/input.css -o ./dashboard.min.css --minify
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
