@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anonymize — troubleshooting</title>
+<style>
+  /* Self-contained help page. Mirrors the dashboard's dark theme
+     without depending on Tailwind. Inline styles are allowed by the
+     /dashboard CSP via ``style-src 'self' 'unsafe-inline'``; no
+     scripts to keep this page CSP-clean and easy to audit. */
+  :root {
+    color-scheme: dark;
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --border: #334155;
+    --fg: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #60a5fa;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --ok: #4ade80;
+    --code-bg: #0b1220;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  main {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 4rem;
+  }
+  header.page {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  header.page h1 {
+    margin: 0;
+    font-size: 1.65rem;
+    font-weight: 600;
+  }
+  header.page p.sub {
+    margin: 0.35rem 0 0;
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+  h2 {
+    margin: 2rem 0 0.5rem;
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
+  h3 {
+    margin: 1.75rem 0 0.5rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--fg);
+    scroll-margin-top: 0.75rem;
+  }
+  h3 .reason {
+    margin-left: 0.4rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    color: var(--muted);
+    font-weight: 400;
+  }
+  p, ul, ol { margin: 0.5rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: 0.25rem 0; }
+  code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.88em;
+    color: #cbd5e1;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    margin: 1rem 0;
+  }
+  .panel.class-a { border-left: 3px solid var(--ok); }
+  .panel.class-b { border-left: 3px solid var(--warn); }
+  .panel.class-c { border-left: 3px solid var(--bad); }
+  .panel dl { margin: 0.25rem 0; }
+  .panel dt {
+    font-weight: 600;
+    color: var(--fg);
+    margin-top: 0.6rem;
+  }
+  .panel dt:first-child { margin-top: 0; }
+  .panel dd {
+    margin: 0.2rem 0 0;
+    padding-left: 0;
+    color: var(--muted);
+  }
+  .panel dd b { color: var(--fg); font-weight: 600; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .tag {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 9999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-left: 0.4rem;
+    vertical-align: 0.05em;
+  }
+  .tag.a { background: rgba(74, 222, 128, 0.18); color: #4ade80; }
+  .tag.b { background: rgba(251, 191, 36, 0.18); color: #fbbf24; }
+  .tag.c { background: rgba(248, 113, 113, 0.18); color: #f87171; }
+  nav.toc {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.9rem 1.1rem;
+    margin: 1rem 0 2rem;
+    font-size: 0.93rem;
+  }
+  nav.toc strong { display: block; margin-bottom: 0.4rem; font-size: 0.95rem; }
+  nav.toc ul { columns: 2; column-gap: 1.5rem; margin: 0.25rem 0 0; padding-left: 1.2rem; }
+  @media (max-width: 600px) { nav.toc ul { columns: 1; } }
+</style>
+</head>
+<body>
+<main>
+
+<header class="page">
+  <h1>Anonymize — troubleshooting</h1>
+  <p class="sub">
+    What each <code>awaiting_reconciliation</code> reason means, what's
+    happening to your funds, and what to do about it. This is the
+    dashboard-served mirror of the canonical
+    <a href="https://github.com/paulscode/agent-wallet/blob/main/docs/anonymize.md#troubleshooting">docs/anonymize.md</a>
+    troubleshooting section.
+  </p>
+</header>
+
+<nav class="toc" id="troubleshooting" aria-label="Per-reason index">
+  <strong>Per-reason index</strong>
+  <ul>
+    <li><a href="#trouble-mpp-k-floor-exhausted">Lightning routing failed</a> <span class="tag b">B</span></li>
+    <li><a href="#trouble-circuit-rebuild-throttled">Network throttled — retrying</a> <span class="tag a">A</span></li>
+    <li><a href="#trouble-bounded-retry-exhausted">Hit a snag</a> <span class="tag a">A</span></li>
+    <li><a href="#trouble-wall-clock-budget-exceeded">Session went stale</a> <span class="tag a">A</span></li>
+    <li><a href="#trouble-pipeline-schema-below-min-supported">Session schema too old</a> <span class="tag c">C</span></li>
+    <li><a href="#trouble-external-state-unknown">Can't reach operator</a> <span class="tag a">A</span></li>
+    <li><a href="#trouble-economy-feerate-unavailable">Can't read on-chain fees</a> <span class="tag a">A</span></li>
+    <li><a href="#trouble-stuck-htlc-alarm">Lightning payment stuck</a> <span class="tag b">B</span></li>
+    <li><a href="#trouble-claim-feerate-outlier">Operator changed fees</a> <span class="tag b">B</span></li>
+    <li><a href="#trouble-operator-signature-mismatch">Operator security check failed</a> <span class="tag c">C</span></li>
+    <li><a href="#trouble-claim-tx-validation-failed">Couldn't sign claim</a> <span class="tag c">C</span></li>
+    <li><a href="#trouble-clock-skew-exceeds-deadline-margin">Clock too far off</a> <span class="tag c">C</span></li>
+    <li><a href="#trouble-inbound-insufficient-at-lockup">Can't receive over Lightning</a> <span class="tag a">A</span></li>
+    <li><a href="#trouble-unknown">Unknown reason</a> <span class="tag c">C</span></li>
+  </ul>
+</nav>
+
+<h2>Class legend</h2>
+<p>
+  Each reason maps to a recovery class. <span class="tag a">A</span>
+  reasons are <b>transient</b> and the wallet auto-retries on a
+  backoff schedule. <span class="tag b">B</span> reasons get a small
+  bounded retry budget (3 attempts) before escalating, because they
+  carry funds-state implications. <span class="tag c">C</span>
+  reasons need operator action — the wallet refreshes the "last
+  seen" timestamp but doesn't retry.
+</p>
+
+<h2>Operator decision tree</h2>
+<ol>
+  <li>Open the row's <b>Details</b> disclosure on the dashboard. Note
+    the raw reason code and the pre-reconciliation status (<b>Was:</b>
+    line).</li>
+  <li>Find the per-reason block below.</li>
+  <li>Click <b>Try again</b> if the underlying condition has cleared.</li>
+  <li>Click <b>Refund</b> if funds are recoverable but the session
+    can't safely resume. Requires step-up nonce confirmation.</li>
+  <li>Click <b>Cancel</b> when no funds moved and you want to abandon.</li>
+  <li>Inspect the session's audit log
+    (<code>anonymize_session_event</code> rows) for the full sequence
+    of <code>reconciliation_attempt_*</code> /
+    <code>reconciliation_escalated</code> events.</li>
+</ol>
+
+<!-- ─────────────────────────────────────────────────────────── -->
+
+<h3 id="trouble-mpp-k-floor-exhausted">Lightning routing failed
+  <span class="tag b">B</span>
+  <span class="reason">mpp_k_floor_exhausted</span></h3>
+<div class="panel class-b">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The reverse-leg's Lightning payment couldn't find a route to
+      Boltz at any of the configured MPP K values. By default the
+      wallet tries K=4, K=3, K=2; all three failed with
+      <code>FAILURE_REASON_NO_ROUTE</code>.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Zero sats moved.</b> <code>NO_ROUTE</code> means LND
+      never committed an HTLC. Refunding isn't needed and isn't
+      offered.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Auto-retries up to 3 times on backoff. On exhaustion, escalates
+      to <code>failed</code>.</dd>
+
+    <dt>You can</dt>
+    <dd><b>Try again</b> if you've added outbound LN liquidity or
+      expect the routing landscape has changed. <b>Cancel</b> to
+      abandon (safe — no funds moved).</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Repeated <code>mpp_k_floor_exhausted</code> across many
+      sessions usually points to outbound-liquidity structure. Fix by
+      adding LN channels, rebalancing, or adding smaller values to
+      <code>ANONYMIZE_AMOUNT_BINS_SAT</code>.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-circuit-rebuild-throttled">Network throttled — retrying
+  <span class="tag a">A</span>
+  <span class="reason">circuit_rebuild_throttled</span></h3>
+<div class="panel class-a">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The Tor circuit-rebuild token bucket blocked another
+      attempt. The wallet rate-limits these to deny entry-guard
+      fingerprinting during operator outages.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Zero sats moved.</b> The throttle fires before any HTLC
+      could be committed.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Auto-retries every probe tick (default 5 min) until the bucket
+      refills. Typical recovery within ~60 min.</dd>
+
+    <dt>You can</dt>
+    <dd>Watch for the "Session resumed" toast — usually no action
+      needed. <b>Cancel</b> to abandon (safe).</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Repeated throttling across many sessions. Check Tor entry-guard
+      reachability, Boltz operator availability, or bump
+      <code>ANONYMIZE_CIRCUIT_REBUILD_TOKENS_PER_HOUR</code>.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-bounded-retry-exhausted">Hit a snag
+  <span class="tag a">A</span>
+  <span class="reason">bounded_retry_exhausted</span></h3>
+<div class="panel class-a">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The per-session loop's tick handler raised an exception too
+      many times in a row (bounded-retry counter). The wallet
+      routes the session to reconciliation rather than hammering a
+      wedged dependency.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Zero sats moved at the threshold.</b> The counter only
+      increments on exceptions before any fund-moving step, so by
+      construction this is pre-payment.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Auto-retries until the underlying exception clears (typically
+      a transient dependency: DB, LND REST, Tor circuit).</dd>
+
+    <dt>You can</dt>
+    <dd><b>Try again</b> to force a fresh attempt. <b>Cancel</b> to
+      abandon (safe).</dd>
+
+    <dt>Escalate when</dt>
+    <dd>The same session repeatedly lands here. Inspect the
+      container logs around the session id for the underlying
+      exception. Likely: LND connectivity drift, DB lock contention,
+      or an orchestrator bug.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-wall-clock-budget-exceeded">Session went stale
+  <span class="tag a">A</span>
+  <span class="reason">wall_clock_budget_exceeded</span></h3>
+<div class="panel class-a">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The wedge detector noticed a non-terminal row whose
+      <code>updated_at</code> is older than
+      <code>ANONYMIZE_RECONCILIATION_RUNTIME_WALL_CLOCK_BUDGET_S</code>
+      (default 4 h). Catches sessions that wedged in an active
+      status without self-reporting a failure.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Depends on pre-status.</b> Open Details and read the
+      <b>Was:</b> line:
+      <ul>
+        <li><b>sending to your address</b> (<code>exiting</code>) —
+          may be in flight; Refund available.</li>
+        <li><b>mixing</b> (<code>hopping</code>) — may be in flight;
+          Refund available.</li>
+        <li><b>received funding</b> or earlier — no funds moved.</li>
+      </ul>
+    </dd>
+
+    <dt>Wallet does</dt>
+    <dd>Auto-retries the resume path on backoff.</dd>
+
+    <dt>You can</dt>
+    <dd>Wait for auto-retry (countdown on the row). <b>Refund</b>
+      if pre-status indicates funds in flight. <b>Cancel</b> if
+      pre-payment.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Sessions repeatedly time out at this stage — likely an
+      orchestrator bug where a hop body returns from a tick without
+      forward progress.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-pipeline-schema-below-min-supported">Session schema too old
+  <span class="tag c">C</span>
+  <span class="reason">pipeline_schema_below_min_supported</span></h3>
+<div class="panel class-c">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The session row was created under an older wallet version
+      whose <code>pipeline_json</code> shape the running code no
+      longer executes. The schema-version gate refuses to
+      drive forward.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Depends on pre-status</b> — same heuristic as
+      <a href="#trouble-wall-clock-budget-exceeded">wall_clock_budget_exceeded</a>.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>No automated retry. The row stays parked indefinitely.</dd>
+
+    <dt>You can</dt>
+    <dd><b>Mark done</b> if pre-status is pre-payment. <b>Refund</b>
+      if pre-status indicates funds in flight.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>A wallet upgrade has bumped
+      <code>ANONYMIZE_MIN_SUPPORTED_PIPELINE_SCHEMA_VERSION</code>
+      past in-flight session schemas. Usually the right action is
+      refund every affected session, then start fresh.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-external-state-unknown">Can't reach operator
+  <span class="tag a">A</span>
+  <span class="reason">external_state_unknown</span></h3>
+<div class="panel class-a">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The wallet couldn't query Boltz (or the chain backend) for
+      the session's external state. Common causes: Boltz onion
+      endpoint is down, Tor circuit churn, deep chain-backend lag.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>May be in flight.</b> Boltz may already be holding LN
+      funds or have published the on-chain claim. Until the
+      external state can be queried, the wallet doesn't know.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Auto-retries via the polling cadence + circuit-rebuild
+      path.</dd>
+
+    <dt>You can</dt>
+    <dd>Wait — most outages recover within minutes.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Class A budget exhausts → wallet escalates to
+      <code>failed</code>. At that point: verify Boltz reachability,
+      check the operator-registry signature, reconcile from Boltz's
+      database manually if needed.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-economy-feerate-unavailable">Can't read on-chain fees
+  <span class="tag a">A</span>
+  <span class="reason">economy_feerate_unavailable</span></h3>
+<div class="panel class-a">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The feerate sanity gate couldn't get a fresh
+      <code>economy</code> feerate from the chain backend after two
+      attempts. The wallet refuses to claim against an outlier fee.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>In flight.</b> The reverse swap's LN side may already
+      be paid. The claim is paused.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Auto-retries the feerate probe.</dd>
+
+    <dt>You can</dt>
+    <dd>Wait — usually resolves within one probe tick. <b>Refund</b>
+      if the swap's <code>timeout_block_height</code> is approaching.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Chain backend (electrs / mempool HTTP) is persistently failing.
+      Inspect the <code>chain_poll</code> recurring task's health.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-stuck-htlc-alarm">Lightning payment stuck
+  <span class="tag b">B</span>
+  <span class="reason">stuck_htlc_alarm</span></h3>
+<div class="panel class-b">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The stuck-HTLC alarm fired — your reverse-leg LN
+      payment has been in-flight at LND for longer than the
+      documented threshold without settling or failing.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>In flight on Lightning.</b> LND holds the HTLC; Boltz
+      hasn't received the preimage yet.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Bounded auto-retry by re-polling LN payment state.</dd>
+
+    <dt>You can</dt>
+    <dd>Wait — most stuck HTLCs settle or fail within the channel's
+      CLTV expiry window. <b>Refund</b> if you don't want to wait
+      (LN fees already paid are not recoverable).</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Repeated stuck-HTLC alarms across sessions point to a
+      routing peer that's accepting HTLCs but not forwarding them
+      — consider adding that peer to
+      <code>ANONYMIZE_AUTO_BLOCKLIST_TOP_N_PEERS</code>.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-claim-feerate-outlier">Operator changed fees
+  <span class="tag b">B</span>
+  <span class="reason">claim_feerate_outlier</span></h3>
+<div class="panel class-b">
+  <dl>
+    <dt>What it means</dt>
+    <dd>Boltz returned a claim feerate outside the configured
+      tolerance band relative to the wallet's live economy estimate.
+      The wallet refuses to claim at that feerate.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>In flight at the operator.</b> The
+      <code>ANONYMIZE_CLAIM_FEERATE_OUTLIER_GRACE_S</code> grace
+      window allows re-quoting before escalating to refund.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Bounded auto-retry by re-requesting a fresh quote. On grace
+      exhaustion, escalates to <code>refunding</code>.</dd>
+
+    <dt>You can</dt>
+    <dd>Wait. <b>Refund</b> to take the on-chain refund path
+      immediately.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Repeated outlier feerates from one operator mark them
+      <code>degraded_operator</code>. Consider removing them from
+      your operator pair set.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-operator-signature-mismatch">Operator security check failed
+  <span class="tag c">C</span>
+  <span class="reason">operator_signature_mismatch</span></h3>
+<div class="panel class-c">
+  <dl>
+    <dt>What it means</dt>
+    <dd>A response from a Boltz operator failed the signature
+      check against the registry's pinned public key. <b>This is a
+      security-critical event</b> — either the operator rotated keys
+      without coordinating a registry update OR the response was
+      tampered with in transit.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>In flight.</b> Boltz has your LN payment; the wallet is
+      refusing to act on the operator's claim response.</dd>
+
+    <dt>Wallet does</dt>
+    <dd><b>No automated retry.</b> Retrying would mask an active
+      attack.</dd>
+
+    <dt>You can</dt>
+    <dd><b>Refund</b> — recommended. The on-chain refund path uses
+      the swap's locally-held <code>refund_private_key</code>, not
+      the operator's signature, so it's safe even if the operator
+      key is compromised.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Always. Check for a recent operator-key rotation
+      announcement; if none, treat as a potential incident.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-claim-tx-validation-failed">Couldn't sign claim
+  <span class="tag c">C</span>
+  <span class="reason">claim_tx_validation_failed</span></h3>
+<div class="panel class-c">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The cooperative-claim Musig2 ceremony produced a transaction
+      that failed the wallet's local validation gate. The wallet
+      refuses to broadcast it.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>In flight.</b> Boltz has your LN payment; the on-chain
+      claim hasn't broadcast.</dd>
+
+    <dt>Wallet does</dt>
+    <dd><b>No automated retry.</b> Re-running the same Musig2 ceremony
+      with the same inputs would produce the same outcome.</dd>
+
+    <dt>You can</dt>
+    <dd><b>Refund</b> — recommended. The refund path bypasses
+      Musig2 entirely.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Always. Capture the redacted <code>last_error</code> from
+      the Details panel before clicking Refund.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-clock-skew-exceeds-deadline-margin">Clock too far off
+  <span class="tag c">C</span>
+  <span class="reason">clock_skew_exceeds_deadline_margin</span></h3>
+<div class="panel class-c">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The clock-skew gate refuses to drive forward because the
+      host's clock has drifted past the safe deadline margin.
+      Allowing the session to continue would risk broadcasting a
+      claim after the swap's <code>timeout_block_height</code>.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>In flight.</b> Boltz has your LN payment.</dd>
+
+    <dt>Wallet does</dt>
+    <dd><b>No automated retry</b> until the operator confirms the
+      clock is correct.</dd>
+
+    <dt>You can</dt>
+    <dd>Verify the host's chrony / NTP status; after the clock
+      catches up, click <b>Try again</b>. <b>Refund</b> if the clock
+      issue can't be resolved before the swap timeout.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>The clock has been corrected but the session won't resume —
+      the wallet may need a process restart for the clock-skew
+      probe to re-measure.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-inbound-insufficient-at-lockup">Can't receive over Lightning
+  <span class="tag a">A</span>
+  <span class="reason">inbound_insufficient_at_lockup</span></h3>
+<div class="panel class-a">
+  <dl>
+    <dt>What it means</dt>
+    <dd>This is an on-chain-sourced session. To convert your on-chain
+      funds to Lightning it uses a submarine swap, which requires your
+      node to <b>receive</b> the amount over Lightning from the swap
+      provider. Just before locking the funds on-chain, the wallet
+      re-checked your inbound capacity and found it can no longer cover
+      the amount (inbound that was sufficient when you started the
+      session has since dropped). It aborted <b>before</b> moving any
+      funds.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Safe — nothing moved.</b> The check fires before the on-chain
+      lockup broadcast, so no coins left your wallet.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Routes the session to reconciliation. Because there's no
+      automatic way to resume an on-chain funding step, the recovery
+      probe escalates the row to <b>Failed</b> rather than retrying.</dd>
+
+    <dt>You can</dt>
+    <dd><b>Cancel</b> right away (no funds moved), then start a new
+      session once you have more inbound capacity — e.g. after a
+      pending channel confirms or a rebalance lands. Alternatively use
+      a Lightning source, which needs no inbound.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>You believe you do have ample inbound — check that your channels
+      are active and not fully depleted on the receive side.</dd>
+  </dl>
+</div>
+
+<h3 id="trouble-unknown">Unknown reason
+  <span class="tag c">C</span>
+  <span class="reason">unrecognised</span></h3>
+<div class="panel class-c">
+  <dl>
+    <dt>What it means</dt>
+    <dd>The reason code on the row isn't in the classifier's known
+      set. The wallet treats unknown reasons as Class C so a new
+      bug-driven reason can't silently retry into a tight loop.</dd>
+
+    <dt>Funds</dt>
+    <dd><b>Status unknown.</b> Open the Details panel for the raw
+      reason string, pre-reconciliation status, and redacted
+      <code>last_error</code>. The combination usually tells you
+      whether funds moved.</dd>
+
+    <dt>Wallet does</dt>
+    <dd>Refresh "last seen" on each probe tick but no automated
+      retry.</dd>
+
+    <dt>You can</dt>
+    <dd><b>Try again</b> if the audit log convinces you the reason is
+      transient. <b>Refund</b> if pre-status indicates funds in
+      flight. <b>Stop trying</b> to mark <code>failed</code> once
+      you've decided.</dd>
+
+    <dt>Escalate when</dt>
+    <dd>Always — this means either a wallet upgrade introduced a
+      reason without updating the classifier, OR the row's reason
+      column was set by a code path that bypassed the helper. Open
+      an issue with the reason string + audit log.</dd>
+  </dl>
+</div>
+
+</main>
+</body>
+</html>

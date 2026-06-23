@@ -1,0 +1,19 @@
+{
+  "name": "agent-wallet-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Boltz Taproot Musig2 claim transaction scripts",
+  "scripts": {
+    "claim": "node boltz_claim.js",
+    "claim-liquid": "node boltz_claim_liquid.js",
+    "lock-liquid": "node boltz_lock_liquid.js"
+  },
+  "dependencies": {
+    "bitcoinjs-lib": "6.1.6",
+    "boltz-core": "3.1.2",
+    "ecpair": "2.1.0",
+    "liquidjs-lib": "^6.0.2-liquid.37",
+    "socks-proxy-agent": "8.0.4",
+    "tiny-secp256k1": "2.2.3"
+  }
+}

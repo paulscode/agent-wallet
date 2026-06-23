@@ -1,0 +1,41 @@
+{
+  "_comment": "Sample payload from LND v2 WalletKit ListUnspent (regtest). Schema mirrors what app.services.lnd_service.list_unspent emits to consumers (a list of normalised utxo dicts).",
+  "utxos": [
+    {
+      "address_type": "WITNESS_PUBKEY_HASH",
+      "address": "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+      "amount_sat": "100000",
+      "pk_script": "0014751e76e8199196d454941c45d1b3a323f1433bd6",
+      "outpoint": {
+        "txid_bytes": "",
+        "txid_str": "5fd986cf7c0a85b8a44e57bb02b14ed72de0d0ad14d68dba6e75d3f0bcae74a3",
+        "output_index": 0
+      },
+      "confirmations": "12"
+    },
+    {
+      "address_type": "TAPROOT_PUBKEY",
+      "address": "bcrt1pq6qy9pwjf2k4y2v3kpckg5xx5y9q0x2sxlhn03n5wru0lazvzlks5khpvc",
+      "amount_sat": "250000",
+      "pk_script": "5120068104a1d24aad522994d83b22a18d50940f329037ef37c674e0f8ffe8982fda",
+      "outpoint": {
+        "txid_bytes": "",
+        "txid_str": "8a7e3e1f6c0b6b67e7b4b1d2c3f1a2e3d4c5b6a798877665544332211ffeeddc",
+        "output_index": 1
+      },
+      "confirmations": "3"
+    },
+    {
+      "address_type": "WITNESS_PUBKEY_HASH",
+      "address": "bcrt1qabc0wszr53cncn4dna5gd4y9hsqpgcyxlqz25k",
+      "amount_sat": "5000",
+      "pk_script": "0014eb87f7405d23b8f13ab67d2886a90b7800a304c3",
+      "outpoint": {
+        "txid_bytes": "",
+        "txid_str": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        "output_index": 0
+      },
+      "confirmations": "0"
+    }
+  ]
+}

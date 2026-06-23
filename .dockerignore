@@ -1,0 +1,52 @@
+# SECURITY: keep secrets and local artifacts out of image layers.
+# `COPY . .` in the Dockerfile would otherwise bake the build context
+# (including a populated .env with SECRET_KEY, LND macaroon, DB/Redis
+# passwords, gateway token) into a root-owned layer, bypassing on-disk
+# 0600 perms. See internal_docs/security_review_2026-06-20_remediation_plan.md (H4).
+
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.macaroon
+*.key
+*.pem
+*.crt
+*-backup-*.txt
+secrets/
+tor-proxy/*.cookie
+
+# VCS / history
+.git
+.gitignore
+.git-blame-ignore-revs
+
+# Local / internal planning + references (never shipped)
+internal_docs/
+references/
+builds/
+
+# Rust build output (not needed in the Python app image). Cargo.lock is NOT
+# ignored — Dockerfile.gateway needs it for a reproducible gateway build, and the
+# Python app image never COPYs it (so it costs nothing there).
+target/
+
+# Python / build caches
+agent_wallet.egg-info/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Node
+scripts/node_modules/
+node_modules/
+
+# Logs / scratch
+*.log
+*.tmp

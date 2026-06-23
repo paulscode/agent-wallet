@@ -1,0 +1,297 @@
+// BOLT 12 onion-message gateway service contract.
+//
+// This is the *only* RPC surface between the Python orchestration layer
+// (`app/services/bolt12/`) and the Rust gateway daemon
+// (`bolt12-gateway/`). The gateway has no knowledge of BOLT 12 itself —
+// it deals exclusively in raw onion-message bytes and Lightning peer
+// management. All BOLT 12 codec / signature / orchestration logic lives
+// on the Python side.
+//
+// Versioning: every breaking change MUST bump the package name suffix
+// (e.g. `bolt12_gateway.v1` → `bolt12_gateway.v2`) so older clients
+// keep working through one deploy cycle.
+
+syntax = "proto3";
+
+package bolt12_gateway.v1;
+
+// ─── Service ───────────────────────────────────────────────────────
+
+service Bolt12Gateway {
+  // Returns identity + peer state. Cheap; safe to poll for health.
+  rpc GetIdentity(GetIdentityRequest) returns (GetIdentityResponse);
+
+  // Send a single onion message. Returns once the message is enqueued
+  // for the relevant outbound peer; delivery is best-effort thereafter.
+  rpc SendOnionMessage(SendOnionMessageRequest)
+      returns (SendOnionMessageResponse);
+
+  // Server-streaming RPC: every inbound onion message addressed to
+  // *this* gateway (i.e. the receive end of one of our blinded paths)
+  // is pushed to the subscriber. Multiple subscribers fan-out is
+  // explicitly NOT supported in v1 — only the single Python service
+  // process is expected to consume.
+  rpc StreamInbound(StreamInboundRequest) returns (stream InboundOnionMessage);
+
+  // Construct a blinded *message* path that terminates at this
+  // gateway, intended for inclusion in an offer's `offer_paths` or an
+  // invreq's `reply_path`. The caller specifies one or more public
+  // introduction-node candidates; the gateway picks one we're peered
+  // with and builds the path. The blinded-path bytes are returned
+  // ready to drop into a TLV.
+  rpc CreateBlindedPath(CreateBlindedPathRequest)
+      returns (CreateBlindedPathResponse);
+
+  // Connect to a peer. Used to establish onion-message routing peers.
+  // Idempotent.
+  rpc ConnectPeer(ConnectPeerRequest) returns (ConnectPeerResponse);
+
+  // Replace the gateway's "sticky peer" set. Sticky peers are the
+  // ones the gateway's on-disconnect handler will redial automatically
+  // with exponential backoff. Callers MUST push the full desired set
+  // on every call (REPLACE semantics, not add/remove) — that keeps
+  // the contract idempotent across gateway restarts: the wallet's
+  // periodic re-peer task re-pushes the current set, so a gateway
+  // that lost its in-memory cache rebuilds on the next push.
+  //
+  // Idempotent + crash-safe. The gateway treats this as advisory:
+  // it will still serve ConnectPeer calls for non-sticky peers, and
+  // sticky peers stay in the set until explicitly replaced.
+  rpc SetStickyPeers(SetStickyPeersRequest) returns (SetStickyPeersResponse);
+
+  // Push the known-peer address cache the gateway consults when LDK
+  // fires ``Event::ConnectionNeeded`` (outbound onion message
+  // buffered waiting for a peer we're not yet connected to) and
+  // neither the event hint nor the gateway's in-memory NetworkGraph
+  // has an address for the requested pubkey.
+  //
+  // The gateway's LDK NetworkGraph is intentionally empty (the
+  // ``route_handler`` is ``IgnoringMessageHandler`` — we don't
+  // consume gossip to keep the gateway's memory footprint small),
+  // so without this cache the gateway has no way to dial a peer
+  // it hasn't been told about. The wallet's LND DOES sync gossip;
+  // this RPC bridges that knowledge to the gateway.
+  //
+  // REPLACE semantics: each call overwrites the entire cache. The
+  // caller's freshness/staleness policy is authoritative — the
+  // gateway has no built-in periodic prune beyond the per-entry TTL
+  // enforced on lookup. Callers SHOULD push periodically (default
+  // 1 h) so that addresses retired from LND's graph age out of the
+  // gateway's cache too.
+  rpc SetKnownNodeAddresses(stream NodeAddresses)
+      returns (SetKnownNodeAddressesResponse);
+}
+
+// ─── Identity ──────────────────────────────────────────────────────
+
+message GetIdentityRequest {}
+
+message GetIdentityResponse {
+  // Compressed secp256k1 public key (33 bytes) — the gateway's
+  // node-id, also used as the BOLT 12 offer-issuer key.
+  bytes node_id = 1;
+
+  // Number of currently-connected peers. Useful for "is the gateway
+  // healthy?" decisions on the Python side.
+  uint32 connected_peers = 2;
+
+  // Per-peer detail. Order is not stable; treat as a set keyed on
+  // node_id.
+  repeated PeerInfo peers = 3;
+
+  // Gateway daemon version string (semver).
+  string version = 4;
+
+  // Bitcoin network the gateway is configured for. One of:
+  // "mainnet", "testnet", "signet", "regtest". The wallet refuses
+  // to start when this disagrees with its own BITCOIN_NETWORK
+  // setting — a mismatch would cause the wallet to mint offers
+  // tagged for the wrong chain.
+  string network = 5;
+}
+
+message PeerInfo {
+  bytes node_id = 1;
+  string address = 2;          // "host:port" or ".onion:port"
+  bool inbound = 3;             // false = we connected outbound
+  bool advertises_onion_messages = 4;  // bit 38 or 39 in init features
+}
+
+// ─── Send onion message ────────────────────────────────────────────
+
+message SendOnionMessageRequest {
+  // Exactly one of these two destinations must be set.
+  oneof destination {
+    // Direct: deliver to this node-id (must be a connected peer or a
+    // peer we can connect to).
+    bytes direct_node_id = 1;
+
+    // Blinded: a serialized BlindedMessagePath as it appears in a
+    // BOLT 12 invreq's `reply_path` or an offer's `offer_paths`.
+    BlindedMessagePathBytes blinded_path = 2;
+  }
+
+  // Optional reply path the recipient may use to respond. Format is
+  // the same as `blinded_path` above.
+  BlindedMessagePathBytes reply_path = 3;
+
+  // The TLV-stream payload of the onion message (BOLT 12
+  // `invoice_request` or `invoice` bytes). The gateway treats this as
+  // opaque — it does not parse or validate.
+  bytes payload = 4;
+
+  // BOLT 4 `tlv_type` of the inner message (e.g. 64 for invreq, 66
+  // for invoice — see BOLT 12 §Onion Messaging Formats).
+  uint64 payload_tlv_type = 5;
+}
+
+message SendOnionMessageResponse {
+  // Hex-encoded internal correlation id, surfaced for log tracing.
+  // Has no protocol significance.
+  string send_id = 1;
+}
+
+// ─── Inbound stream ────────────────────────────────────────────────
+
+message StreamInboundRequest {
+  // Reserved for future filters (e.g. only invreqs vs only invoices).
+  // Empty in v1; gateway delivers everything.
+}
+
+message InboundOnionMessage {
+  // Per-message correlation id (hex), unique within the gateway
+  // process lifetime. Useful for de-dup on the consumer side if the
+  // stream reconnects.
+  string recv_id = 1;
+
+  // BOLT 4 inner-TLV type (64 = invreq, 66 = invoice, …).
+  uint64 payload_tlv_type = 2;
+
+  // Decrypted innermost TLV payload — opaque to the gateway.
+  bytes payload = 3;
+
+  // If the sender included a reply_path, it's surfaced here so the
+  // consumer can reply via SendOnionMessage(reply_path=...).
+  BlindedMessagePathBytes reply_path = 4;
+
+  // Unix-epoch milliseconds of receipt at the gateway.
+  int64 received_at_ms = 5;
+
+  // Echoes back the `context` bytes the consumer attached when it
+  // built the blinded path this message arrived along (via
+  // CreateBlindedPath). Empty if the message arrived directly (not
+  // via one of our blinded paths). The consumer uses this to
+  // correlate replies to outstanding sender-flow requests without
+  // having to parse the BOLT 12 payload.
+  bytes inbound_context = 6;
+
+  // Liveness heartbeat marker. When true this is NOT a real onion
+  // message — it's a periodic keepalive the gateway emits on a fixed
+  // interval while the inbound stream is otherwise idle. All other
+  // fields are unset and MUST be ignored. Its sole purpose is to let
+  // the consumer's inbound-idle watchdog distinguish a healthy-but-
+  // quiet stream from a wedged one without having to wait for a real
+  // onion message (which can be arbitrarily far apart). Consumers MUST
+  // drop heartbeats before dispatch; older consumers that don't know
+  // the field still see a message with an unrecognised tlv_type (0)
+  // and drop it, so adding this is wire-compatible.
+  bool heartbeat = 7;
+}
+
+// ─── Blinded path construction ─────────────────────────────────────
+
+message CreateBlindedPathRequest {
+  // Public introduction-node candidates (33-byte compressed pubkeys).
+  // The gateway picks the first that we're already peered with; if
+  // none, fails with FAILED_PRECONDITION.
+  repeated bytes introduction_node_candidates = 1;
+
+  // Number of intermediate dummy hops to add for privacy padding
+  // (BOLT 4 / 12). 0 ≤ n ≤ 7. Defaults to 2 if zero.
+  uint32 dummy_hops = 2;
+
+  // Optional opaque context bytes that will be encrypted into the
+  // final hop — the gateway returns these to us via
+  // `InboundOnionMessage.payload` aux fields when a message arrives
+  // along this path. Used by Python to correlate replies with
+  // outstanding invreq state. ≤ 256 bytes.
+  bytes context = 3;
+}
+
+message CreateBlindedPathResponse {
+  // Serialized blinded path ready for embedding in BOLT 12 TLVs.
+  BlindedMessagePathBytes path = 1;
+}
+
+message BlindedMessagePathBytes {
+  // Serialization is exactly the on-wire BOLT 12 representation of a
+  // `blinded_path` (first_node_id + first_path_key + num_hops +
+  // hops[]) so the consumer can drop these bytes into a TLV value
+  // unchanged.
+  bytes serialized = 1;
+}
+
+// ─── Peer management ───────────────────────────────────────────────
+
+message ConnectPeerRequest {
+  // 33-byte compressed pubkey.
+  bytes node_id = 1;
+  // "host:port" or ".onion:port".
+  string address = 2;
+}
+
+message ConnectPeerResponse {
+  bool already_connected = 1;
+}
+
+// A peer the gateway should auto-redial on disconnect. Mirrors the
+// (node_id, address) shape of ConnectPeerRequest so the gateway can
+// treat the dial codepath uniformly.
+message StickyPeer {
+  bytes node_id = 1;
+  string address = 2;
+}
+
+message SetStickyPeersRequest {
+  // The full desired sticky set. REPLACE semantics — peers absent
+  // from this list are removed from the gateway's sticky set on the
+  // next reconnect attempt (no immediate disconnect; existing
+  // connections stay up until they drop naturally).
+  repeated StickyPeer peers = 1;
+}
+
+message SetStickyPeersResponse {
+  // Number of peers in the sticky set after this call. Echoed back
+  // for log/diagnostic confirmation.
+  uint32 sticky_count = 1;
+}
+
+// ─── Known-peer address cache ──────────────────────────────────────
+
+// One entry in the cache the gateway consults from its
+// ``ConnectionNeeded`` handler. Pushed by the wallet from the LND
+// ``DescribeGraph`` view.
+message NodeAddresses {
+  // 33-byte compressed pubkey.
+  bytes node_id = 1;
+  // Dial-strings (LDK ``SocketAddress::Display`` shape: ``host:port``
+  // or ``<onion>.onion:port``). Order is preserved on the gateway
+  // side; ``try_addresses`` walks in order and stops at the first
+  // success, so a sender SHOULD list the preferred address first
+  // (typically the .onion if SOCKS5 is configured, then clearnet
+  // as fallback).
+  repeated string addresses = 2;
+  // The ``node_announcement.timestamp`` LND has for this peer (unix
+  // seconds). The gateway evicts entries whose timestamp is older
+  // than ``CACHE_TTL`` on lookup, so a peer that stopped gossiping
+  // ages out even if the wallet's push includes it from a stale LND
+  // graph row.
+  uint32 node_announcement_timestamp = 3;
+}
+
+message SetKnownNodeAddressesResponse {
+  // Number of cache entries the gateway accepted (one per
+  // ``NodeAddresses`` message in the stream). Returned so the
+  // caller can confirm the push landed end-to-end.
+  uint32 accepted_count = 1;
+}

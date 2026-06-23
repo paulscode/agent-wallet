@@ -1,0 +1,287 @@
+# Liquid hop overlay.
+#
+# Adds an Elements daemon + electrs-liquid indexer for the
+# Liquid hop's chain access. The wallet talks to `electrs-liquid`
+# over the internal Docker network at `electrs-liquid:50001`
+# (Electrum JSON-RPC); operators who want external-host deployment
+# expose `electrs-liquid` separately and configure the wallet's
+# ANONYMIZE_LIQUID_ELECTRUM_URL accordingly.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.liquid.yml up
+#
+# The federation-trust posture is documented in docs/anonymize.md
+#. Operator must commit to running Liquid infrastructure
+# alongside the wallet — this overlay automates the deployment but
+# does not change the trust model.
+
+services:
+  # ─── Elements daemon (Liquid chain backend) ─────────────────────
+  elementsd:
+    image: blockstream/elementsd:23.3.3
+    restart: unless-stopped
+    # The daemon authenticates with a salted-hash rpcauth line
+    # (user:salt$hmac) rather than the cleartext password, so no secret
+    # appears in /proc/<pid>/cmdline or `docker inspect`. The mounted
+    # conf stays secret-free and the rpcallowip CIDR is narrowed to the
+    # overlay's compose subnet on the command line. start.sh derives
+    # ELEMENTSD_RPC_AUTH from the user/password and refuses to boot the
+    # overlay if ELEMENTSD_RPC_USER/PASSWORD are missing or match the
+    # legacy placeholder. RPC clients (electrs, the wallet, the
+    # healthcheck) present the cleartext user/password, which the
+    # rpcauth hash validates.
+    #
+    # ELEMENTSD_RPC_AUTH is expanded by the container shell (note the
+    # $$ escape) rather than by Compose, because its value contains a
+    # literal `$` between salt and hash. The shell does not re-expand
+    # the result of that expansion, so the `$hmac` portion is preserved
+    # verbatim.
+    environment:
+      - ELEMENTSD_RPC_USER
+      - ELEMENTSD_RPC_PASSWORD
+      - ELEMENTSD_RPC_AUTH
+      - ELEMENTSD_RPC_ALLOW_CIDR
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        elementsd \
+          -rpcauth="$${ELEMENTSD_RPC_AUTH:?ELEMENTSD_RPC_AUTH must be set}" \
+          -rpcallowip=${ELEMENTSD_RPC_ALLOW_CIDR:-172.16.0.0/12} &
+        pid=$$!
+        # Wait for datadir to be created, then fix permissions
+        while [ ! -d /root/.elements/liquidv1/blocks ]; do sleep 1; done
+        chmod -R a+rx /root/.elements/liquidv1
+        chmod -R a+r /root/.elements/liquidv1/blocks /root/.elements/liquidv1/chainstate
+        wait $$pid
+    volumes:
+      # The blockstream/elementsd:23.3.x image runs as root with
+      # HOME=/root, so the daemon's default datadir is
+      # /root/.elements. Mount the named volume + conf there so
+      # chain state actually persists across container restarts
+      # and the conf is read (mounting at /home/elements/.elements
+      # is a silent no-op — the daemon never looks there).
+      - elementsd_data:/root/.elements
+      - ./liquid-overlay/elementsd.conf:/root/.elements/elements.conf:ro
+    # P2P routed through Tor (no direct internet
+    # connections from the wallet host's IP for Liquid).
+    depends_on:
+      tor-proxy:
+        condition: service_healthy
+    # Expose RPC + ZMQ on the internal network only — never on the
+    # host. The electrs-liquid container reaches it at elementsd:7041.
+    expose:
+      - "7041"   # mainnet RPC (testnet=18891, regtest=18884)
+    healthcheck:
+      # elementsd authenticates via -rpcauth, which disables cookie
+      # auth \u2014 so elements-cli must present the matching cleartext
+      # user/password. We pass them via the same env vars the rpcauth
+      # line was derived from.
+      test: ["CMD-SHELL", "elements-cli -rpcuser=$$ELEMENTSD_RPC_USER -rpcpassword=$$ELEMENTSD_RPC_PASSWORD getblockchaininfo > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      # Generous start_period: on a cold start with an existing
+      # data directory, elementsd replays the block index from
+      # disk before opening the RPC port. On Liquid mainnet this
+      # routinely takes 5-10 minutes once IBD has accumulated a
+      # few GB. The container is "starting" (not "unhealthy")
+      # during this window and dependents wait correctly.
+      start_period: 30m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          # elementsd holds the full Liquid block index in memory —
+          # ~3.9M dynafed headers, each far larger than Bitcoin's
+          # 80-byte header. This is a ~9.6 GiB resident floor at the
+          # tip, present in steady state (not just an IBD transient),
+          # independent of the electrs indexer. dbcache and mempool
+          # add on top during sync.
+          #
+          # 12G leaves headroom over the ~9.6 GiB floor for the coin
+          # cache during initial sync and multi-day catch-up. A tighter
+          # cap sits right on the floor and thrashes against the limit
+          # while catching up.
+          #
+          # This floor is now the dominant memory cost of the local
+          # Liquid stack — the electrs indexer below is slimmed to
+          # ~2 GiB, but reducing elementsd's footprint would require
+          # patching Elements Core itself.
+          memory: 12G
+          cpus: "2.0"
+
+  # ─── electrs-liquid (Electrum JSON-RPC indexer) ─────────────────
+  # Builds from Blockstream/electrs with --features liquid; binds
+  # the Electrum protocol on internal port 50001 for the wallet's
+  # ElectrumLiquidBackend to connect.
+  #
+  # GATED BEHIND THE ``liquid-indexer`` COMPOSE PROFILE.
+  # The image is built with liquid-overlay/patches/0001-slim-headers.patch,
+  # which keeps electrs's in-RAM Liquid header index slim (storing only
+  # per-block metadata and reading full headers from RocksDB on demand)
+  # and streams the startup and header-download loads. With it, electrs
+  # peak RSS is ~2.4 GiB serving (~3.7 GiB during the one-time index
+  # build) — down from the 10–16 GiB the unpatched upstream holds on
+  # Liquid mainnet (where the whole-chain dynafed-header set would
+  # otherwise sit resident in RAM).
+  #
+  # ``start.sh`` activates this profile only when
+  # ``ENABLE_LIQUID_INDEXER=true`` in .env. Operators who prefer not to
+  # self-host the indexer can leave it ``false`` and point
+  # ``ANONYMIZE_LIQUID_ELECTRUM_URL`` at an external Liquid Electrum
+  # endpoint (Blockstream operates public ones; a separate host can also
+  # self-host this same indexer). Note the dominant memory cost of the
+  # local Liquid stack is now elementsd (~9.6 GiB), not this indexer.
+  electrs-liquid:
+    profiles: ["liquid-indexer"]
+    build:
+      context: ./liquid-overlay
+      dockerfile: Dockerfile.electrs-liquid
+    restart: unless-stopped
+    environment:
+      ELECTRS_NETWORK: ${LIQUID_NETWORK:-liquid}
+      ELECTRS_DAEMON_RPC_ADDR: elementsd:7041
+      ELECTRS_DAEMON_DIR: /var/lib/elementsd
+      ELECTRS_DB_DIR: /var/lib/electrs
+      ELECTRS_ELECTRUM_RPC_ADDR: 0.0.0.0:50001
+      ELECTRS_LOG_FILTERS: ${ELECTRS_LOG_FILTERS:-INFO}
+      ELEMENTSD_RPC_USER: ${ELEMENTSD_RPC_USER:?ELEMENTSD_RPC_USER must be set}
+      ELEMENTSD_RPC_PASSWORD: ${ELEMENTSD_RPC_PASSWORD:?ELEMENTSD_RPC_PASSWORD must be set}
+    # Override the hard-coded ENTRYPOINT baked into the image so we
+    # can pass --cookie. elementsd is started with
+    # -rpcuser/-rpcpassword which disables cookie-file auth; without
+    # --cookie, electrs spins forever on "failed to read cookie
+    # from .../.cookie".
+    entrypoint: ["/bin/sh", "-c"]
+    # Flag set:
+    #
+    #   --jsonrpc-import              Use the RPC-based bitcoind_fetcher
+    #                                 instead of the default blk*.dat
+    #                                 mmap fetcher. REQUIRED on
+    #                                 Liquid: see "Why --jsonrpc-import
+    #                                 is required" below.
+    #   --daemon-parallelism 2        Bounds how many block batches are
+    #                                 fetched concurrently (default 4),
+    #                                 keeping fetch-pipeline memory low.
+    #   --db-write-buffer-size-mb 64  Caps RocksDB write buffers (default
+    #                                 256 → ~1.5 GiB across the 3 column
+    #                                 families; 64 → ~384 MiB).
+    #   --cache-index-filter-blocks   Bounds RocksDB filter/index RAM
+    #                                 to the (small) block-cache.
+    #
+    # These keep RocksDB/fetch memory bounded; the slim-headers patch
+    # (see the cap comment below) is what removes the large in-RAM
+    # header index that used to dominate electrs's footprint.
+    #
+    # Why --jsonrpc-import is required (investigated 2026-05-31):
+    #
+    # The default blk*.dat fetcher (blkfiles_fetcher in fetch.rs)
+    # streams blocks in the order elementsd received them, NOT in
+    # chain order. The recent single-pass add()+index() refactor in
+    # schema.rs assumes each batch's referenced prev-outputs are
+    # already in txstore by index() time. With out-of-chain-order
+    # batches, an earlier block in chain order can land in a later
+    # blk file batch — at which point index() of a later-chain block
+    # panics with "missing txo {prev_txid}:{vout}" in schema.rs
+    # (deterministic; reproduced at block 71822 looking up a txo
+    # from block 71751).
+    #
+    # bitcoind_fetcher (the --jsonrpc-import path) iterates the
+    # header work-set in chunks directly, so batches arrive in
+    # chain order and the single-pass invariant holds. It's slower
+    # than blk*.dat mmap (RPC overhead per block) but correct.
+    # (Memory is not a reason to prefer either path now — the
+    # slim-headers patch bounds electrs RSS to ~2 GiB regardless.)
+    command:
+      - |
+        exec /usr/local/bin/electrs \
+          --network "${LIQUID_NETWORK:-liquid}" \
+          --daemon-rpc-addr elementsd:7041 \
+          --daemon-dir /var/lib/elementsd \
+          --db-dir /var/lib/electrs \
+          --electrum-rpc-addr 0.0.0.0:50001 \
+          --jsonrpc-import \
+          --daemon-parallelism 2 \
+          --db-write-buffer-size-mb 64 \
+          --cache-index-filter-blocks \
+          --cookie "$$ELEMENTSD_RPC_USER:$$ELEMENTSD_RPC_PASSWORD"
+    volumes:
+      - elementsd_data:/var/lib/elementsd:ro
+      - electrs_liquid_data:/var/lib/electrs
+    depends_on:
+      # service_started (not service_healthy) so electrs-liquid
+      # boots in parallel with elementsd's initial block-index
+      # replay. electrs retries the daemon RPC with backoff until
+      # it is reachable, logging "failed to connect" until then —
+      # that's expected and self-clearing once elementsd opens
+      # its RPC port. Waiting for healthy here would block the
+      # entire stack for the full IBD / index-replay window.
+      elementsd:
+        condition: service_started
+    # Internal-network port only — the wallet reaches it at
+    # electrs-liquid:50001.
+    expose:
+      - "50001"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 50001 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 120s   # index build takes time on first run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          # The image carries liquid-overlay/patches/0001-slim-headers.patch
+          # (see the service comment above). On --features liquid each
+          # dynafed header is 1-4 KiB (signblock script + proof witness),
+          # not Bitcoin's fixed 80 B, so the unpatched upstream — which
+          # holds a whole-chain header index in RAM and re-materializes the
+          # full header set on each fresh sync and restart — needs 10-16 GiB
+          # on Liquid mainnet. The patch keeps only per-block metadata in
+          # RAM (full headers come from RocksDB on demand) and streams the
+          # bulk loads. Measured peak RSS: ~2.4 GiB steady-state serving
+          # (~1.2 GiB on restart), and ~3.7 GiB during the one-time initial
+          # index build (the post-index RocksDB compaction is the high-water
+          # mark).
+          #
+          # 6G leaves comfortable headroom over the ~3.7 GiB build peak.
+          # Reclaimable RocksDB page cache lives above this and is reclaimed
+          # under cap pressure, so this bounds the OOM-relevant (anonymous)
+          # memory without starving the build.
+          #
+          # To skip the local indexer entirely, set
+          # ENABLE_LIQUID_INDEXER=false and point
+          # ANONYMIZE_LIQUID_ELECTRUM_URL at an external indexer.
+          memory: 6G
+          cpus: "2.0"
+
+  # ─── Wallet — extends the base service with the Liquid wire ────
+  # Adds the ANONYMIZE_LIQUID_ELECTRUM_URL environment binding so
+  # the wallet's ElectrumLiquidBackend knows where to find the
+  # indexer. The base docker-compose.yml's `api` service is the
+  # extended target.
+  api:
+    environment:
+      ANONYMIZE_LIQUID_ELECTRUM_URL: tcp://electrs-liquid:50001
+    # NOTE: we deliberately do NOT add a depends_on entry for
+    # elementsd or electrs-liquid here. The wallet boots
+    # independently and gates Liquid features at runtime via the
+    # `liquid_indexer_reachable` field on /anonymize/policy
+    # (which the dashboard surfaces as a "Liquid backend not
+    # ready yet" banner under the Anonymize tab). The base
+    # docker-compose.yml's depends_on list (postgres, redis,
+    # migrate, tor-proxy) is preserved by compose's merge
+    # semantics. This keeps dashboard boot decoupled from
+    # Liquid IBD, which on a fresh install can take hours.
+
+volumes:
+  elementsd_data:
+  electrs_liquid_data:

@@ -1,0 +1,601 @@
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 4cb3830..74f733e 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -26,7 +26,7 @@ use electrs_macros::trace;
+ use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid};
+ use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
+ use crate::signal::Waiter;
+-use crate::util::{HeaderList, DEFAULT_BLOCKHASH};
++use crate::util::{HeaderEntry, HeaderList, DEFAULT_BLOCKHASH};
+ 
+ use crate::errors::*;
+ 
+@@ -773,7 +773,12 @@ impl Daemon {
+     }
+ 
+     #[trace]
+-    fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
++    // Liquid memory patch (E6b): stream all headers into slim HeaderEntries, projecting
++    // each 100k chunk and dropping the full BlockHeaders immediately. This avoids the
++    // ~9.6 GiB whole-chain Vec<BlockHeader> transient the fresh-sync path otherwise holds
++    // (the header-download peak left over after the in-RAM header floor was slimmed).
++    pub fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<HeaderEntry>> {
++        info!("downloading all block headers up to {}", tip);
+         let info: Value = self.request("getblockheader", json!([tip]))?;
+         let tip_height = info
+             .get("height")
+@@ -782,12 +787,18 @@ impl Daemon {
+             .expect("non-numeric height") as usize;
+         let all_heights: Vec<usize> = (0..=tip_height).collect();
+         let chunk_size = 100_000;
+-        let mut result = vec![];
++        let mut result: Vec<HeaderEntry> = Vec::with_capacity(tip_height + 1);
++        let mut prev_blockhash = *DEFAULT_BLOCKHASH;
+         for heights in all_heights.chunks(chunk_size) {
+-            let mut headers = self.getblockheaders(&heights)?;
++            let headers = self.getblockheaders(heights)?;
+             assert!(headers.len() == heights.len());
+ 
+-            result.append(&mut headers);
++            for (height, header) in heights.iter().zip(headers.iter()) {
++                let hash = header.block_hash();
++                assert_eq!(header.prev_blockhash, prev_blockhash);
++                result.push(HeaderEntry::new(*height, hash, header));
++                prev_blockhash = hash;
++            }
+ 
+             debug!(
+                 "downloaded {}/{} block headers ({:.0}%)",
+@@ -797,12 +808,7 @@ impl Daemon {
+             );
+         }
+ 
+-        let mut blockhash = *DEFAULT_BLOCKHASH;
+-        for header in &result {
+-            assert_eq!(header.prev_blockhash, blockhash);
+-            blockhash = header.block_hash();
+-        }
+-        assert_eq!(blockhash, *tip);
++        assert_eq!(prev_blockhash, *tip);
+         Ok(result)
+     }
+ 
+@@ -813,11 +819,9 @@ impl Daemon {
+         indexed_headers: &HeaderList,
+         bestblockhash: &BlockHash,
+     ) -> Result<Vec<BlockHeader>> {
+-        // Iterate back over headers until known blockash is found:
+-        if indexed_headers.is_empty() {
+-            info!("downloading all block headers up to {}", bestblockhash);
+-            return self.get_all_headers(bestblockhash);
+-        }
++        // Incremental path only — the fresh-sync (empty) case is handled by the caller
++        // via get_all_headers (slim, streaming; E6b). Here we walk back from the tip until
++        // a known block is found, so the header count is bounded by the new-block backlog.
+         debug!(
+             "downloading new block headers ({} already indexed) from {}",
+             indexed_headers.len(),
+diff --git a/src/electrum/server.rs b/src/electrum/server.rs
+index 873a8dc..214216d 100644
+--- a/src/electrum/server.rs
++++ b/src/electrum/server.rs
+@@ -148,7 +148,13 @@ impl Connection {
+ 
+     fn blockchain_headers_subscribe(&mut self) -> Result<Value> {
+         let entry = self.query.chain().best_header();
+-        let hex_header = serialize_hex(entry.header());
++        // Liquid memory patch: full header comes from the DB, not the slim HeaderEntry.
++        let header = self
++            .query
++            .chain()
++            .get_block_header(entry.hash())
++            .chain_err(|| "missing header")?;
++        let hex_header = serialize_hex(&header);
+         let result = json!({"hex": hex_header, "height": entry.height()});
+         self.last_header_entry = Some(entry);
+         Ok(result)
+@@ -216,11 +222,13 @@ impl Connection {
+         let height = usize_from_value(params.get(0), "height")?;
+         let cp_height = usize_from_value_or(params.get(1), "cp_height", 0)?;
+ 
++        // Liquid memory patch: full header comes from the DB, not the slim HeaderEntry.
+         let raw_header_hex: String = self
+             .query
+             .chain()
+             .header_by_height(height)
+-            .map(|entry| serialize_hex(entry.header()))
++            .and_then(|entry| self.query.chain().get_block_header(entry.hash()))
++            .map(|header| serialize_hex(&header))
+             .chain_err(|| "missing header")?;
+ 
+         if cp_height == 0 {
+@@ -240,13 +248,13 @@ impl Connection {
+         let count = MAX_HEADERS.min(usize_from_value(params.get(1), "count")?);
+         let cp_height = usize_from_value_or(params.get(2), "cp_height", 0)?;
+         let heights: Vec<usize> = (start_height..(start_height + count)).collect();
++        // Liquid memory patch: full headers come from the DB, not the slim HeaderEntry.
+         let headers: Vec<String> = heights
+             .into_iter()
+             .filter_map(|height| {
+-                self.query
+-                    .chain()
+-                    .header_by_height(height)
+-                    .map(|entry| serialize_hex(entry.header()))
++                let entry = self.query.chain().header_by_height(height)?;
++                let header = self.query.chain().get_block_header(entry.hash())?;
++                Some(serialize_hex(&header))
+             })
+             .collect();
+ 
+@@ -505,7 +513,13 @@ impl Connection {
+             let entry = self.query.chain().best_header();
+             if *last_entry != entry {
+                 *last_entry = entry;
+-                let hex_header = serialize_hex(last_entry.header());
++                // Liquid memory patch: full header from the DB, not the slim HeaderEntry.
++                let full_header = self
++                    .query
++                    .chain()
++                    .get_block_header(last_entry.hash())
++                    .chain_err(|| "missing header")?;
++                let hex_header = serialize_hex(&full_header);
+                 let header = json!({"hex": hex_header, "height": last_entry.height()});
+                 result.push(json!({
+                     "jsonrpc": "2.0",
+diff --git a/src/new_index/fetch.rs b/src/new_index/fetch.rs
+index 0dc92ae..e5a62cb 100644
+--- a/src/new_index/fetch.rs
++++ b/src/new_index/fetch.rs
+@@ -31,7 +31,10 @@ pub enum FetchFrom {
+ pub fn start_fetcher(
+     from: FetchFrom,
+     daemon: &Daemon,
+-    new_headers: Vec<HeaderEntry>,
++    // Liquid memory patch: the fetch work-set is a slim (hash, height) list,
++    // not a second whole-chain Vec<HeaderEntry>. Each fetcher reconstructs the
++    // HeaderEntry from the fetched block's own header.
++    new_headers: Vec<(BlockHash, usize)>,
+     batch_size: usize,
+     chain_tip_height: usize,
+ ) -> Result<Fetcher<Vec<BlockEntry>>> {
+@@ -76,12 +79,12 @@ impl<T> Fetcher<T> {
+ #[trace]
+ fn bitcoind_fetcher(
+     daemon: &Daemon,
+-    new_headers: Vec<HeaderEntry>,
++    new_headers: Vec<(BlockHash, usize)>,
+     batch_size: usize,
+     chain_tip_height: usize,
+ ) -> Result<Fetcher<Vec<BlockEntry>>> {
+-    if let Some(tip) = new_headers.last() {
+-        debug!("{:?} ({} left to index)", tip, new_headers.len());
++    if let Some((hash, height)) = new_headers.last() {
++        debug!("indexing to {} at height {} ({} left to index)", hash, height, new_headers.len());
+     };
+     let daemon = daemon.reconnect()?;
+     let chan = SyncChannel::new(1);
+@@ -93,7 +96,7 @@ fn bitcoind_fetcher(
+             let total_blocks_fetched = new_headers.len();
+             for entries in new_headers.chunks(batch_size) {
+                 if fetcher_count % 50 == 0 && total_blocks_fetched >= 50 {
+-                    let batch_height = entries.last().map(|e| e.height()).unwrap_or(0);
++                    let batch_height = entries.last().map(|(_, h)| *h).unwrap_or(0);
+                     info!("fetching blocks {}/{} ({:.1}%)",
+                         batch_height,
+                         chain_tip_height,
+@@ -102,7 +105,7 @@ fn bitcoind_fetcher(
+                 }
+                 fetcher_count += 1;
+ 
+-                let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
++                let blockhashes: Vec<BlockHash> = entries.iter().map(|(h, _)| *h).collect();
+                 let blocks = daemon
+                     .getblocks(&blockhashes)
+                     .expect("failed to get blocks from bitcoind");
+@@ -110,10 +113,14 @@ fn bitcoind_fetcher(
+                 let block_entries: Vec<BlockEntry> = blocks
+                     .into_iter()
+                     .zip(entries)
+-                    .map(|(block, entry)| {
++                    // Reconstruct the HeaderEntry from the fetched block's own
++                    // header — identical bytes to the daemon-served header that
++                    // the old full-HeaderEntry work-set carried.
++                    .map(|(block, &(blockhash, height))| {
+                         let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
++                        let entry = HeaderEntry::new(height, blockhash, &block.header);
+                         BlockEntry {
+-                            entry: entry.clone(), // TODO: remove this clone()
++                            entry,
+                             size: block.total_size() as u32,
+                             txids,
+                             block,
+@@ -133,7 +140,7 @@ fn bitcoind_fetcher(
+ #[trace]
+ fn blkfiles_fetcher(
+     daemon: &Daemon,
+-    new_headers: Vec<HeaderEntry>,
++    new_headers: Vec<(BlockHash, usize)>,
+ ) -> Result<Fetcher<Vec<BlockEntry>>> {
+     let magic = daemon.magic();
+     let blk_files = daemon.list_blk_files()?;
+@@ -144,8 +151,9 @@ fn blkfiles_fetcher(
+     let chan = SyncChannel::new(2);
+     let sender = chan.sender();
+ 
+-    let mut entry_map: HashMap<BlockHash, HeaderEntry> =
+-        new_headers.into_iter().map(|h| (*h.hash(), h)).collect();
++    // Liquid memory patch: hold only height per hash; the HeaderEntry is
++    // reconstructed from the parsed block below, not carried in this map.
++    let mut entry_map: HashMap<BlockHash, usize> = new_headers.into_iter().collect();
+ 
+     let parser = blkfiles_parser(blkfiles_reader(blk_files, xor_key), magic);
+     Ok(Fetcher::from(
+@@ -166,8 +174,9 @@ fn blkfiles_fetcher(
+                         let blockhash = block.block_hash();
+                         entry_map
+                             .remove(&blockhash)
+-                            .map(|entry| {
++                            .map(|height| {
+                                 let txids = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
++                                let entry = HeaderEntry::new(height, blockhash, &block.header);
+                                 BlockEntry { block, entry, size, txids }
+                             })
+                             .or_else(|| {
+diff --git a/src/new_index/schema.rs b/src/new_index/schema.rs
+index 23193ba..af51e98 100644
+--- a/src/new_index/schema.rs
++++ b/src/new_index/schema.rs
+@@ -97,7 +97,7 @@ impl Store {
+                 tip_hash = headers_map
+                     .get(&tip_hash)
+                     .expect("invalid header chain")
+-                    .prev_blockhash;
++                    .0; // (prev_blockhash, time) — the slim header projection
+             }
+             info!(
+                 "{} headers were loaded, tip at {:?}",
+@@ -270,13 +270,17 @@ impl Indexer {
+     }
+ 
+     // Headers that need any work: either not yet added to txstore or not yet indexed to history.
+-    fn headers_to_process(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
++    // Liquid memory patch: return a slim (hash, height) work-set instead of
++    // cloning whole HeaderEntry values. On a fresh build this is the difference
++    // between ~150 MB and a second ~16 GiB whole-chain Vec<HeaderEntry> — the
++    // fetcher reconstructs each HeaderEntry from the fetched block.
++    fn headers_to_process(&self, new_headers: &[HeaderEntry]) -> Vec<(BlockHash, usize)> {
+         let added = self.store.added_blockhashes.read().unwrap();
+         let indexed = self.store.indexed_blockhashes.read().unwrap();
+         new_headers
+             .iter()
+             .filter(|e| !added.contains(e.hash()) || !indexed.contains(e.hash()))
+-            .cloned()
++            .map(|e| (*e.hash(), e.height()))
+             .collect()
+     }
+ 
+@@ -296,8 +300,15 @@ impl Indexer {
+         tip: &BlockHash,
+     ) -> Result<(Vec<HeaderEntry>, Option<usize>)> {
+         let indexed_headers = self.store.indexed_headers.read().unwrap();
+-        let raw_new_headers = daemon.get_new_headers(&indexed_headers, tip)?;
+-        let (new_headers, reorged_since) = indexed_headers.preprocess(raw_new_headers, tip);
++        // E6b: on a fresh sync, stream all headers straight into slim HeaderEntries
++        // (never materializing the whole-chain Vec<BlockHeader>). The incremental path
++        // keeps using preprocess — its header count is bounded by the new-block backlog.
++        let (new_headers, reorged_since) = if indexed_headers.is_empty() {
++            (daemon.get_all_headers(tip)?, None)
++        } else {
++            let raw_new_headers = daemon.get_new_headers(&indexed_headers, tip)?;
++            indexed_headers.preprocess(raw_new_headers, tip)
++        };
+ 
+         if let Some(tip) = new_headers.last() {
+             info!("{:?} ({} left to index)", tip, new_headers.len());
+@@ -342,7 +353,10 @@ impl Indexer {
+ 
+             // Fetch the reorged blocks, then undo their history index db rows.
+             // The txstore db rows are kept for reorged blocks/transactions.
+-            start_fetcher(self.from, &daemon, reorged_headers, self.iconfig.block_batch_size, chain_tip_height)?
++            // Liquid memory patch: pass the slim (hash, height) work-set.
++            let reorged_stubs: Vec<(BlockHash, usize)> =
++                reorged_headers.iter().map(|h| (*h.hash(), h.height())).collect();
++            start_fetcher(self.from, &daemon, reorged_stubs, self.iconfig.block_batch_size, chain_tip_height)?
+                 .map(|blocks| self.undo_index(&blocks));
+         }
+ 
+@@ -623,7 +637,9 @@ impl ChainQuery {
+             let blockhex = blockval.as_str().expect("valid block from bitcoind");
+             Some(Vec::from_hex(blockhex).expect("valid block from bitcoind"))
+         } else {
+-            let entry = self.header_by_hash(hash)?;
++            // Liquid memory patch: read the full header from the DB ('B' row) —
++            // the in-RAM HeaderEntry no longer carries it.
++            let header = self.get_block_header(hash)?;
+             let meta = self.get_block_meta(hash)?;
+             let txids = self.get_block_txids(hash)?;
+             let txids_with_blockhash: Vec<_> =
+@@ -634,7 +650,7 @@ impl ChainQuery {
+             // as <raw header><tx count varint><raw txs>
+             let mut raw = Vec::with_capacity(meta.size as usize);
+ 
+-            raw.append(&mut serialize(entry.header()));
++            raw.append(&mut serialize(&header));
+             raw.append(&mut serialize(&VarInt(raw_txs.len() as u64)));
+ 
+             for mut raw_tx in raw_txs {
+@@ -647,7 +663,12 @@ impl ChainQuery {
+ 
+     pub fn get_block_header(&self, hash: &BlockHash) -> Option<BlockHeader> {
+         let _timer = self.start_timer("get_block_header");
+-        Some(self.header_by_hash(hash)?.header().clone())
++        // Liquid memory patch: read the full header from the DB 'B' row rather
++        // than the in-RAM HeaderEntry (which keeps only metadata).
++        self.store
++            .txstore_db
++            .get(&BlockRow::header_key(full_hash(&hash[..])))
++            .map(|val| deserialize(&val).expect("failed to parse BlockHeader"))
+     }
+ 
+     pub fn get_mtp(&self, height: usize) -> u32 {
+@@ -661,6 +682,9 @@ impl ChainQuery {
+         Some(BlockHeaderMeta {
+             meta: self.get_block_meta(hash)?,
+             mtp: self.get_mtp(header_entry.height()),
++            // Liquid memory patch: carry the full header (from the DB) for the
++            // serialize-to-client sites; HeaderEntry holds only metadata.
++            header: self.get_block_header(hash)?,
+             header_entry,
+         })
+     }
+@@ -1188,11 +1212,12 @@ impl ChainQuery {
+     pub fn get_merkleblock_proof(&self, txid: &Txid) -> Option<MerkleBlock> {
+         let _timer = self.start_timer("get_merkleblock_proof");
+         let blockid = self.tx_confirming_block(txid)?;
+-        let headerentry = self.header_by_hash(&blockid.hash)?;
++        // Liquid memory patch: full header from the DB, not the slim HeaderEntry.
++        let header = self.get_block_header(&blockid.hash)?;
+         let block_txids = self.get_block_txids(&blockid.hash)?;
+ 
+         Some(MerkleBlock::from_header_txids_with_predicate(
+-            headerentry.header(),
++            &header,
+             &block_txids,
+             |t| t == txid,
+         ))
+@@ -1221,13 +1246,17 @@ fn load_blockhashes(db: &DB, prefix: &[u8]) -> HashSet<BlockHash> {
+         .collect()
+ }
+ 
+-fn load_blockheaders(db: &DB) -> HashMap<BlockHash, BlockHeader> {
++// Liquid memory patch: project each 'B' row to (prev_blockhash, time) and drop the
++// full header immediately, so the whole-chain header set is never resident in RAM
++// (the ~9.6 GiB startup floor / ~2-3x restart transient on Liquid mainnet). The full
++// headers stay in the DB and are read on demand via get_block_header.
++fn load_blockheaders(db: &DB) -> HashMap<BlockHash, (BlockHash, u32)> {
+     db.iter_scan(&BlockRow::header_filter())
+         .map(BlockRow::from_row)
+         .map(|r| {
+             let key: BlockHash = deserialize(&r.key.hash).expect("failed to parse BlockHash");
+-            let value: BlockHeader = deserialize(&r.value).expect("failed to parse BlockHeader");
+-            (key, value)
++            let header: BlockHeader = deserialize(&r.value).expect("failed to parse BlockHeader");
++            (key, (header.prev_blockhash, header.time))
+         })
+         .collect()
+ }
+@@ -1611,6 +1640,10 @@ impl BlockRow {
+         b"B".to_vec()
+     }
+ 
++    fn header_key(hash: FullHash) -> Bytes {
++        [b"B", &hash[..]].concat()
++    }
++
+     fn txids_key(hash: FullHash) -> Bytes {
+         [b"X", &hash[..]].concat()
+     }
+diff --git a/src/rest.rs b/src/rest.rs
+index c0ab695..d2f5738 100644
+--- a/src/rest.rs
++++ b/src/rest.rs
+@@ -94,7 +94,9 @@ struct BlockValue {
+ impl BlockValue {
+     #[cfg_attr(feature = "liquid", allow(unused_variables))]
+     fn new(blockhm: BlockHeaderMeta) -> Self {
+-        let header = blockhm.header_entry.header();
++        // Liquid memory patch: the full header comes from BlockHeaderMeta (DB-fetched),
++        // not from the slim in-RAM HeaderEntry.
++        let header = &blockhm.header;
+         BlockValue {
+             id: header.block_hash(),
+             height: blockhm.header_entry.height() as u32,
+@@ -1317,7 +1319,7 @@ fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Full<By
+             .chain()
+             .get_block_with_meta(&current_hash)
+             .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
+-        current_hash = blockhm.header_entry.header().prev_blockhash;
++        current_hash = *blockhm.header_entry.prev_blockhash();
+ 
+         #[allow(unused_mut)]
+         let mut value = BlockValue::new(blockhm);
+diff --git a/src/util/block.rs b/src/util/block.rs
+index ca2da60..5f77d91 100644
+--- a/src/util/block.rs
++++ b/src/util/block.rs
+@@ -32,7 +32,7 @@ impl From<&HeaderEntry> for BlockId {
+         BlockId {
+             height: header.height(),
+             hash: *header.hash(),
+-            time: header.header().time,
++            time: header.time(),
+         }
+     }
+ }
+@@ -41,24 +41,35 @@ impl From<&HeaderEntry> for BlockId {
+ pub struct HeaderEntry {
+     height: usize,
+     hash: BlockHash,
+-    header: BlockHeader,
++    // Liquid memory patch: keep only the metadata the in-RAM read sites need
++    // (prev_blockhash + time), not the full BlockHeader. The full header (incl.
++    // the multi-KiB dynafed signblock proof) is retrieved from the DB 'B' rows
++    // on demand by the few serialize-to-client sites. This drops the in-RAM
++    // header floor from ~9.6 GiB toward ~0.3 GiB on Liquid mainnet.
++    prev_blockhash: BlockHash,
++    time: u32,
+ }
+ 
+ impl HeaderEntry {
+-    #[cfg(feature = "bench")]
+-    pub fn new(height: usize, hash: BlockHash, header: BlockHeader) -> Self {
++    // Build a slim entry from a full header (the header is not retained).
++    pub fn new(height: usize, hash: BlockHash, header: &BlockHeader) -> Self {
+         Self {
+             height,
+             hash,
+-            header,
++            prev_blockhash: header.prev_blockhash,
++            time: header.time,
+         }
+     }
+     pub fn hash(&self) -> &BlockHash {
+         &self.hash
+     }
+ 
+-    pub fn header(&self) -> &BlockHeader {
+-        &self.header
++    pub fn prev_blockhash(&self) -> &BlockHash {
++        &self.prev_blockhash
++    }
++
++    pub fn time(&self) -> u32 {
++        self.time
+     }
+ 
+     pub fn height(&self) -> usize {
+@@ -68,7 +79,7 @@ impl HeaderEntry {
+ 
+ impl fmt::Debug for HeaderEntry {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        let last_block_time = DateTime::from_unix_timestamp(self.header().time as i64).unwrap();
++        let last_block_time = DateTime::from_unix_timestamp(self.time as i64).unwrap();
+         write!(
+             f,
+             "hash={} height={} @ {}",
+@@ -94,9 +105,14 @@ impl HeaderList {
+         }
+     }
+ 
++    // Liquid memory patch: build the chain from a slim (prev_blockhash, time) map
++    // rather than a HashMap<BlockHash, BlockHeader> + Vec<BlockHeader>. This avoids
++    // materializing all full headers in RAM at startup — the ~2-3x floor transient
++    // that made a synced-electrs restart OOM-prone. HeaderEntry keeps only metadata;
++    // full headers are read from the DB 'B' rows on demand.
+     #[trace]
+     pub fn new(
+-        mut headers_map: HashMap<BlockHash, BlockHeader>,
++        mut headers_map: HashMap<BlockHash, (BlockHash, u32)>,
+         tip_hash: BlockHash,
+     ) -> HeaderList {
+         trace!(
+@@ -106,29 +122,33 @@ impl HeaderList {
+         );
+ 
+         let mut blockhash = tip_hash;
+-        let mut headers_chain: Vec<BlockHeader> = vec![];
++        let mut chain: Vec<HeaderEntry> = vec![];
+ 
+         while blockhash != *DEFAULT_BLOCKHASH {
+-            let header = headers_map.remove(&blockhash).unwrap_or_else(|| {
+-                panic!(
+-                    "missing expected blockhash in headers map: {:?}, pointed from: {:?}",
+-                    blockhash,
+-                    headers_chain.last().map(|h| h.block_hash())
+-                )
++            let (prev_blockhash, time) = headers_map.remove(&blockhash).unwrap_or_else(|| {
++                panic!("missing expected blockhash in headers map: {:?}", blockhash)
+             });
+-            blockhash = header.prev_blockhash;
+-            headers_chain.push(header);
++            chain.push(HeaderEntry {
++                height: 0, // assigned below once the chain is genesis..tip
++                hash: blockhash,
++                prev_blockhash,
++                time,
++            });
++            blockhash = prev_blockhash;
++        }
++        chain.reverse();
++        for (height, entry) in chain.iter_mut().enumerate() {
++            entry.height = height;
+         }
+-        headers_chain.reverse();
+ 
+         trace!(
+             "{} chained headers ({} orphan blocks left)",
+-            headers_chain.len(),
++            chain.len(),
+             headers_map.len()
+         );
+ 
+         let mut headers = HeaderList::empty();
+-        headers.append(headers.preprocess(headers_chain, &tip_hash).0);
++        headers.append(chain);
+         headers
+     }
+ 
+@@ -168,7 +188,8 @@ impl HeaderList {
+                 .map(|(height, (hash, header))| HeaderEntry {
+                     height,
+                     hash,
+-                    header,
++                    prev_blockhash: header.prev_blockhash,
++                    time: header.time,
+                 })
+                 .collect();
+             (new_height, header_entries)
+@@ -209,7 +230,7 @@ impl HeaderList {
+         // new_headers[i] -> new_headers[i - 1] (i.e. new_headers.last() is the tip)
+         for (curr_header, next_header) in new_headers.iter().tuple_windows() {
+             assert_eq!(curr_header.height() + 1, next_header.height());
+-            assert_eq!(*curr_header.hash(), next_header.header().prev_blockhash);
++            assert_eq!(*curr_header.hash(), *next_header.prev_blockhash());
+         }
+         let new_height = match new_headers.first() {
+             Some(entry) => {
+@@ -219,7 +240,7 @@ impl HeaderList {
+                 } else {
+                     *DEFAULT_BLOCKHASH
+                 };
+-                assert_eq!(entry.header().prev_blockhash, expected_prev_blockhash);
++                assert_eq!(*entry.prev_blockhash(), expected_prev_blockhash);
+                 height
+             }
+             None => return,
+@@ -294,12 +315,12 @@ impl HeaderList {
+         // Use the timestamp as the mtp of the genesis block.
+         // Matches bitcoind's behaviour: bitcoin-cli getblock `bitcoin-cli getblockhash 0` | jq '.time == .mediantime'
+         if height == 0 {
+-            self.headers.get(0).unwrap().header.time
++            self.headers.get(0).unwrap().time
+         } else if height > self.best_height() {
+             0
+         } else {
+             let mut timestamps = (height.saturating_sub(MTP_SPAN - 1)..=height)
+-                .map(|p_height| self.headers.get(p_height).unwrap().header.time)
++                .map(|p_height| self.headers.get(p_height).unwrap().time)
+                 .collect::<Vec<_>>();
+             timestamps.sort_unstable();
+             timestamps[timestamps.len() / 2]
+@@ -342,6 +363,9 @@ pub struct BlockMeta {
+ 
+ pub struct BlockHeaderMeta {
+     pub header_entry: HeaderEntry,
++    // Liquid memory patch: the full header, fetched from the DB when this is
++    // built (HeaderEntry no longer carries it), for the serialize-to-client sites.
++    pub header: BlockHeader,
+     pub meta: BlockMeta,
+     pub mtp: u32,
+ }

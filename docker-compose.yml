@@ -1,0 +1,320 @@
+services:
+  # ─── PostgreSQL ───────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agent_btc_wallet
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── Redis ────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─── Tor SOCKS5 Proxy ────────────────────────────────────────────
+  tor-proxy:
+    build: ./tor-proxy
+    restart: unless-stopped
+    # The entrypoint shim reads $TOR_CONTROL_PASSWORD from the
+    # env, derives the HashedControlPassword via ``tor --hash-password``,
+    # and renders /etc/tor/torrc before exec'ing tor.
+    environment:
+      TOR_CONTROL_PASSWORD: ${TOR_CONTROL_PASSWORD:-}
+    # Persistent DataDirectory. Faster restart (no re-bootstrap),
+    # stable guard selection across container lifecycle. Growth monitored
+    # by the watchdog via TOR_DATA_DIR_WARN_MB threshold.
+    volumes:
+      - tor_data:/var/lib/tor
+    # No compose-level healthcheck override — the Dockerfile's
+    # circuit-validating check (nc -z + curl --socks5-hostname round-trip
+    # with --start-period=180s) is the source of truth. Defining one here
+    # would silently downgrade the check by dropping the curl probe.
+    # Explicit resource limits. Tor at steady-state is
+    # ~30-50 MB; 256 is generous headroom that protects the host
+    # from a runaway bootstrap loop or descriptor-cache explosion
+    # without starving normal operation.
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    # Network membership: ``default`` for internet egress (tor
+    # bootstraps + circuits go out via the host); ``bolt12-internal``
+    # so the BOLT 12 gateway — which lives ONLY on the isolated
+    # network — can reach SOCKS5 at ``tor-proxy:9050``. Without the
+    # second membership the gateway can never dial a Lightning peer
+    # (every dial fails at TCP connect) because ``internal: true``
+    # blocks egress from ``bolt12-internal`` to any other network.
+    # ``postgres`` and ``redis`` deliberately stay off
+    # ``bolt12-internal`` so the gateway's gRPC surface remains
+    # unreachable from those services — the isolation property the
+    # hardening was added for is preserved.
+    networks:
+      - default
+      - bolt12-internal
+
+  # ─── BOLT 12 Onion-Message Gateway ───────────────────────────────
+  # Bare-LDK daemon that speaks onion-messaging on behalf of the
+  # Python service. Owns no funds, no channels, no preimages — just
+  # an onion-message-capable node identity.
+  bolt12-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    restart: unless-stopped
+    environment:
+      RUST_LOG: ${BOLT12_GATEWAY_LOG:-info,bolt12_gateway=debug}
+      BOLT12_GATEWAY_CONFIG: /etc/bolt12-gateway/config.toml
+      # ⚠ DO NOT REVERT to 127.0.0.1 — see note below.
+      # Bind the gRPC server on all interfaces inside the container so
+      # the api + celery-worker services can reach it via the
+      # ``bolt12-gateway`` service DNS name on the private Docker
+      # network. The mounted ``config.example.toml`` defaults to
+      # ``127.0.0.1:50061`` (safe-by-default for standalone host
+      # installs) which is unreachable from peer containers — every
+      # wallet probe lands as "Connection refused". The env override
+      # below is the canonical fix.
+      #
+      # No host port is published in this compose file (the
+      # ``50061`` line below is ``expose:`` semantics — internal
+      # network only), so 0.0.0.0 here exposes the gateway only
+      # on the private docker network, never on the host. Pairing
+      # with the bearer-token auth (BOLT12_GATEWAY_TOKEN) is
+      # what protects the gRPC surface; the bind address alone is
+      # not the security boundary.
+      BOLT12_GATEWAY_GRPC_LISTEN: 0.0.0.0:50061
+      # Pull from .env so the gateway always agrees with the wallet's
+      # BITCOIN_NETWORK. Without this the mounted TOML's hardcoded
+      # default would silently disagree on non-regtest deployments and
+      # the wallet would refuse to keep the BOLT 12 runtime active
+      # (cross-chain fund-loss guard).
+      BOLT12_GATEWAY_NETWORK: ${BITCOIN_NETWORK:-bitcoin}
+      BOLT12_GATEWAY_TOKEN: ${BOLT12_GATEWAY_TOKEN:-}
+      # ── Optional mTLS (opt-in, off by default) ────────────────
+      # When all three of these env vars are set, the gateway
+      # terminates TLS on its gRPC listener and requires every
+      # client to present a cert signed by the configured CA. Leave
+      # unset for the default cleartext-on-internal-network mode.
+      # See docs/bolt12.md → "Optional: mTLS" for cert generation
+      # (scripts/gen_bolt12_certs.sh) and full operator runbook.
+      BOLT12_GATEWAY_TLS_CA_CERT: ${BOLT12_GATEWAY_TLS_CA_CERT:-}
+      BOLT12_GATEWAY_TLS_SERVER_CERT: ${BOLT12_GATEWAY_TLS_SERVER_CERT:-}
+      BOLT12_GATEWAY_TLS_SERVER_KEY: ${BOLT12_GATEWAY_TLS_SERVER_KEY:-}
+    volumes:
+      - bolt12_gateway_data:/var/lib/bolt12-gateway
+      - ./bolt12-gateway/config.example.toml:/etc/bolt12-gateway/config.toml:ro
+      # mTLS cert directory. The host-side path is operator-
+      # provided via ``BOLT12_CERTS_DIR`` (defaults to a placeholder
+      # that doesn't need to exist when TLS is disabled — Docker
+      # only resolves bind mounts at container start, and the env
+      # vars above also default to empty, so the gateway runs
+      # cleartext and never reads from the mount). When TLS is
+      # enabled, point ``BOLT12_CERTS_DIR`` at the directory
+      # populated by ``./scripts/gen_bolt12_certs.sh``.
+      - ${BOLT12_CERTS_DIR:-./bolt12-gateway/certs}:/etc/bolt12-gateway/certs:ro
+    depends_on:
+      tor-proxy:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    # Not exposed on the host — only reachable from other compose services
+    # on the internal network at bolt12-gateway:50061.
+    expose:
+      - "50061"
+    # Network segregation: the gateway lives ONLY on the dedicated
+    # ``bolt12-internal`` network. ``postgres``, ``redis``, and
+    # ``tor-proxy`` are not members, so a hypothetical RCE in those
+    # support services cannot reach the gateway's gRPC surface at
+    # all — the bearer-token auth becomes a defence-in-depth layer
+    # behind L3 isolation. ``api`` and ``celery-worker`` join both
+    # networks (default + bolt12-internal) because they need both
+    # the support services and the gateway.
+    networks:
+      - bolt12-internal
+
+  # ─── Database Migration (one-shot) ────────────────────────────────
+  migrate:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/agent_btc_wallet
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: alembic upgrade head
+    restart: "no"
+
+  # ─── API Server ──────────────────────────────────────────────────
+  api:
+    build: .
+    env_file: .env
+    # Self-healing: the in-process keepalive task drops a wedged
+    # httpx pool + resets the LND breaker after 5 consecutive
+    # failures (see lnd_keepalive._RECOVERY_TRIGGER_FAILURES). If
+    # that doesn't recover liveness, /livez returns 503 and Docker
+    # bounces the container as the last-resort escape hatch.
+    # ``start_period`` is long enough to absorb cold-start Tor HS
+    # descriptor fetch (~30 s) + first keepalive probe.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8100/livez"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/agent_btc_wallet
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      LND_TOR_PROXY: socks5://tor-proxy:9050
+      BOLT12_GATEWAY_GRPC: bolt12-gateway:50061
+    ports:
+      - "127.0.0.1:${API_PORT:-8100}:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tor-proxy:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      bolt12-gateway:
+        condition: service_started
+    networks:
+      - default
+      - bolt12-internal
+    read_only: true
+    tmpfs:
+      - /tmp
+    # The api watchdog reads the volume's free / used bytes
+    # via os.statvfs() to surface DataDirectory growth. Read-only +
+    # contents-not-traversed (statvfs operates on the mountpoint),
+    # so no information leak about which microdescriptors Tor has
+    # cached. The container's read_only: true setting still applies
+    # to its own filesystem; this mount is an exception scoped to
+    # the named volume.
+    volumes:
+      - tor_data:/var/lib/tor:ro
+      # Same opt-in mTLS material as bolt12-gateway, mounted here so
+      # the wallet client can present a CA-signed cert. The env vars
+      # in .env (BOLT12_GATEWAY_TLS_CA_CERT etc.) point at paths
+      # inside this mount. The mount is harmless when TLS is off —
+      # the client only reads files when the env vars are set.
+      - ${BOLT12_CERTS_DIR:-./bolt12-gateway/certs}:/etc/bolt12-gateway/certs:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8100
+
+  # ─── Celery Worker (Boltz swap processing) ───────────────────────
+  celery-worker:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/agent_btc_wallet
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      LND_TOR_PROXY: socks5://tor-proxy:9050
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      tor-proxy:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - bolt12-internal
+    read_only: true
+    tmpfs:
+      - /tmp
+    # mTLS material — same mount + semantics as the api service.
+    # See the comment above the matching mount on ``api``.
+    volumes:
+      - ${BOLT12_CERTS_DIR:-./bolt12-gateway/certs}:/etc/bolt12-gateway/certs:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    # ``-B`` runs Celery Beat embedded in the worker process so the
+    # ``beat_schedule`` defined in ``app/tasks/boltz_tasks.py``
+    # actually fires. Without this the periodic tasks
+    # (``recover-boltz-swaps`` every 5 min,
+    # ``advance-braiins-deposit-sessions`` every 30 s,
+    # ``cleanup-audit-logs`` daily, etc.) are dead code — the bug
+    # this caught on 2026-05-21: a wedged swap had no scheduled
+    # reconciliation, so manual recovery was the only path.
+    # Embedded beat is the right call for a single-worker
+    # deployment; a separate ``celery-beat`` service would be
+    # warranted only if we run multiple workers.
+    # ``--schedule=/tmp/celerybeat-schedule`` writes beat's gdbm
+    # state file to the tmpfs mount. Without this the read-only
+    # rootfs blocks beat from persisting its schedule and ALL
+    # periodic tasks silently wedge after the first "due now"
+    # tick at startup — the symptom is "beat: corrupted schedule
+    # file ... Read-only file system" in container logs. Caught
+    # 2026-06-05 when verifying the new bolt12 settle-watchdog
+    # and path-drift tasks weren't firing.
+    command: >
+      celery -A app.tasks.boltz_tasks.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --max-tasks-per-child=50
+      -B
+      --schedule=/tmp/celerybeat-schedule
+
+volumes:
+  pgdata:
+  bolt12_gateway_data:
+  tor_data:
+
+networks:
+  # Implicit default network. ``postgres``, ``redis``, ``tor-proxy``,
+  # ``migrate``, ``api``, and ``celery-worker`` attach here.
+  default:
+  # Dedicated, isolated network for BOLT 12 gateway gRPC traffic.
+  # ``internal: true`` denies all outbound traffic to the docker host
+  # AND to other networks — services on this network can only talk
+  # to each other. Only ``bolt12-gateway`` (server), ``api``, and
+  # ``celery-worker`` (clients) are members. Limits the blast radius
+  # of a hypothetical compromise in ``postgres``/``redis``/``tor-
+  # proxy``: those services cannot reach the gateway gRPC surface at
+  # all, so the bearer-token auth becomes defence-in-depth behind L3
+  # isolation.
+  bolt12-internal:
+    internal: true

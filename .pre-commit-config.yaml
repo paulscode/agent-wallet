@@ -1,0 +1,18 @@
+# Local pre-commit hooks mirroring the CI "Lint & Type Check" ruff steps,
+# so contributors catch lint/format violations before pushing.
+#
+# Setup (one-time):  pip install pre-commit && pre-commit install
+#
+# IMPORTANT: keep `rev` below in lockstep with the `ruff==` pin in
+# pyproject.toml ([project.optional-dependencies] dev). ruff's formatter
+# output changes between releases; a mismatch here vs. CI would let
+# `ruff format --check .` pass locally but fail in CI (or vice versa).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.17
+    hooks:
+      # Lint (autofix) — matches CI's `ruff check .`
+      - id: ruff
+        args: [--fix]
+      # Format — matches CI's `ruff format --check .`
+      - id: ruff-format

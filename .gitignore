@@ -1,0 +1,118 @@
+# ──────────────────────────────────────────────────────────────────────
+# Agent Wallet — .gitignore
+# SECURITY: This file is critical. Never commit secrets or credentials.
+# ──────────────────────────────────────────────────────────────────────
+
+# ── Environment & secrets ──
+# Catch every .env variant (.env, .env.local, .env.bak, .env.production,
+# .env.20260522, etc.). .env.example is the only env file allowed in
+# the repo — explicitly un-ignored.
+.env
+.env.*
+!.env.example
+*.pem
+*.cert
+*.key
+*.macaroon
+macaroon.hex
+tls.cert
+# direnv
+.envrc
+# Generic backup files anywhere in the tree — catches accidental
+# `cp .env .env.bak` style operator gestures.
+*.bak
+*.backup
+*.orig
+*~
+# First-run key/seed backups written next to .env by start.sh. These hold
+# the raw SECRET_KEY and Liquid seed in cleartext and must stay out of git.
+secret-key-backup-*.txt
+liquid-seed-backup-*.txt
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Virtual environment ──
+# Common venv directory names AND the case where someone ran
+# ``python -m venv .`` and dumped pyvenv.cfg / bin / lib at the repo
+# root. Anchor the bare-name patterns to the repo root so we don't
+# accidentally ignore real ``bin/`` or ``lib/`` source directories
+# that might live inside subprojects. No trailing slash on the bare
+# names so symlinks (e.g. ``lib64 -> lib``) match too — a trailing
+# slash makes the pattern directory-only and silently lets symlinks
+# through.
+.venv/
+venv/
+env/
+/pyvenv.cfg
+/bin
+/lib
+/lib64
+/include
+/share
+.python-version
+
+# ── Testing & linting ──
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+
+# ── IDE / AI assistants ──
+.vscode/
+.idea/
+.claude/
+*.iml
+*.swp
+*.swo
+
+# ── Tor (managed by start.sh) ──
+.tor-data/
+.tor.pid
+
+# ── Docker ──
+docker-compose.override.yml
+
+# ── Node.js (boltz-core claim scripts) ──
+scripts/node_modules/
+scripts/package-lock.json
+
+# ── Rust (BOLT 12 gateway) ──
+/target/
+**/*.rs.bk
+
+# ── Database ──
+*.db
+*.sqlite3
+
+# ── Alembic ──
+alembic/versions/__pycache__/
+
+# ── Logs ──
+*.log
+logs/
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── For Reference ──
+/references/
+/internal_docs/
+/builds/
+
+

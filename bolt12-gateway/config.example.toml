@@ -1,0 +1,49 @@
+# Example BOLT 12 gateway config. Mount this at
+# /etc/bolt12-gateway/config.toml inside the container, or override the
+# location via BOLT12_GATEWAY_CONFIG.
+
+# gRPC bind address. Defaults to loopback so a fresh deployment is
+# not silently exposed on a public interface when someone runs the
+# binary directly on a host.
+#
+# IMPORTANT — Docker Compose deployments:
+# Peer containers (api, celery-worker) reach this service via its
+# private-network IP, NOT via the gateway's own loopback. With
+# ``grpc_listen = "127.0.0.1:50061"`` the listener only accepts
+# connections from inside the gateway container, and the wallet
+# logs ``Connection refused`` on every probe. ``docker-compose.yml``
+# therefore overrides this to ``0.0.0.0:50061`` via the
+# ``BOLT12_GATEWAY_GRPC_LISTEN`` env var. No host port is published,
+# so the gateway is only reachable on the internal docker network.
+# DO NOT "harden" the compose override back to 127.0.0.1 — it
+# breaks the wallet→gateway channel. The loopback default here is
+# only correct for standalone (non-compose) host installs.
+#
+# Split-host deploys must set this to the desired interface
+# explicitly AND configure mTLS / auth_token before exposing.
+grpc_listen = "127.0.0.1:50061"
+
+# Persistent state lives on a docker volume.
+data_dir = "/var/lib/bolt12-gateway"
+
+# Route all peer traffic through the shared tor-proxy service.
+socks5_proxy = "tor-proxy:9050"
+
+# Initial peers — onion-message-capable public nodes. The gateway
+# attempts these on startup; missing peers are non-fatal.
+bootstrap_peers = [
+    # "<hex-pubkey>@<host:port>",
+]
+
+# Bitcoin network the gateway operates on. MUST match the wallet's
+# BITCOIN_NETWORK or the wallet refuses to start the BOLT 12 runtime.
+# One of: "mainnet" / "bitcoin", "testnet", "signet", "regtest".
+# Override at runtime with the BOLT12_GATEWAY_NETWORK env var.
+network = "regtest"
+
+# Bearer token. MUST be set in production deployments; the gateway
+# refuses to start when BOLT12_GATEWAY_ENVIRONMENT=production (the
+# default) without a token of at least 32 bytes. The wallet must be
+# configured with the same value in BOLT12_GATEWAY_TOKEN. Override
+# at runtime with the BOLT12_GATEWAY_TOKEN env var.
+auth_token = "REPLACE-ME-OR-STARTUP-FAILS-AT-LEAST-32-BYTES-LONG"

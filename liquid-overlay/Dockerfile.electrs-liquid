@@ -1,0 +1,79 @@
+# electrs-liquid — Blockstream's electrs fork with --features liquid.
+# Multi-stage build: Rust toolchain to compile, then a slim runtime
+# image that ships only the binary. Built from source so the image
+# is reproducible from the pinned commit.
+
+# ─── Stage 1: build ─────────────────────────────────────────────
+FROM rust:1.85-slim-bookworm AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    clang \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin a known-good commit. Operators upgrading should bump this +
+# verify via repo-side review. Branch new-index is the canonical
+# Liquid-mode branch.
+
+# Accept either a branch, tag, or commit SHA for ELECTRS_GIT_REF.
+ARG ELECTRS_GIT_URL=https://github.com/Blockstream/electrs.git
+ARG ELECTRS_GIT_REF=503b740cce2133fd07f451cbe93249a4e092b300
+ARG ELECTRS_GIT_BRANCH=new-index
+
+WORKDIR /build
+RUN git clone --depth 1 --branch ${ELECTRS_GIT_BRANCH} ${ELECTRS_GIT_URL} . \
+    && if [ "${ELECTRS_GIT_REF}" != "${ELECTRS_GIT_BRANCH}" ]; then git fetch --depth 1 origin ${ELECTRS_GIT_REF} && git checkout ${ELECTRS_GIT_REF}; fi
+
+# Carry local patches under ./patches/. Each *.patch is applied with
+# `git apply --check` first so a stale rebase fails the build loudly
+# instead of silently no-op'ing. Bumping ELECTRS_GIT_REF requires
+# re-generating any patch that no longer applies — see the patch file
+# header for the upstream lines it touches.
+COPY patches/ /build/patches/
+RUN for p in /build/patches/*.patch; do \
+        echo "Applying $p"; \
+        git apply --check "$p" && git apply "$p"; \
+    done
+
+RUN cargo build --release --features liquid --locked
+
+# ─── Stage 2: runtime ───────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    netcat-openbsd \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system electrs \
+    && useradd --system --gid electrs --shell /usr/sbin/nologin electrs
+
+COPY --from=build /build/target/release/electrs /usr/local/bin/electrs
+
+# Pre-create the db dir owned by `electrs` so that:
+#   (a) callers who forget the `VOLUME` mount still get a writable
+#       path, and
+#   (b) Docker seeds a freshly-created named volume with this
+#       ownership on first mount (Docker copies the image's
+#       directory mode/owner into the new volume's root).
+# Without this, the empty named volume defaults to root:root mode
+# 0755, and the non-root `electrs` user crashloops with
+# `RocksDB ... PermissionDenied` on first start.
+RUN mkdir -p /var/lib/electrs \
+    && chown -R electrs:electrs /var/lib/electrs
+VOLUME ["/var/lib/electrs"]
+
+USER electrs
+EXPOSE 50001
+
+ENTRYPOINT ["/usr/local/bin/electrs"]
+CMD [\
+    "--network", "liquid",\
+    "--daemon-rpc-addr", "elementsd:7041",\
+    "--daemon-dir", "/var/lib/elementsd",\
+    "--db-dir", "/var/lib/electrs",\
+    "--electrum-rpc-addr", "0.0.0.0:50001"\
+]

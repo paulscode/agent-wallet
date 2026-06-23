@@ -1,0 +1,63 @@
+## Bare-LDK BOLT 12 onion-message gateway.
+##
+## This image runs ONLY the onion-message daemon. It owns no funds, no
+## channels, and no preimages. It pairs with the existing managed LND for
+## settlement and with the Python service for orchestration.
+##
+## Multi-stage build keeps the runtime image small (~80 MB) and free of
+## toolchain bloat / build-time secrets.
+
+# ─── Builder ─────────────────────────────────────────────────────────
+FROM rust:1.85-slim-bookworm AS builder
+
+# protoc is required by tonic-build at compile time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        pkg-config \
+        libssl-dev \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Cache dependency compilation by copying manifests first.
+COPY Cargo.toml Cargo.lock ./
+COPY bolt12-gateway/Cargo.toml bolt12-gateway/Cargo.toml
+COPY proto proto
+
+# Stub source so the dependency graph compiles without our code. The
+# crate is both a library (`src/lib.rs`, used by transport tests and
+# the LDK glue layer) and a binary (`src/main.rs`).
+RUN mkdir -p bolt12-gateway/src \
+    && echo 'fn main() {}' > bolt12-gateway/src/main.rs \
+    && echo '' > bolt12-gateway/src/lib.rs \
+    && cargo build --release -p bolt12-gateway \
+    && rm -rf bolt12-gateway/src
+
+# Now copy real source and build for real.
+COPY bolt12-gateway bolt12-gateway
+RUN touch bolt12-gateway/src/main.rs bolt12-gateway/src/lib.rs \
+    && cargo build --release -p bolt12-gateway \
+    && strip target/release/bolt12-gateway
+
+# ─── Runtime ─────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 gateway \
+    && useradd --system --uid 10001 --gid gateway --no-create-home gateway \
+    && mkdir -p /etc/bolt12-gateway /var/lib/bolt12-gateway \
+    && chown -R gateway:gateway /var/lib/bolt12-gateway
+
+COPY --from=builder /build/target/release/bolt12-gateway /usr/local/bin/bolt12-gateway
+
+USER gateway:gateway
+ENV RUST_LOG=info,bolt12_gateway=debug
+EXPOSE 50061
+
+ENTRYPOINT ["/usr/local/bin/bolt12-gateway"]

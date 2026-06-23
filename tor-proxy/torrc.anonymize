@@ -1,0 +1,75 @@
+# Tor configuration for the anonymize-only pool (split mode).
+#
+# Eight SOCKS5 listeners on 9050-9057 — one per anonymize call site.
+# Independent guard set + DataDirectory from the LND pool, so a
+# wedge on this side doesn't affect LND circuits and vice versa.
+# This is the file the tor-anonymize container loads when the
+# operator brings up the stack with docker-compose.tor-split.yml.
+#
+# Listener layout (same as the unified torrc):
+#   9050 — boltz_submarine
+#   9051 — boltz_reverse
+#   9052 — liquid
+#   9053 — chain_backend
+#   9054 — bip353_dns
+#   9055 — quote_cache_refresh
+#   9056 — chain_backend_general
+#   9057 — chain_backend_anonymize
+#
+# IsolateDestAddr + IsolateDestPort + IsolateSOCKSAuth ensure even
+# two requests on the same listener to different destinations OR
+# with different SOCKS auth use distinct circuits.
+
+# Defense-in-depth
+# allow-list restricting accepted SOCKS clients to localhost + docker
+# bridge ranges. See `tor-proxy/torrc` for the rationale.
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+SocksPort 0.0.0.0:9050 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9051 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9052 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9053 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9054 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9055 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9056 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9057 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+
+# Persistent DataDirectory. Mounted from the
+# ``tor_anonymize_data`` named volume; isolated from the LND pool.
+DataDirectory /var/lib/tor
+
+# Guard + circuit-build tuning. Identical to LND.
+NumEntryGuards 3
+GuardLifetime 6 weeks
+LearnCircuitBuildTimeout 1
+MaxCircuitDirtiness 600
+
+# LongLivedPorts. Less critical here than on the LND pool
+# (anonymize traffic is request/response with shorter natural
+# lifetimes) but still useful for the liquid hop's longer streams.
+LongLivedPorts 21,22,706,1863,5050,5190,5222,5223,6523,6667,6697,8080,8332,8333,8334,9735
+
+# Scrub onion addresses + peer fingerprints from notice
+# logs so operator log-pastes don't leak hidden-service contacts.
+SafeLogging 1
+
+# Accept connections from localhost (healthcheck) and Docker bridge networks
+SocksPolicy accept 127.0.0.1
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+# Disable exit relay (we only need client functionality)
+ExitRelay 0
+
+# Reduce log noise
+Log notice stderr
+
+# Control port for the anonymize-pool watchdog.
+ControlPort 0.0.0.0:9100
+# Entrypoint shim replaces this placeholder before exec'ing tor.
+#__HASHED_CONTROL_PASSWORD_LINE__

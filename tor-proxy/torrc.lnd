@@ -1,0 +1,64 @@
+# Tor configuration for the LND-only pool (split-mode).
+#
+# Single SOCKS5 listener on 9050 dedicated to LND outbound traffic.
+# Independent guard set + DataDirectory from the anonymize pool, so
+# a wedge on this side doesn't affect anonymize circuits and vice
+# versa. This is the file the tor-lnd container loads when the
+# operator brings up the stack with docker-compose.tor-split.yml.
+#
+# IsolateDestAddr + IsolateDestPort + IsolateSOCKSAuth match the
+# unified torrc so the application's existing per-call SOCKS auth
+# (anonymize/http.py) keeps its stream-isolation guarantee. LND
+# itself doesn't pass SOCKS auth — its single connection shares one
+# circuit with itself, which is the expected behaviour.
+
+# Defense-in-depth
+# allow-list restricting accepted SOCKS clients to localhost + docker
+# bridge ranges. See `tor-proxy/torrc` for the rationale.
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+SocksPort 0.0.0.0:9050 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+
+# Persistent DataDirectory. Mounted from the
+# ``tor_lnd_data`` named volume; isolated from the anonymize pool.
+DataDirectory /var/lib/tor
+
+# Guard + circuit-build tuning. Same values as the
+# unified torrc; the rationale is identical (single-guard exclusion
+# is what wedged us on 2026-05-21).
+NumEntryGuards 3
+GuardLifetime 6 weeks
+LearnCircuitBuildTimeout 1
+MaxCircuitDirtiness 600
+
+# LongLivedPorts. Critical for LND on this pool: 8080 is
+# LND REST and 9735 is LN peer-to-peer; HOLD-invoice payments
+# would be torn down without this.
+LongLivedPorts 21,22,706,1863,5050,5190,5222,5223,6523,6667,6697,8080,8332,8333,8334,9735
+
+# Scrub onion addresses + peer fingerprints from notice
+# logs so operator log-pastes don't leak hidden-service contacts.
+SafeLogging 1
+
+# Accept connections from localhost (healthcheck) and Docker bridge networks
+SocksPolicy accept 127.0.0.1
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+# Disable exit relay (we only need client functionality)
+ExitRelay 0
+
+# Reduce log noise
+Log notice stderr
+
+# Control port for the LND-pool watchdog. Same
+# auth model as the anonymize pool; both pools read the same
+# TOR_CONTROL_PASSWORD from env.
+ControlPort 0.0.0.0:9100
+# Entrypoint shim replaces this placeholder before exec'ing tor.
+#__HASHED_CONTROL_PASSWORD_LINE__

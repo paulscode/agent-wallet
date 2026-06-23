@@ -1,0 +1,101 @@
+# Split-mode Tor override.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.tor-split.yml up -d
+#
+# This override:
+#   - Disables the single ``tor-proxy`` service.
+#   - Adds two role-specific Tor services: ``tor-lnd`` (single
+#     listener on 9050 for LND traffic) and ``tor-anonymize``
+#     (eight listeners 9050-9057 for the anonymize call sites).
+#   - Each container has its own DataDirectory volume so a wedge
+#     on one pool's guard set doesn't bleed into the other.
+#   - Repoints ``api`` and ``celery-worker`` at the two new Tor
+#     services and turns on ``TOR_SPLIT_MODE`` in their envs.
+#
+# Migration story is in the operator runbook and the
+# Tor robustness plan.
+services:
+  # Disable the single-mode Tor proxy when running split.
+  # ``replicas: 0`` is the compose-idiomatic way to deactivate a
+  # service from an override without removing it from the base
+  # file (which other compose commands may still reference).
+  tor-proxy:
+    deploy:
+      replicas: 0
+
+  # ─── Tor (LND pool) ─────────────────────────────────────────────
+  tor-lnd:
+    build: ./tor-proxy
+    restart: unless-stopped
+    environment:
+      # The entrypoint shim reads this to pick the
+      # role-specific torrc default (00-default.conf.lnd).
+      TOR_ROLE: lnd
+      TOR_CONTROL_PASSWORD: ${TOR_CONTROL_PASSWORD:-}
+    volumes:
+      - tor_lnd_data:/var/lib/tor
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  # ─── Tor (Anonymize pool) ──────────────────────────────────────
+  tor-anonymize:
+    build: ./tor-proxy
+    restart: unless-stopped
+    environment:
+      TOR_ROLE: anonymize
+      TOR_CONTROL_PASSWORD: ${TOR_CONTROL_PASSWORD:-}
+    volumes:
+      - tor_anonymize_data:/var/lib/tor
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+
+  # ─── API: repoint at the split Tor services ───────────────────
+  api:
+    environment:
+      LND_TOR_PROXY: socks5://tor-lnd:9050
+      ANONYMIZE_TOR_SOCKS_HOST: tor-anonymize
+      ANONYMIZE_TOR_CONTROL_HOST: tor-anonymize
+      LND_TOR_CONTROL_HOST: tor-lnd
+      LND_TOR_CONTROL_PORT: "9100"
+      TOR_SPLIT_MODE: "true"
+    depends_on:
+      tor-lnd:
+        condition: service_healthy
+      tor-anonymize:
+        condition: service_healthy
+    volumes:
+      # The watchdog statvfs()s both pool data dirs in
+      # split mode. The default api volumes block in
+      # docker-compose.yml only mounts the unified tor_data; this
+      # override REPLACES that list with the split-pool volumes.
+      - tor_lnd_data:/var/lib/tor-lnd:ro
+      - tor_anonymize_data:/var/lib/tor-anonymize:ro
+
+  # ─── Celery worker: same SOCKS routing as the api ─────────────
+  celery-worker:
+    environment:
+      LND_TOR_PROXY: socks5://tor-lnd:9050
+      ANONYMIZE_TOR_SOCKS_HOST: tor-anonymize
+      ANONYMIZE_TOR_CONTROL_HOST: tor-anonymize
+      LND_TOR_CONTROL_HOST: tor-lnd
+      LND_TOR_CONTROL_PORT: "9100"
+      TOR_SPLIT_MODE: "true"
+    depends_on:
+      tor-lnd:
+        condition: service_healthy
+      tor-anonymize:
+        condition: service_healthy
+
+volumes:
+  # Independent DataDirectory volumes per pool. Without
+  # this both Tors would share a consensus cache + guard list,
+  # which defeats the point of splitting.
+  tor_lnd_data:
+  tor_anonymize_data:

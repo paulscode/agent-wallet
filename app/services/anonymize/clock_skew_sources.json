@@ -1,0 +1,20 @@
+[
+  {
+    "source_id": "duckduckgo-onion",
+    "url": "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/",
+    "label": "DuckDuckGo onion",
+    "last_audit_date": "2026-05-15"
+  },
+  {
+    "source_id": "protonmail-onion",
+    "url": "https://protonmailrmez3lotccipshtkleegetolb73fuirgj7r4o4vfu7ozyd.onion/",
+    "label": "ProtonMail onion",
+    "last_audit_date": "2026-05-15"
+  },
+  {
+    "source_id": "torproject-check",
+    "url": "https://check.torproject.org/",
+    "label": "Tor Project (clearnet via Tor SOCKS)",
+    "last_audit_date": "2026-05-15"
+  }
+]

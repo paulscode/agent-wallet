@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Login — Agent Wallet{% endblock %}
+
+{% block body %}
+<div class="min-h-screen flex items-center justify-center px-4">
+    <div class="w-full max-w-sm">
+        <!-- Logo & Title -->
+        <div class="text-center mb-8">
+            <img src="/dashboard/static/logo.png" alt="Agent Wallet" class="w-16 h-16 mx-auto mb-4 rounded-lg">
+            <h1 class="text-2xl font-bold text-white">Agent Wallet</h1>
+            <p class="text-gray-400 text-sm mt-1">Dashboard Login</p>
+        </div>
+
+        <!-- Login Card -->
+        <div class="bg-navy-900 border border-navy-700 rounded-lg p-6 shadow-lg">
+            {% if error %}
+            <div class="mb-4 p-3 rounded-lg bg-neon-pink/10 border border-neon-pink/30 text-neon-pink text-sm">
+                {{ error }}
+            </div>
+            {% endif %}
+
+            <form method="POST" action="/dashboard/login">
+                <input type="hidden" name="login_nonce" value="{{ login_nonce }}">
+                <!-- Hidden username field is a Chromium/WebKit accessibility
+                     hint: password managers and screen readers expect every
+                     password input to be paired with a username field. The
+                     dashboard authenticates with a single shared password
+                     (no username concept), so this field is hidden,
+                     non-editable, and never submitted to the server. -->
+                <input
+                    type="text"
+                    name="username"
+                    value="dashboard"
+                    autocomplete="username"
+                    tabindex="-1"
+                    aria-hidden="true"
+                    readonly
+                    class="hidden"
+                >
+                <label for="password" class="block text-sm text-gray-400 mb-2">Dashboard Password</label>
+                <input
+                    type="password"
+                    id="password"
+                    name="password"
+                    required
+                    autofocus
+                    autocomplete="current-password"
+                    placeholder="Enter your dashboard password"
+                    class="w-full bg-navy-800 border border-navy-600 rounded-lg px-3 py-2.5 text-white font-mono text-sm placeholder-gray-600 focus:border-neon-cyan/50 focus:ring-1 focus:ring-neon-cyan/20 focus:outline-none mb-4"
+                >
+                <button
+                    type="submit"
+                    class="w-full bg-neon-cyan/15 border border-neon-cyan/30 text-neon-cyan font-medium rounded-lg px-4 py-2.5 hover:bg-neon-cyan/25 transition-colors"
+                >
+                    Sign In
+                </button>
+            </form>
+        </div>
+
+        <p class="text-center text-gray-600 text-xs mt-4">
+            Password is set via DASHBOARD_TOKEN in .env
+        </p>
+    </div>
+</div>
+{% endblock %}

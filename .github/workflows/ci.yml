@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least-privilege default token scope for every job.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Ruff check
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+      - name: Mypy
+        run: mypy app/
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Run tests
+        # Behavioral suite (coverage-gated). Source-structure guardrail tests
+        # carry no app coverage and run as a separate step below.
+        run: pytest -m "not guardrail" --cov=app --cov-report=term-missing --cov-report=xml -q
+      - name: Run guardrail tests
+        # Source-structure / supply-chain lint assertions; not coverage-gated.
+        run: pytest -m guardrail -q
+      - name: Check coverage threshold
+        if: matrix.python-version == '3.12'
+        # Threshold is single-sourced from [tool.coverage.report] fail_under in
+        # pyproject.toml; plain ``coverage report`` reads and enforces it.
+        run: |
+          coverage report
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  security:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install pip-audit
+      - run: pip install -e .
+      - name: Audit Python dependencies
+        run: pip-audit --strict
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+      - name: Audit Node.js dependencies
+        run: cd scripts && npm ci && npm audit --audit-level=moderate
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build Docker image
+        run: docker build -t agent-wallet:ci .
+
+  gateway:
+    name: BOLT 12 Gateway (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo fmt
+        run: cargo fmt --manifest-path Cargo.toml --all -- --check
+      - name: cargo clippy
+        run: cargo clippy -p bolt12-gateway --all-targets -- -D warnings
+      - name: cargo build (release)
+        run: cargo build --release -p bolt12-gateway
+      - name: cargo test
+        run: cargo test -p bolt12-gateway --all-features
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - name: Build gateway Docker image
+        run: docker build -f Dockerfile.gateway -t bolt12-gateway:ci .

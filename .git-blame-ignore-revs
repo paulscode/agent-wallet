@@ -1,0 +1,11 @@
+# Revisions to ignore in `git blame` — purely-mechanical, tree-wide reformats/auto-fixes.
+# Enable locally with:  git config blame.ignoreRevsFile .git-blame-ignore-revs
+# GitHub honors this file automatically.
+#
+# Hashes appended by the ruff cleanup effort:
+
+# ruff check --fix sweep (import order, dead code, whitespace)
+74c4ad15a36d469b4af42969c2cc235091eb01f4
+
+# ruff format adoption (whole-tree formatter, ruff 0.15.17)
+ce39babd5eaef6302d5ac9166e4a5af19506f72f

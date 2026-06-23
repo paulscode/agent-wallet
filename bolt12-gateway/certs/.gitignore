@@ -1,0 +1,8 @@
+# Generated mTLS material — never commit cert/key files.
+*.pem
+*.key
+*.crt
+*.srl
+*.csr
+*.cnf
+!README.md

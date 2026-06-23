@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Hide native number-input spinners on inputs with the
+   ``no-spinner`` class. Used on compact fee/timeout inputs in the
+   Send Payment dialog where a "sats"/"sec" suffix sits in the right
+   gutter — the browser-drawn spinner buttons would otherwise crowd
+   or overlap the suffix. Users can still type and arrow-key. */
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.no-spinner {
+    -moz-appearance: textfield;
+    appearance: textfield;
+}

@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Anonymize — operator diversity</title>
+<style>
+  /* Self-contained help page. Mirrors the dashboard's dark theme
+     without depending on Tailwind. Inline styles are allowed by the
+     /dashboard CSP via ``style-src 'self' 'unsafe-inline'``; no
+     scripts to keep this page CSP-clean and easy to audit. */
+  :root {
+    color-scheme: dark;
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --border: #334155;
+    --fg: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #60a5fa;
+    --warn: #fbbf24;
+    --ok: #4ade80;
+    --code-bg: #0b1220;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  main {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 4rem;
+  }
+  header.page {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  header.page h1 {
+    margin: 0;
+    font-size: 1.65rem;
+    font-weight: 600;
+  }
+  header.page p.sub {
+    margin: 0.35rem 0 0;
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+  h2 {
+    margin: 2rem 0 0.5rem;
+    font-size: 1.25rem;
+    font-weight: 600;
+  }
+  h3 {
+    margin: 1.75rem 0 0.5rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  p, ul, ol { margin: 0.5rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: 0.35rem 0; }
+  code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.88em;
+    color: #cbd5e1;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    margin: 1rem 0;
+    border-left: 3px solid var(--warn);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.75rem 0;
+    font-size: 0.92rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<header class="page">
+  <h1>Operator diversity for on-chain Anonymize</h1>
+  <p class="sub">
+    Why the wizard caps single-operator on-chain sessions at the
+    <b>moderate</b> tier, what's still protected, and what configuring
+    a second operator buys you.
+  </p>
+</header>
+
+<div class="panel">
+  <p style="margin-top:0">
+    <b>TL;DR.</b> The wallet's bundled <code>operators.json</code>
+    ships three operators: canonical Boltz, Middleway, and Eldamar.
+    The default chain puts <b>canonical Boltz on the reverse leg</b>
+    (where the destination address is exposed) and <b>Middleway →
+    Eldamar on the submarine leg</b> with a pre-funding fallback
+    chain. If both alts are unreachable at quote time, the wizard
+    offers single-operator Boltz at the cost of capping the tier at
+    <code>moderate</code>. All other privacy defenses — Tor stream
+    isolation, amount binning, MPP fragmentation, randomized
+    inter-leg delay, optional Liquid hop — apply on every session
+    regardless of the operator pair.
+  </p>
+</div>
+
+<h2>What an on-chain anonymize session looks like</h2>
+<p>An on-chain anonymize session has two halves:</p>
+<ol>
+  <li><b>Submarine swap.</b> Your on-chain BTC funds a lockup address
+    controlled by Boltz operator A; operator A pays you Lightning
+    sats.</li>
+  <li><b>Reverse swap.</b> You pay Lightning sats to operator B;
+    operator B sends BTC to your destination address.</li>
+</ol>
+<p>
+  If operator A and operator B are the same entity, their logs contain
+  both halves: the input UTXO that funded the submarine lockup, the
+  destination address from the reverse-swap request, and the
+  approximate timing + binned amount of both. Two genuinely
+  independent operators each only see one half.
+</p>
+
+<h2>What's still mitigated with one operator</h2>
+<p>
+  The wallet's other defenses don't go away when only one operator is
+  configured. With a single operator the following are still active
+  on every on-chain session:
+</p>
+<table>
+  <thead>
+    <tr><th>Defense</th><th>Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Tor stream isolation</td>
+      <td>The submarine and reverse legs run on different SOCKS
+        listeners with fresh Tor circuits. The operator can't link
+        the two requests by circuit identity.</td>
+    </tr>
+    <tr>
+      <td>Pinned-JA4 HTTP client</td>
+      <td>Both legs share an identical, fingerprint-pinned TLS
+        handshake. The TLS layer doesn't differentiate the two
+        calls.</td>
+    </tr>
+    <tr>
+      <td>Per-call internal-ID strip</td>
+      <td>Neither leg's request body carries session IDs, quote
+        tokens, or other wallet-internal identifiers.</td>
+    </tr>
+    <tr>
+      <td>Amount binning</td>
+      <td>Both legs use a bin amount, not your exact request, so
+        amount-based matching has many candidates.</td>
+    </tr>
+    <tr>
+      <td>Inter-leg delay (6–48 h)</td>
+      <td>The two legs are separated by a randomized multi-hour gap,
+        weakening timing correlation.</td>
+    </tr>
+    <tr>
+      <td>Priv-channel hop</td>
+      <td>Lightning-side traffic routes through a fresh throwaway
+        private channel, hiding your primary Lightning node identity
+        from the operator.</td>
+    </tr>
+    <tr>
+      <td>MPP fragmentation</td>
+      <td>Lightning payments are split across paths, weakening any
+        "this LN node paid me" signal.</td>
+    </tr>
+    <tr>
+      <td>Liquid round-trip hop</td>
+      <td>Interposes a Confidential-Transactions-blinded L-BTC dwell
+        between the two legs (when enabled).</td>
+    </tr>
+  </tbody>
+</table>
+<p>
+  A single-operator session with all of these active is meaningfully
+  better than no mixing — an attacker has to actively correlate
+  amounts, timings, and destination addresses against the operator's
+  own volume to break the link. The operator has the data to attempt
+  this; the wallet's job is to make the work hard and the result
+  probabilistic.
+</p>
+
+<h2>What the wallet can't defend against in software</h2>
+<p>Two things genuinely require operator diversity:</p>
+<ol>
+  <li><b>A logging-then-correlating operator.</b> If Boltz (or any
+    single operator) chooses to log both halves and run a correlation
+    pipeline on its own data, no in-wallet mitigation breaks the
+    link. The wallet can raise the noise floor but can't make the
+    data unavailable.</li>
+  <li><b>A subpoenaed or compromised operator.</b> Logs the operator
+    keeps for legitimate operational reasons (anti-abuse, support
+    tickets, fee accounting) become correlation evidence if a future
+    legal compulsion or breach exposes them.</li>
+</ol>
+<p>
+  For both, <b>two independent operators</b> is the only defense —
+  neither alone has the full picture.
+</p>
+
+<h2>How to add a second operator</h2>
+<p>
+  Set both <code>BOLTZ_SUBMARINE_ONION_URL</code> and
+  <code>BOLTZ_REVERSE_ONION_URL</code> in your <code>.env</code> to
+  distinct onion URLs of two independent Boltz-compatible operators.
+  The wizard re-renders the tier badge and removes the banner without
+  a redeploy.
+</p>
+<p>
+  Picking a non-canonical operator deserves diligence — onion
+  authenticity, Lightning liquidity in your bin range, contact
+  responsiveness, backend version, uptime history. The maintainer
+  runbook has the full checklist plus pointers to community-curated
+  operator lists and a guide to running your own operator:
+</p>
+<p>
+  <a href="https://github.com/paulscode/agent-wallet/blob/main/docs/anonymize_operator_diversity.md"
+     target="_blank" rel="noopener">
+    docs/anonymize_operator_diversity.md →
+  </a>
+</p>
+
+<h2>References</h2>
+<ul>
+  <li>
+    <a href="https://github.com/paulscode/agent-wallet/blob/main/docs/anonymize.md"
+       target="_blank" rel="noopener">docs/anonymize.md</a>
+    — operator runbook, tier definitions, full config inventory.
+  </li>
+  <li>
+    <a href="https://github.com/SwapMarket/swapmarket.github.io"
+       target="_blank" rel="noopener">SwapMarket repository</a>
+    — community-curated list of Boltz-compatible providers.
+  </li>
+  <li>
+    <a href="https://api.docs.boltz.exchange/"
+       target="_blank" rel="noopener">Boltz API documentation</a>
+    — authoritative Boltz endpoint reference.
+  </li>
+</ul>
+
+</main>
+</body>
+</html>

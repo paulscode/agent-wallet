@@ -1,0 +1,224 @@
+[project]
+name = "agent-wallet"
+version = "0.1.0"
+description = "A Bitcoin and Lightning wallet service providing AI agents an interface for transacting in Bitcoin"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Office/Business :: Financial",
+]
+dependencies = [
+    "fastapi>=0.115.0,<1.0",
+    "uvicorn[standard]>=0.30.0,<1.0",
+    "pydantic>=2.0,<3.0",
+    "pydantic-settings>=2.0,<3.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "asyncpg>=0.29.0,<1.0",
+    "alembic>=1.13.0,<2.0",
+    "httpx>=0.27.0,<1.0",
+    "socksio>=1.0.0,<2.0",
+    "cryptography>=46.0.6,<49.0",
+    "celery[redis]>=5.3.0,<6.0",
+    "redis>=5.0,<6.0",
+    "slowapi>=0.1.9,<1.0",
+    "python-multipart>=0.0.31,<1.0",
+    "python-dotenv>=1.0.0,<2.0",
+    "jinja2>=3.1.0,<4.0",
+    "grpcio>=1.60,<2.0",
+    "protobuf>=4.25,<7.0",
+    "coincurve>=20,<22",
+    "dnspython>=2.6,<3.0",
+    # Liquid Confidential Transactions support (Liquid hop). Provides
+    # Pedersen commitments, rangeproofs, surjection proofs, SLIP-77
+    # master blinding key derivation, and Elements/Liquid tx
+    # serialisation. Authored by Blockstream; bundles libsecp256k1-zkp.
+    "wallycore>=1.5.0,<2.0",
+    # Security floors for transitive deps (request-path / crypto chain).
+    # pip-audit-flagged advisories require at least these versions.
+    "starlette>=1.3.1",
+    "pyjwt>=2.13.0",
+    "urllib3>=2.7.0",
+    "idna>=3.15",
+]
+
+[project.optional-dependencies]
+json-logging = [
+    "python-json-logger>=3.0,<4.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0",
+    # Optional parallel test runner. The suite is process-isolated (in-memory
+    # SQLite per worker, no shared ports/files), so `pytest -n auto` is a safe
+    # ~10x speedup. Left out of addopts on purpose: the default serial run
+    # stays the canonical single-process isolation check; opt into `-n` for
+    # speed. pytest-cov merges per-worker coverage automatically.
+    "pytest-xdist>=3.6",
+    "httpx",
+    "aiosqlite>=0.20.0",
+    "mypy>=1.0",
+    # Pinned exactly: ruff's formatter output changes between releases, so an
+    # unpinned spec would let CI's `ruff format --check .` drift red whenever a
+    # new ruff ships. Bump deliberately (reformat + re-verify) — see
+    # .pre-commit-config.yaml, which must track this version.
+    "ruff==0.15.17",
+    "fakeredis[lua]>=2.21.0",
+    "pip-audit>=2.7.0",
+    "grpcio-tools>=1.60,<2.0",
+    # Property-based testing for round-trip / codec / state-machine invariants.
+    # Run deterministically in CI via the "ci" profile (see tests/conftest.py).
+    "hypothesis>=6.100",
+]
+
+[project.urls]
+Homepage = "https://github.com/paulscode/agent-wallet"
+Repository = "https://github.com/paulscode/agent-wallet"
+Issues = "https://github.com/paulscode/agent-wallet/issues"
+
+[project.scripts]
+# Convenience launcher (dev/single-process). For production, run
+# uvicorn/gunicorn directly to tune workers, timeouts, and TLS.
+agent-wallet = "app.main:run"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# The -W flag below also suppresses the swigvarlink warning at
+# interpreter shutdown (after pytest's own filterwarnings have stopped
+# applying); the in-session filter below is kept for symmetry.
+addopts = ["-W", "ignore:builtin type swigvarlink:DeprecationWarning"]
+filterwarnings = [
+    "error",
+    # wallycore (SWIG-wrapped Libwally) emits this at interpreter
+    # shutdown on Python 3.12+. Upstream SWIG fix tracked at
+    # https://github.com/swig/swig/issues/2659 — nothing for us to fix.
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+    # Cross-test event-loop pollution: some pytest-asyncio tests
+    # leave background tasks pinned to an event loop that's then
+    # destroyed by pytest's teardown, surfacing as
+    # ``unclosed event loop`` ResourceWarning. The warning is
+    # process-global (not attributable to a specific test) so
+    # promoting it to ``error`` via the rule above causes
+    # arbitrary cross-file failures. Ignore the specific message.
+    "ignore:unclosed event loop:ResourceWarning",
+    # Same class of teardown race, thread side: aiosqlite runs each SQLite
+    # connection in a worker thread (the test DB is sqlite+aiosqlite). When a
+    # DB-querying background loop (anonymize / runtime probes, etc.) is
+    # cancelled mid-query at teardown, that worker thread calls
+    # ``call_soon_threadsafe`` on the now-closed test event loop and raises
+    # ``RuntimeError: Event loop is closed``. pytest's threadexception plugin
+    # turns it into PytestUnhandledThreadExceptionWarning and ``error`` above
+    # promotes it to a hard failure — attributed to whatever test is active
+    # when it surfaces, so it floats across files (the conftest BOLT12
+    # subscriber flags mitigate the most common source; this covers the rest).
+    # Scoped to the closed-loop message only, so a genuine thread exception
+    # still fails. [\s\S] (not .*) because the warning message is multi-line.
+    "ignore:Exception in thread[\\s\\S]*Event loop is closed:pytest.PytestUnhandledThreadExceptionWarning",
+    # Connection-object side of the same teardown race. aiosqlite runs each
+    # SQLite connection on a worker thread; when a DB-querying background loop
+    # (subscriber / supervisor / runtime probe) is cancelled at teardown, the
+    # connection can be garbage-collected after its event loop has already
+    # closed. CPython then emits a ResourceWarning from ``Connection.__del__``
+    # during GC, which pytest's unraisableexception plugin re-raises as
+    # ``PytestUnraisableExceptionWarning`` — and ``error`` above would promote
+    # it to a hard failure attributed to whatever test is active when GC runs
+    # (so it floats across files and is flaky under ``-n`` parallelism, never
+    # reproducing serially or in isolation). Scoped to the aiosqlite
+    # connection-deleted message so a genuine unraisable exception still fails.
+    # [\s\S] (not .*) because the wrapped warning text is multi-line.
+    "ignore:[\\s\\S]*aiosqlite[\\s\\S]*was deleted before being closed:pytest.PytestUnraisableExceptionWarning",
+    "ignore:[\\s\\S]*aiosqlite[\\s\\S]*was deleted before being closed:ResourceWarning",
+]
+markers = [
+    "slow: nightly-only stochastic / distribution tests.",
+    "regtest_harness: requires the BoltzExchange/regtest harness running locally (skipped otherwise).",
+    "integration_tor: end-to-end Tor recovery test that needs a real Tor process + iptables manipulation. Skipped by default; opt in with TOR_E2E_RECOVERY=1.",
+    "guardrail: source-structure / supply-chain lint assertions, not behavioral tests. Run as a separate CI step and excluded from the coverage-gated behavioral run.",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+# Generated protobuf stubs are regenerated by protoc/grpc with their own
+# formatting; exclude from BOTH `ruff check` and `ruff format` so the
+# formatter never fights the generator (the per-file-ignore below only
+# covers `check`). Keep this in sync with that entry.
+extend-exclude = ["app/services/bolt12_gateway/_proto"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+# E501 ignored: line-length above handles formatting; E501 catches non-fixable cases in strings/comments.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# E402: imports must be after os.environ overrides (settings before app imports)
+"app/main.py" = ["E402"]
+"tests/conftest.py" = ["E402"]
+# N806: MockClient / similar test helpers use PascalCase in functions
+# N802: gRPC servicer methods are PascalCase by protobuf convention
+# F811: shared pytest fixtures are imported then used as test parameters; ruff reads the
+#       parameter as a redefinition of the imported name (a classic pytest false-positive).
+# E402: tests group imports under "── section ──" dividers (and after monkeypatch/env
+#       setup); deliberate house style, no runtime effect.
+# N811/N814: tests use terse local import aliases for private constants / mock classes
+#       (e.g. ``_STATE as state``, ``MagicMock as _MM``) — readability ergonomics, not code.
+"tests/**" = ["N802", "N806", "F811", "E402", "N811", "N814"]
+# E402: the anonymize package deliberately places some module-level imports mid-file,
+#       under section dividers — e.g. clock.py imports .http/.tor at module scope (below
+#       the functions) so tests can monkeypatch ``clock.get_anonymize_client`` without the
+#       function-local import re-resolving each call. Intentional; no runtime effect.
+"app/services/anonymize/*" = ["E402"]
+# E402: import co-located with its SQLAlchemy event-listener registration section.
+"app/models/boltz_swap.py" = ["E402"]
+# Generated protobuf stubs — never lint.
+"app/services/bolt12_gateway/_proto/*" = ["E", "F", "I", "N", "W"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = [
+    # Generated protobuf / gRPC stubs — measuring them is noise.
+    "app/services/bolt12_gateway/_proto/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+precision = 1
+# Coverage floor lives here so CI and local runs share one source of truth;
+# CI invokes plain ``coverage report`` which reads this value. Branch coverage
+# is on; ratchet this up as the floor rises, never down. Held a couple of
+# points below the realized total so it locks in the gain without blocking
+# unrelated work on minor coverage dips.
+fail_under = 83
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Generated protobuf code lacks proper type annotations.
+module = "app.services.bolt12_gateway._proto.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# grpc lacks first-party type stubs that work cleanly with grpc.aio.
+module = ["grpc", "grpc.aio"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# wallycore (Blockstream libwally) ships no type stubs / py.typed marker.
+module = ["wallycore"]
+ignore_missing_imports = true

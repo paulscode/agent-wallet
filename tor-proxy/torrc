@@ -1,0 +1,104 @@
+# Tor configuration for Agent Wallet — 8 isolated SOCKS5 listeners.
+#
+# Each anonymize leg uses a dedicated SOCKS port so its streams never
+# share a circuit with another leg's. LND traffic shares 9050 with the
+# boltz_submarine listener in v1; the wallet surfaces this in its
+# startup gates as a known limitation operators can opt out of by
+# running a second Tor instance for LND.
+#
+#   9050 — boltz_submarine        (also LND in single-Tor v1)
+#   9051 — boltz_reverse
+#   9052 — liquid
+#   9053 — chain_backend
+#   9054 — bip353_dns
+#   9055 — quote_cache_refresh
+#   9056 — chain_backend_general
+#   9057 — chain_backend_anonymize
+#
+# IsolateDestAddr + IsolateDestPort ensure even two requests on the
+# same listener to different destinations use distinct circuits.
+
+# Defense-in-depth.
+# The SocksPort bind is wildcard inside the container so any service
+# on the docker network can reach it (the wallet's compose stack is
+# already isolated by docker network, but a misconfigured operator
+# override that publishes 9050 on the host would expose Tor without
+# this allow-list). SocksPolicy below restricts accepted SOCKS
+# clients to localhost + the standard RFC1918 docker bridge ranges;
+# any source outside those ranges is rejected even if the bind line
+# is widened later.
+SocksPolicy accept 127.0.0.0/8
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 10.0.0.0/8
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+SocksPort 0.0.0.0:9050 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9051 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9052 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9053 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9054 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9055 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9056 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+SocksPort 0.0.0.0:9057 IsolateDestAddr IsolateDestPort IsolateSOCKSAuth
+
+# Persistent DataDirectory. Without this, every container
+# restart resets the consensus cache + guard selections, costing
+# ~60s of re-bootstrap on every restart. The /var/lib/tor volume is
+# mounted from a named compose volume; growth is monitored by the
+# watchdog so it doesn't surprise the operator.
+DataDirectory /var/lib/tor
+
+# Guard / circuit-build tuning. Defaults are conservative for
+# general browsing; the 2026-05-21 incident's "All current guards
+# excluded by path restriction type 2" warning showed that Tor's
+# single-guard default leaves us wedged when that one guard can't
+# satisfy a path constraint. The values below trade slightly weaker
+# guard-rotation entropy for materially better recovery behaviour.
+NumEntryGuards 3
+GuardLifetime 6 weeks
+LearnCircuitBuildTimeout 1
+MaxCircuitDirtiness 600
+
+# LongLivedPorts. The CBT learner gives circuits to these
+# ports more patience before declaring them unusable. Default list
+# is ssh/irc/etc; we add 8080 (LND REST) + 9735 (LN p2p) so HOLD-
+# invoice payments don't trip aggressive teardowns mid-stream.
+LongLivedPorts 21,22,706,1863,5050,5190,5222,5223,6523,6667,6697,8080,8332,8333,8334,9735
+
+# SafeLogging scrubs sensitive identifiers (target addresses,
+# peer fingerprints, stream IDs) from notice-level output. Operators
+# often paste docker logs into bug reports; this prevents accidental
+# disclosure of which onion services we contact and when.
+SafeLogging 1
+
+# Accept connections from localhost (healthcheck) and Docker bridge networks
+SocksPolicy accept 127.0.0.1
+SocksPolicy accept 172.16.0.0/12
+SocksPolicy accept 192.168.0.0/16
+SocksPolicy reject *
+
+# Disable exit relay (we only need client functionality)
+ExitRelay 0
+
+# Reduce log noise
+Log notice stderr
+
+# Control port for the wallet's bootstrap probes,
+# circuit-status reads, and the NEWNYM watchdog. Bound to
+# the container network so it's reachable from sibling containers
+# but not from the host (`network_mode: host` deployments must
+# explicitly remap; see operator runbook).
+#
+# Authentication: ``HashedControlPassword`` — the
+# tor-proxy/entrypoint.sh shim derives the hash from
+# $TOR_CONTROL_PASSWORD at container start. If the env var is
+# unset, the shim falls back to the no-auth-required boot pattern
+# (still gated by SocksPolicy + container isolation). The wallet's
+# control-port client at app/services/anonymize/tor.py reads the
+# same plaintext password from settings.anonymize_tor_control_password
+# and uses it for AUTHENTICATE.
+ControlPort 0.0.0.0:9100
+# The directive below is a placeholder; the entrypoint shim
+# replaces it (or removes it) before exec'ing tor.
+#__HASHED_CONTROL_PASSWORD_LINE__

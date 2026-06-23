@@ -1,0 +1,26 @@
+[
+  {
+    "operator_id": "boltz-canonical",
+    "onion": "http://boltzzzbnus4m7mta3cxmflnps4fp7dueu2tgurstbvrbt6xswzcocyd.onion/api/v2",
+    "public_key_hex": "",
+    "attested_min_24h_volume_satoshis": 0,
+    "clearnet_fallback": "https://api.boltz.exchange/v2",
+    "last_audit_date": "2026-05-13"
+  },
+  {
+    "operator_id": "middleway",
+    "onion": "http://middlwayksj5gak7pgaag32kcslzkjrpois57qtquiydpaqpy5fhzhqd.onion/v2",
+    "public_key_hex": "",
+    "attested_min_24h_volume_satoshis": 0,
+    "clearnet_fallback": "https://api.middle-way.space/v2",
+    "last_audit_date": "2026-05-13"
+  },
+  {
+    "operator_id": "eldamar",
+    "onion": "http://mnyazp2duhs3jewqzw7g6vv44g73ijiujdmk5z6js72fn3epybup2yqd.onion/v2",
+    "public_key_hex": "",
+    "attested_min_24h_volume_satoshis": 0,
+    "clearnet_fallback": "https://boltz-api.eldamar.icu/v2",
+    "last_audit_date": "2026-05-13"
+  }
+]

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {# CSRF token is
+       delivered in this meta tag (and in the login JSON response)
+       instead of a JS-readable cookie. Dashboard JS reads from here
+       and rotates it whenever the server sends ``X-CSRF-Token-Next``
+       . #}
+    {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
+    <title>{% block title %}Agent Wallet{% endblock %}</title>
+    <link rel="icon" href="/dashboard/static/favicon.ico" sizes="any">
+    <link rel="icon" href="/dashboard/static/logo.png" type="image/png">
+
+    <!-- Tailwind CSS (bundled at build time) -->
+    <link rel="stylesheet" href="/dashboard/static/dashboard.min.css">
+    <style nonce="{{ csp_nonce }}">
+        body { background-color: #0a0e27; color: #e5e7eb; }
+        /* Scrollbar styling */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #141b34; }
+        ::-webkit-scrollbar-thumb { background: #283764; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3d4f7c; }
+        /* Pulsing sync indicator */
+        @keyframes pulse-neon { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .animate-pulse-neon { animation: pulse-neon 2s ease-in-out infinite; }
+        /* Card hover */
+        .card-hover { transition: all 0.3s ease; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3); }
+        .card-hover:hover { box-shadow: 0 0 20px rgba(0, 217, 255, 0.2); }
+        /* Tab underline */
+        .tab-active { border-bottom: 2px solid #ffbe0b; color: #ffbe0b; }
+        /* Capacity bar */
+        .capacity-bar { height: 6px; border-radius: 3px; overflow: hidden; }
+        /* Animated dashed flow used by the rebalance arrow */
+        @keyframes dash-flow { to { stroke-dashoffset: -10; } }
+
+        /* Block clock — gentle flip-in when a new block is mined. The
+           value gets a one-shot ``block-clock-bump`` class for ~0.9s
+           via Alpine, after which it returns to its idle state. The
+           cyan glow is sized to read as "something just changed"
+           without being distracting at the corner of the viewport. */
+        @keyframes block-clock-bump {
+            0%   { transform: translateY(-0.4em) scale(1.05); opacity: 0; filter: drop-shadow(0 0 6px rgba(0, 217, 255, 0.9)); }
+            40%  { transform: translateY(0) scale(1.05);      opacity: 1; filter: drop-shadow(0 0 8px rgba(0, 217, 255, 0.7)); }
+            100% { transform: translateY(0) scale(1);         opacity: 1; filter: drop-shadow(0 0 0 rgba(0, 217, 255, 0)); }
+        }
+        .block-clock-bump { animation: block-clock-bump 0.9s ease-out; }
+        @keyframes block-clock-pulse { 0%, 100% { box-shadow: 0 0 0 rgba(0, 217, 255, 0.0); } 50% { box-shadow: 0 0 12px rgba(0, 217, 255, 0.35); } }
+        .block-clock { font-variant-numeric: tabular-nums; animation: block-clock-pulse 6s ease-in-out infinite; }
+
+        /* Footer tip-jar coffee cup: three steam wisps gently sway and fade
+           in/out at staggered phases so the eye catches the motion without
+           it feeling like a hard pulse. */
+        @keyframes coffee-steam-sway {
+            0%, 100% { transform: translate(0, 0); opacity: 0.35; }
+            25%      { transform: translate(0.4px, -0.8px); opacity: 0.7; }
+            50%      { transform: translate(0, -1.4px); opacity: 0.95; }
+            75%      { transform: translate(-0.4px, -0.8px); opacity: 0.7; }
+        }
+        .coffee-steam { animation: coffee-steam-sway 2.8s ease-in-out infinite; transform-box: fill-box; transform-origin: center bottom; }
+        .coffee-steam-2 { animation-delay: -0.9s; }
+        .coffee-steam-3 { animation-delay: -1.8s; }
+
+        /* Receive-Lightning "payment received" celebration. The QR
+           swaps out for a stack of expanding neon-green rings (sonar),
+           a popping check icon, eight sparks fanning outward, and a
+           one-shot border glow on the dialog itself. Each layer is its
+           own keyframe so they can compose at different durations and
+           delays without fighting one transition. */
+        @keyframes recv-paid-ring {
+            0%   { transform: translate(-50%, -50%) scale(0.25); opacity: 0.9; }
+            100% { transform: translate(-50%, -50%) scale(3.2);  opacity: 0; }
+        }
+        @keyframes recv-paid-check-pop {
+            0%   { transform: scale(0)    rotate(-12deg); opacity: 0; }
+            55%  { transform: scale(1.25) rotate(4deg);   opacity: 1; }
+            100% { transform: scale(1)    rotate(0);      opacity: 1; }
+        }
+        @keyframes recv-paid-spark {
+            0%   { transform: translateX(0)    scale(0);   opacity: 0; }
+            18%  { transform: translateX(10px) scale(1);   opacity: 1; }
+            100% { transform: translateX(64px) scale(0.3); opacity: 0; }
+        }
+        @keyframes recv-paid-title {
+            0%   { transform: translateY(10px); opacity: 0; }
+            100% { transform: translateY(0);    opacity: 1; }
+        }
+        @keyframes recv-paid-glow {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(6, 255, 165, 0); }
+            30%      { box-shadow: 0 0 48px 6px rgba(6, 255, 165, 0.55); }
+        }
+        .recv-paid-ring   { position: absolute; top: 50%; left: 50%; border-radius: 9999px; border: 2px solid rgba(6, 255, 165, 0.7); width: 80px; height: 80px; animation: recv-paid-ring 1.4s ease-out forwards; }
+        .recv-paid-ring-2 { animation-delay: 0.18s; }
+        .recv-paid-ring-3 { animation-delay: 0.36s; }
+        .recv-paid-check  { animation: recv-paid-check-pop 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+        .recv-paid-spark  { animation: recv-paid-spark 1.1s ease-out forwards; }
+        .recv-paid-title  { animation: recv-paid-title 0.4s ease-out 0.25s both; }
+        .recv-paid-glow   { animation: recv-paid-glow 1.6s ease-out 1; }
+
+        /* Onboarding wizard. Three small named keyframes that the
+           welcome / awaiting_deposit / connecting steps lean on. We
+           reuse the existing ``recv-paid-*`` family for the
+           celebration / exit transition since they cover the same
+           "burst of green" semantics. */
+        @keyframes onboarding-dots {
+            0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+            40%           { transform: translateY(-6px); opacity: 1; }
+        }
+        @keyframes onboarding-progress-stripe {
+            from { background-position: 0 0; }
+            to   { background-position: 32px 0; }
+        }
+        @keyframes onboarding-fade-up {
+            from { transform: translateY(8px); opacity: 0; }
+            to   { transform: translateY(0);   opacity: 1; }
+        }
+        .onboarding-dot   { animation: onboarding-dots 1.2s ease-in-out infinite; }
+        .onboarding-dot-2 { animation-delay: 0.15s; }
+        .onboarding-dot-3 { animation-delay: 0.30s; }
+        .onboarding-fade-up { animation: onboarding-fade-up 0.45s ease-out both; }
+        /* Progress-bar stripe — neon-green band that slides right at
+           a steady ~5 s loop. The bar itself fills proportionally to
+           confirmations (set inline via width on the inner div). */
+        .onboarding-progress-stripe {
+            background-image: linear-gradient(45deg,
+                rgba(6, 255, 165, 0.95) 25%, rgba(6, 255, 165, 0.55) 25%,
+                rgba(6, 255, 165, 0.55) 50%, rgba(6, 255, 165, 0.95) 50%,
+                rgba(6, 255, 165, 0.95) 75%, rgba(6, 255, 165, 0.55) 75%);
+            background-size: 32px 32px;
+            animation: onboarding-progress-stripe 1.4s linear infinite;
+        }
+    </style>
+
+    {% block head %}{% endblock %}
+</head>
+<body class="bg-navy-950 text-gray-100 min-h-screen antialiased">
+    {% block body %}{% endblock %}
+
+    <!-- Alpine.js (vendored locally — in) -->
+    <script defer src="/dashboard/static/vendor/alpinejs-csp-3.15.11.min.js" integrity="sha384-TIk3zaxqa4vMqf5I0fQA5imzQDYj1TODC6n9XoykD/M+27VHsOJcDkic2bhwMHGN" crossorigin="anonymous" nonce="{{ csp_nonce }}"></script>
+    <!-- Lucide Icons (vendored locally) -->
+    <script src="/dashboard/static/vendor/lucide-0.469.0.min.js" integrity="sha384-hJnF5AwidE18GSWTAGHv3ByzzvfNZ1Tcx5y1UUV3WkauuMCEzBJBMSwSt/PUPXnM" crossorigin="anonymous" nonce="{{ csp_nonce }}"></script>
+    <!-- QR Code (vendored locally; qrcode@1.5.x dropped its UMD ``build/`` bundle from the
+         npm package, so we pin to 1.4.4 which still ships ``build/qrcode.min.js`` and
+         exposes the global ``QRCode`` used by dashboard.js) -->
+    <script src="/dashboard/static/vendor/qrcode-1.4.4.min.js" integrity="sha384-0RsG1yo/crf/1Qc14sho26SXXOTngNCjgJw7fuvXBt9W/OChF/Ijx+aUuBDqQwEk" crossorigin="anonymous" nonce="{{ csp_nonce }}"></script>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>
