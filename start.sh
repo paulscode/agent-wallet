@@ -951,7 +951,7 @@ sys.exit(0 if len(decoded) == 32 else 1)
     bolt12_drop_undersized_paths="$(get_env BOLT12_DROP_UNDERSIZED_PATHS "true")"
     bolt12_blinded_path_refresh_policy_from_gossip="$(get_env BOLT12_BLINDED_PATH_REFRESH_POLICY_FROM_GOSSIP "true")"
     bolt12_blinded_path_payinfo_safety_margin_ppm="$(get_env BOLT12_BLINDED_PATH_PAYINFO_SAFETY_MARGIN_PPM "1000")"
-    bolt12_blinded_path_payinfo_safety_margin_base_msat="$(get_env BOLT12_BLINDED_PATH_PAYINFO_SAFETY_MARGIN_BASE_MSAT "1000")"
+    bolt12_blinded_path_payinfo_safety_margin_base_msat="$(get_env BOLT12_BLINDED_PATH_PAYINFO_SAFETY_MARGIN_BASE_MSAT "1500")"
     bolt12_probe_paths_before_mint="$(get_env BOLT12_PROBE_PATHS_BEFORE_MINT "false")"
     bolt12_path_diversity_enforce="$(get_env BOLT12_PATH_DIVERSITY_ENFORCE "true")"
     bolt12_path_breaker_enabled="$(get_env BOLT12_PATH_BREAKER_ENABLED "true")"

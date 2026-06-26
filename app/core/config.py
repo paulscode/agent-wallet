@@ -508,12 +508,16 @@ class Settings(BaseSettings):
     # undisclosed fee, but on tiny HTLCs the undisclosed extra is
     # dominated by what looks like a fixed min-fee floor, which a
     # proportional margin can't cover (e.g. 1000 ppm × 35 sat is
-    # only 35 msat of headroom). A flat 1,000-msat base margin
-    # gives every payment ≥1 sat of absolute headroom regardless
-    # of size; payer cost is 0.001 sat per payment, negligible.
-    # Raise further only if a small-HTLC failure shows a larger
-    # flat gap.
-    bolt12_blinded_path_payinfo_safety_margin_base_msat: int = Field(default=1_000, ge=0, le=100_000)
+    # only 35 msat of headroom). A flat 1,500-msat base margin
+    # gives every payment ≥1.5 sat of absolute headroom regardless
+    # of size. The 1,500 default (raised from 1,000 on 2026-06-26
+    # after a StartOS-deployment audit row showed a multi-hop
+    # intro deducting ~367 msat extra — within the prior 1,000
+    # technically, but with no headroom) gives +500 msat over the
+    # worst observed gap. Payer cost is 0.0015 sat per payment,
+    # negligible. Raise further only if a small-HTLC failure
+    # shows a larger flat gap.
+    bolt12_blinded_path_payinfo_safety_margin_base_msat: int = Field(default=1_500, ge=0, le=100_000)
 
     # Liveness probe each candidate path before
     # advertising it (intro reachable + relevant channel active).
