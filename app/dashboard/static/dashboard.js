@@ -42,6 +42,17 @@ const ONBOARDING_SAFETY_BUFFER_PCT = 0.02;
 // dialog only surfaces one decision (amount).
 const BOLTZ_MIN_AMOUNT_SATS = 25_000;
 const BOLTZ_MAX_AMOUNT_SATS = 25_000_000;
+// Lightning-leg routing-fee budget reserved on top of the invoice amount.
+// Mirrors ``routing_fee_buffer_pct`` in ``cold_storage_initiate``
+// (app/dashboard/api.py); keep in sync. The wizard caps Max-button amounts
+// by this so the post-confirm "channel only has X sats free" rejection
+// can't fire on a value the UI just suggested.
+const BOLTZ_ROUTING_FEE_BUFFER_PCT = 0.03;
+// ``floor(x / (1 + BOLTZ_ROUTING_FEE_BUFFER_PCT))`` — the largest amount A
+// whose ``A * (1 + buffer)`` fits inside ``x``. Inlined so callers can read
+// the math.
+const _withBoltzBuffer = (x) =>
+    Math.max(0, Math.floor(x / (1 + BOLTZ_ROUTING_FEE_BUFFER_PCT)));
 const INBOUND_SAFETY_MARGIN_SATS = 5_000;   // headroom above the requested invoice amount
 const INBOUND_LOCAL_RESERVE_SATS = 10_000;  // keep some sats in the channel for routing fees
 // Pad (on top of the live commit_fee) reserved on a rebalance source
@@ -1001,6 +1012,11 @@ document.addEventListener('alpine:init', () => {
         ciAddress: '',
         ciAmountSats: null,
         ciAmountTouched: false,
+        // Backend-suggested retry amount surfaced by the
+        // ``insufficient_balance`` rejection payload — non-zero only
+        // when the user can recover with one click. Cleared on next
+        // submit attempt.
+        ciSuggestedRetryAmount: 0,
         ciFeeBreakdownOpen: false,
         ciGenerating: false,
         ciLoading: false,
@@ -1322,10 +1338,14 @@ document.addEventListener('alpine:init', () => {
          *  and the input would display garbage. */
         setMaxBoltzAmount() {
             const max = this.boltzFeesUsable ? this.boltzFees.max : 25000000;
-            this.coldBoltzAmount = Math.min(
+            const raw = Math.min(
                 this.summary?.lightning?.local_balance_sat || 0,
                 max,
             );
+            // Reserve the routing-fee buffer the backend requires —
+            // otherwise Max fills a value that fails the post-confirm
+            // insufficient-balance check.
+            this.coldBoltzAmount = _withBoltzBuffer(raw);
         },
         /** True only when ``fetchBoltzFees`` has completed *and*
          *  the resulting payload carries finite ``min`` / ``max``
@@ -7318,7 +7338,11 @@ document.addEventListener('alpine:init', () => {
             return Math.max(0, amount - this.ciTotalFeeSats);
         },
         /** Upper bound the user may move out of this channel: the
-         *  channel's own spendable, capped by the live Boltz maximum. */
+         *  channel's own spendable, capped by the live Boltz maximum,
+         *  then reduced by the Lightning routing-fee buffer the backend
+         *  reserves at confirm time. Without the buffer step, Max would
+         *  fill a value that always trips the post-confirm "this channel
+         *  only has X sats free" rejection. */
         get ciAmountCeiling() {
             const freeable = this.ciMaxFreeable || 0;
             // ``boltzFees.max`` is the sentinel ``-Infinity`` until the
@@ -7327,7 +7351,8 @@ document.addEventListener('alpine:init', () => {
             // constant — otherwise the Max button would fill -Infinity.
             const fees = this.boltzFees || {};
             const boltzMax = (Number.isFinite(fees.max) && fees.max > 0) ? fees.max : BOLTZ_MAX_AMOUNT_SATS;
-            return Math.min(freeable, boltzMax);
+            const raw = Math.min(freeable, boltzMax);
+            return _withBoltzBuffer(raw);
         },
         get ciBoltzReachable() {
             if (!this._boltzFeesFetched) return false;
@@ -7428,6 +7453,7 @@ document.addEventListener('alpine:init', () => {
             this.ciAddress = '';
             this.ciAmountSats = null;
             this.ciAmountTouched = false;
+            this.ciSuggestedRetryAmount = 0;
             this.ciFeeBreakdownOpen = false;
             this.ciAdvancedOpen = false;
             this.ciGenerating = false;
@@ -7524,6 +7550,7 @@ document.addEventListener('alpine:init', () => {
             if (!this.ciChannel || !this.ciChannel.chan_id) return;
             this.ciLoading = true;
             this.ciError = '';
+            this.ciSuggestedRetryAmount = 0;
             try {
                 const data = await this.api('POST', '/cold-storage/initiate', {
                     amount_sats: this.ciAmountSats,
@@ -7540,8 +7567,33 @@ document.addEventListener('alpine:init', () => {
                 }
             } catch (e) {
                 this.ciError = e.message || 'Could not start the transfer. Please try again.';
+                // Backend ships ``suggested_amount_sats`` on the
+                // insufficient-balance rejection so the UI can offer a
+                // one-click retry. Only surface it when it's actually
+                // submittable (≥ Boltz minimum) — otherwise the button
+                // would lead to a "below the minimum" rejection.
+                const detail = e && e.detail;
+                const suggested = detail && Number(detail.suggested_amount_sats);
+                if (Number.isFinite(suggested)
+                    && suggested >= BOLTZ_MIN_AMOUNT_SATS
+                    && suggested < (this.ciAmountSats || 0)) {
+                    this.ciSuggestedRetryAmount = Math.floor(suggested);
+                }
             }
             this.ciLoading = false;
+            this.$nextTick(() => this.initIcons());
+        },
+
+        /** One-click "Try with X sats instead" handler — fills the
+         *  amount with the backend's suggestion, clears the error +
+         *  suggestion, leaves the user on the confirm step ready to
+         *  click "Open inbound room" again. */
+        ciAcceptSuggestedRetry() {
+            if (!this.ciSuggestedRetryAmount) return;
+            this.ciAmountSats = this.ciSuggestedRetryAmount;
+            this.ciAmountTouched = true;
+            this.ciSuggestedRetryAmount = 0;
+            this.ciError = '';
             this.$nextTick(() => this.initIcons());
         },
 

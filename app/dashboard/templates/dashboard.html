@@ -5788,6 +5788,13 @@
                                 <p class="text-xs text-neon-pink" x-text="ciError"></p>
                             </div>
                         </template>
+                        <template x-if="ciSuggestedRetryAmount > 0">
+                            <button @click="ciAcceptSuggestedRetry()"
+                                class="w-full inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg bg-neon-yellow/10 border border-neon-yellow/40 text-neon-yellow font-medium hover:bg-neon-yellow/20 hover:border-neon-yellow/60 transition-all text-xs">
+                                <i data-lucide="rotate-cw" class="w-4 h-4"></i>
+                                <span>Try with <span x-text="formatSats(ciSuggestedRetryAmount)"></span> sats instead</span>
+                            </button>
+                        </template>
                         <div class="flex gap-2">
                             <button @click="ciStep = 'form'" :disabled="ciLoading"
                                 class="px-4 py-3 rounded-lg bg-navy-700 border border-navy-600 text-gray-300 hover:border-gray-500 transition-all text-sm disabled:opacity-40">Back</button>

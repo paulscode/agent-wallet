@@ -770,3 +770,100 @@ class TestConcurrentSwapsIndependent:
         assert resp_b.json()["status"] == "claimed"
         assert resp_b.json()["invoice_amount_sats"] == 200_000
         assert resp_b.json()["claim_txid"] == "b" * 64
+
+
+class TestInitiateSuggestedRetry:
+    """When ``/cold-storage/initiate`` rejects a pinned reverse swap
+    for insufficient balance, the response carries
+    ``suggested_amount_sats`` — the largest amount that satisfies
+    ``amount * (1 + routing_fee_buffer_pct) ≤ available``. The
+    Open-Inbound UI uses this to render a one-click "Try with X sats
+    instead" button without re-doing the buffer math (or scraping the
+    free-form ``detail`` message). Pins the contract end-to-end."""
+
+    @pytest.fixture
+    def auth_cookies(self, dashboard_client):
+        cookie = _make_session_cookie()
+        dashboard_client.cookies.set(COOKIE_NAME, cookie)
+        return {COOKIE_NAME: cookie}
+
+    @pytest.fixture(autouse=True)
+    def _bypass_csrf(self):
+        with patch(
+            "app.dashboard.api.check_csrf_token",
+            new_callable=AsyncMock, return_value="ok",
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_pinned_insufficient_returns_suggested_amount(
+        self, dashboard_client, auth_cookies,
+    ):
+        # Channel spendable = local - reserve - unsettled - cap//100
+        # = 200_000 - 1_000 - 0 - 2_000 = 197_000 sat. Submit an
+        # amount EQUAL to the spendable so the routing-fee buffer is
+        # what tips it over.
+        chan = {
+            "chan_id": "1234567",
+            "active": True,
+            "capacity": 200_000,
+            "local_balance": 200_000,
+            "local_chan_reserve_sat": 1_000,
+            "unsettled_balance": 0,
+        }
+        with patch(
+            "app.dashboard.api.lnd_service.get_channels",
+            new_callable=AsyncMock, return_value=([chan], None),
+        ):
+            resp = await dashboard_client.post(
+                "/dashboard/api/cold-storage/initiate",
+                json={
+                    "amount_sats": 197_000,
+                    "destination_address": _TEST_ADDR,
+                    "purpose": "inbound_liquidity",
+                    "outgoing_chan_id": "1234567",
+                },
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "detail" in body
+        # The new structured fields the JS retry UI consumes.
+        assert body.get("available_sats") == 197_000, (
+            f"available_sats should mirror the channel's spendable; got {body!r}"
+        )
+        suggested = body.get("suggested_amount_sats")
+        assert isinstance(suggested, int) and suggested > 0, (
+            f"suggested_amount_sats must be a positive int; got {body!r}"
+        )
+        # And the suggestion must itself satisfy the buffer check when
+        # re-checked — otherwise the retry would just re-reject.
+        assert int(suggested * 1.03) <= 197_000, (
+            f"suggested {suggested} * 1.03 = {int(suggested * 1.03)} must "
+            f"fit inside available 197_000"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unpinned_insufficient_returns_suggested_amount(
+        self, dashboard_client, auth_cookies,
+    ):
+        # Unpinned: backend reads the wallet's total local_balance_sat
+        # (not a per-channel value). Same buffer math applies.
+        with patch(
+            "app.dashboard.api.lnd_service.get_channel_balance",
+            new_callable=AsyncMock,
+            return_value=({"local_balance_sat": 100_000}, None),
+        ):
+            resp = await dashboard_client.post(
+                "/dashboard/api/cold-storage/initiate",
+                json={
+                    "amount_sats": 100_000,
+                    "destination_address": _TEST_ADDR,
+                    "purpose": "cold_storage",
+                },
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body.get("available_sats") == 100_000
+        suggested = body.get("suggested_amount_sats")
+        assert isinstance(suggested, int) and suggested > 0
+        assert int(suggested * 1.03) <= 100_000

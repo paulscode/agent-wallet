@@ -1943,6 +1943,14 @@ async def cold_storage_initiate(
     needed = int(body.amount_sats * (1 + routing_fee_buffer_pct))
 
     async def _reject_insufficient(available: int, detail: str) -> JSONResponse:
+        # Compute the largest amount A whose A * (1 + buffer) fits in
+        # ``available``, so the UI can offer a one-click retry without
+        # re-doing the math on its side (and without scraping the
+        # ``detail`` message). The frontend mirrors this in
+        # ``_withBoltzBuffer`` in dashboard.js — keep in sync.
+        suggested = max(
+            0, int(available // (1 + routing_fee_buffer_pct)),
+        )
         await log_dashboard_action(
             db,
             DASHBOARD_KEY_ID,
@@ -1954,13 +1962,21 @@ async def cold_storage_initiate(
                 "reason": "insufficient_balance",
                 "destination_address": body.destination_address,
                 "available_sats": available,
+                "suggested_amount_sats": suggested,
                 "outgoing_chan_id": body.outgoing_chan_id,
             },
             success=False,
             error_message=detail,
             ip_address=ip,
         )
-        return JSONResponse(status_code=400, content={"detail": detail})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": detail,
+                "available_sats": available,
+                "suggested_amount_sats": suggested,
+            },
+        )
 
     if body.outgoing_chan_id:
         # Pinned to a single channel: the Lightning leg must fit through
