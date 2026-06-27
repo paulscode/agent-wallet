@@ -5,6 +5,177 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-06-27
+
+### Added
+
+#### Small-channel peer discovery
+- Public guide [`docs/small-channel-peers.md`](docs/small-channel-peers.md):
+  a vetted list of 15 Lightning routing peers confirmed (by empirical
+  channel open) to accept ~150,000 sat opens. For each peer: pubkey,
+  socket, channel count, capacity, fee structure (median + min/max
+  base/ppm), outbound-enable ratio, `min_htlc` / `time_lock_delta` /
+  `max_htlc`, geographic location, and a plain-English summary of
+  trade-offs. Intended for new operators / small wallets needing
+  inbound liquidity without committing to 1M-sat-plus channels.
+  Indexed in `docs/README.md`.
+- Companion CLI tooling at [`scripts/peer_probe/`](scripts/peer_probe/):
+  `recon.py` ranks the LN graph by small-channel-friendliness from a
+  local LND's `DescribeGraph` view; `probe.py` walks the resulting
+  candidates one at a time, opening a real ~150 k sat channel, and
+  records each outcome to a persistent JSON checkpoint so the
+  operator can stop / resume across many rounds without losing
+  state. Both honour an operator-supplied SKIP set and the new
+  routing-health filter (see *Changed* below).
+
+#### Dashboard
+- **Reverse-swap lockup transaction surfaced in the UI.** `BoltzSwap.lockup_txid`
+  is now persisted the first time we observe a `transaction.mempool` /
+  `transaction.confirmed` event from Boltz, and both the Open Inbound
+  and Cold Storage panels render a Mempool link plus live confirmation
+  count for the lockup TX (alongside the existing claim-TX panel).
+  Previously the lockup txid was referenced only during ephemeral
+  verification and the user had no visibility into the on-chain step
+  while waiting for it to confirm.
+- **"Reconnect peer" action on stuck channels.** When a channel is
+  inactive because we're still waiting for the peer to send
+  `channel_ready` after enough confirmations (standard LND foot-gun
+  after a long open), the dashboard channel card now offers a one-tap
+  "Reconnect peer" button that disconnects + reconnects the peer via
+  the new
+  `POST /dashboard/api/channels/{chan_id}/reconnect-peer` endpoint.
+  Picks the best clearnet address from the peer's gossiped
+  `node_announcement` with clearnet-IPv4 → clearnet-IPv6 → Tor
+  fallback. No funds movement; safe to run against an
+  already-healthy channel.
+- **Three-state channel-status indicator.** Channel cards now
+  distinguish **active** (green), **waiting for `channel_ready`**
+  (yellow, with the "Reconnect peer" affordance), and **peer offline**
+  (grey). Backed by a new `LNDService.list_peer_pubkeys()` helper
+  whose result is joined with the active-channels list so the
+  dashboard can tell apart the two "inactive but not the same thing"
+  states that both surface as `active=False` on LND's channel record.
+- **One-tap "use suggested amount" retry on cold-storage rejection.**
+  When `POST /dashboard/api/cold-storage/initiate` is rejected for
+  `insufficient_balance`, the response now includes
+  `available_sats` and `suggested_amount_sats` (the largest
+  amount whose `A * (1 + routing_fee_buffer_pct)` fits in
+  `available`). The dashboard renders an inline retry button that
+  drops the suggested value into the amount field, so users no
+  longer need to redo the math by hand.
+
+### Changed
+
+#### BOLT 12
+- **Blinded-path `PAYINFO` safety-margin base bumped 1,000 → 1,500 msat**
+  (`BOLT12_BLINDED_PATH_PAYINFO_SAFETY_MARGIN_BASE_MSAT`). A multi-hop
+  intro audit row on 2026-06-26 showed a ~367 msat extra undisclosed
+  deduction, which fit within the prior 1,000 msat floor only with
+  zero headroom. Raising the default to 1,500 preserves the same
+  flat-headroom property with margin. Per-payment cost: 0.0015 sat
+  (negligible). `start.sh` and `.env.example` updated to match.
+
+#### Boltz claim subprocess + DB pool
+- **Boltz claim/refund Node.js subprocess calls are now non-blocking.**
+  Replaced four blocking `subprocess.run(timeout=…)` sites in
+  `BoltzSwapService` — `cooperative_claim`, `unilateral_claim`,
+  `cooperative_refund_submarine`, `unilateral_refund_submarine` —
+  with `asyncio.create_subprocess_exec` + `proc.communicate`. The
+  previous synchronous call froze the entire event loop for up to
+  120 s per call, which under sustained load left the async
+  SQLAlchemy pool unable to recycle connections (see *Fixed*). The
+  10-second keypair-gen subprocess at swap creation is unchanged —
+  its blocking window is short and the call doesn't hold a DB
+  session.
+- **Boltz-recovery classifier soft-pedals fresh failures.** During
+  the first 20 minutes after a failed cooperative-claim attempt
+  (`CLAIM_RETRY_GRACE_SECONDS = 20 * 60`), the classifier now
+  returns a new INFO-severity `claim_retry_in_progress` hint with
+  copy "Retrying claim shortly" rather than the WARNING-severity
+  `claim_retry_available` "Claim attempt failed; retry available."
+  The auto-retry pipeline (Boltz status poll, periodic
+  `recover_boltz_swaps`, or external block notification) almost
+  always lands the next attempt within this window; previously
+  users saw a scary banner during the normal recovery cycle. The
+  same retry action stays available throughout — only the copy and
+  severity are downgraded.
+
+#### Peer-probe recon filter
+- **`recon.py` now excludes non-routing nodes.** New
+  `--max-disabled-outbound-ratio` flag (default 0.50) drops nodes
+  whose own outbound policy is disabled on more than 50% of their
+  channels — catches the "accepts opens but won't actually route"
+  pattern (e.g. 1ML.com node ALPHA, 82% disabled outbound, confirmed
+  non-routing after a 150 k sat open + three reverse-swap attempts
+  hitting `FAILURE_REASON_NO_ROUTE`). Combined with a small
+  hardcoded `SKIP_PUBKEYS` set covering known self-rejecting
+  nodes (Megalithic main + small-channels), custodial wallets
+  (Wallet of Satoshi), and now 1ML.com node ALPHA.
+
+#### Documentation
+- README brought current with the code: alembic head bumped
+  043 → 047 in the Project Structure listing; test-suite size
+  corrected from "~1,400 tests" to "~3,900 tests across 376
+  files"; Boltz retry-backoff tiers corrected from
+  "10 s → 30 s → 120 s → 300 s" to the actual
+  "15 s for the first 10 retries → 60 s for the next 20 → 300 s
+  thereafter"; the API Reference admin table no longer lists four
+  REST endpoints (`POST /v1/admin/api-keys` and its
+  PATCH/DELETE/purge siblings) that have always been
+  dashboard-only — API-key mutations stay session-authed and
+  CSRF-gated at `/dashboard/api/api-keys[...]`. The Quickstart
+  bootstrap-script callout now points subsequent-key creation at
+  the dashboard's **⚙ Settings → API Keys** panel.
+
+### Fixed
+
+- **PostgreSQL connection-pool exhaustion under reverse-swap load.**
+  The four blocking `subprocess.run(timeout=120)` calls in
+  `BoltzSwapService` (see *Changed*) were freezing the event loop
+  for up to 120 s per claim, holding open any DB session that
+  happened to be checked out by the same coroutine. Under load
+  this leaked 30 PostgreSQL connections into `idle in transaction`
+  state, exhausting the SQLAlchemy pool (`pool_size=10 +
+  max_overflow=20`) and causing the BOLT 12 settlement-subscriber
+  poll, `/ready` health probe, and dashboard polls to fail with
+  `QueuePool limit of size 10 overflow 20 reached`. Surfaced in
+  StartOS as `Node Connectivity: Timed out. Retrying soon…`.
+- **Reverse-swap "Max" button no longer fails the server-side check.**
+  The dashboard previously auto-filled the Max amount without
+  subtracting the 3% Boltz routing-fee buffer, so a fresh Max
+  value would be rejected by `/cold-storage/initiate` at confirm
+  time. A new `_withBoltzBuffer()` helper now applies the buffer
+  client-side using the same constant the server enforces, so the
+  numbers stay in sync.
+- **Peer-probe state no longer poisoned by our-side failures.**
+  `probe.py` now detects "our LND ran out of on-chain"
+  (`reserved wallet balance invalidated`, `insufficient funds`)
+  and **aborts the run without recording the attempted peer** —
+  previously a wallet-OOM mid-batch falsely recorded every
+  subsequent peer in the batch as `open_failed`. Transient
+  transport errors (`connection refused`, `i/o timeout`, SOCKS
+  read timeouts, etc.) are similarly skipped without recording so
+  intermittently-flaky candidates stay in the pending queue for
+  the next round.
+- **Channel status no longer conflates two distinct
+  "inactive" states.** LND returns `active=False` for both
+  "channel exists on-chain but peer hasn't sent `channel_ready`
+  yet" and "channel was active but the peer is now disconnected."
+  The dashboard now distinguishes them (see the three-state
+  indicator under *Added*), so the operator sees the correct
+  remedy (wait / reconnect peer) instead of the same generic
+  "inactive" state for both.
+
+### Security
+
+- **PostgreSQL `idle_in_transaction_session_timeout=300000`** (5 min)
+  added to the asyncpg `connect_args` as a safety net. Any future
+  session that gets abandoned mid-transaction — e.g. by coroutine
+  cancellation while a long external await is in progress — will be
+  reaped by PostgreSQL rather than sitting in the pool forever.
+  Defence-in-depth against the specific bug fixed above and against
+  any future similar regression.
+
 ## [0.1.0] - 2026-06-23
 
 ### Added
