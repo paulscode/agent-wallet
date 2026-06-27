@@ -111,6 +111,47 @@ def is_already_connected_error(body: dict | str) -> bool:
     return "already connected" in text.lower()
 
 
+# Substrings that prove the failure was OURS, not the peer's. Recording
+# the peer as "rejected" in this case would poison the candidate's
+# record — we'd never re-probe them. Each pattern below has been
+# observed in production from LND's REST responses.
+_OUR_SIDE_FAILURE_PATTERNS = (
+    "reserved wallet balance invalidated",   # on-chain wallet headroom
+    "insufficient funds",                    # broader on-chain shortage
+    "not enough witness outputs to create funding transaction",
+    "insufficient on-chain funds",
+)
+
+# Substrings that prove the failure was transport-level (peer
+# unreachable / Tor flake / network blip), NOT a willful rejection.
+# Skip recording so the candidate is re-probed on the next run.
+_TRANSIENT_FAILURE_PATTERNS = (
+    "connection refused",
+    "network is unreachable",
+    "i/o timeout",
+    "operation timed out",
+    "read operation timed out",
+    "no route to host",
+    "transport error",
+    "disconnected",  # peer disconnected mid-handshake
+)
+
+
+def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
+    lo = text.lower()
+    return any(p in lo for p in patterns)
+
+
+def is_our_side_failure(body: dict | str) -> bool:
+    text = json.dumps(body) if isinstance(body, dict) else str(body)
+    return _matches_any(text, _OUR_SIDE_FAILURE_PATTERNS)
+
+
+def is_transient_failure(body: dict | str) -> bool:
+    text = json.dumps(body) if isinstance(body, dict) else str(body)
+    return _matches_any(text, _TRANSIENT_FAILURE_PATTERNS)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -210,11 +251,18 @@ def main() -> int:
             err = json.dumps(body)[:240] if isinstance(body, dict) else str(body)[:240]
             print(f"FAIL [{code}]")
             print(f"    {err}")
-            state["attempts"][pk] = {
-                "alias": alias, "address": addr, "outcome": "connect_failed",
-                "detail": err,
-            }
-            save_state()
+            # Transport-level / unreachable failures look like rejection
+            # in the response shape, but they're really "couldn't reach
+            # the peer right now". Don't poison the candidate's record —
+            # re-probe on next run when conditions might be different.
+            if is_transient_failure(body):
+                print("    (transient transport error — NOT recording; will re-probe)")
+            else:
+                state["attempts"][pk] = {
+                    "alias": alias, "address": addr, "outcome": "connect_failed",
+                    "detail": err,
+                }
+                save_state()
             continue
         print("ok")
 
@@ -255,6 +303,39 @@ def main() -> int:
         err = json.dumps(body)[:240] if isinstance(body, dict) else str(body)[:240]
         print(f"FAIL [{code}]")
         print(f"    {err}")
+
+        # If LND refused on OUR side (on-chain headroom exhausted etc.),
+        # the peer never even saw the open — recording them as rejected
+        # would falsely retire them. Abort the whole run since the next
+        # attempt would fail for the same reason.
+        if is_our_side_failure(body):
+            # Try to be polite before exiting.
+            lnd_request(
+                rest_url, headers, ctx, "DELETE", f"/v1/peers/{pk}",
+                timeout=10,
+            )
+            print(
+                "\n*** ABORTING RUN — this is OUR LND refusing the open, not\n"
+                "*** the peer rejecting us. NOT recording this attempt; the\n"
+                "*** candidate stays in the pending queue. Fix the on-chain\n"
+                "*** side (wait for closes to confirm, top up the on-chain\n"
+                "*** wallet, etc.) and re-run probe.py to continue."
+            )
+            return 0
+
+        # Transient transport blip — peer disconnected mid-handshake,
+        # i/o timed out, etc. Same logic as the connect-step transient
+        # path: don't record, re-probe on the next run.
+        if is_transient_failure(body):
+            print("    (transient — NOT recording; will re-probe)")
+            lnd_request(
+                rest_url, headers, ctx, "DELETE", f"/v1/peers/{pk}",
+                timeout=10,
+            )
+            continue
+
+        # Legitimate peer-side rejection (e.g. "below min chan size",
+        # "channel size too small", policy guards). Record and move on.
         state["attempts"][pk] = {
             "alias": alias, "address": addr, "outcome": "open_failed",
             "http_code": code, "detail": err,
