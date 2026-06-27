@@ -1816,6 +1816,14 @@ class BoltzSwapService:
                 if isinstance(tx_block, dict):
                     lockup_id = tx_block.get("id")
                 if isinstance(lockup_id, str) and len(lockup_id) == 64:
+                    # Persist the lockup txid the first time we see it
+                    # so the dashboard can surface a Mempool link while
+                    # the user waits for it to confirm. Reverse-swap
+                    # lockups are broadcast by Boltz, not us — until
+                    # this commit they were only referenced in the
+                    # ephemeral verification path below.
+                    if not swap.lockup_txid:
+                        swap.lockup_txid = lockup_id
                     from app.services.mempool_fee_service import (
                         mempool_fee_service,
                     )

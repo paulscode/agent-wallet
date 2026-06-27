@@ -201,18 +201,38 @@ class TestClaimingPhase:
         """When the failed attempt is OLDER than the grace window, the
         auto-retry pipeline has clearly not landed; escalate back to the
         WARNING-level 'Claim attempt failed' banner so the user sees the
-        retry button."""
+        retry button. Use 30 min ago — comfortably past the 20-min grace
+        and within the realistic "swap is genuinely stuck" window."""
         swap = _make_swap(
             status=SwapStatus.CLAIMING,
             recovery_count=1,
             error_message="cooperative claim subprocess failed",
             timeout_block_height=900_000,
-            recovery_attempted_seconds_ago=10 * 60,  # 10 minutes ago
+            recovery_attempted_seconds_ago=30 * 60,
         )
         hint = classify_recovery_state(swap, btc_tip_height=800_000, now=_now())
         assert hint.state == STATE_CLAIM_RETRY_AVAILABLE
         assert hint.severity == SEVERITY_WARNING
         assert ACTION_COOPERATIVE_CLAIM in hint.actions
+
+    def test_within_grace_after_block_interval_softpedaled(self):
+        """2026-06-27 follow-up: the original 90-second grace was too
+        short — block-driven auto-retry can take 5-20 minutes in normal
+        operation (block arrival + Boltz poll). At 10 minutes elapsed
+        (the average block time), the user must still see INFO, NOT a
+        scary warning. Pins the realistic boundary."""
+        from app.services.boltz_recovery import STATE_CLAIM_RETRY_IN_PROGRESS
+
+        swap = _make_swap(
+            status=SwapStatus.CLAIMING,
+            recovery_count=1,
+            error_message="cooperative claim subprocess failed",
+            timeout_block_height=900_000,
+            recovery_attempted_seconds_ago=10 * 60,
+        )
+        hint = classify_recovery_state(swap, btc_tip_height=800_000, now=_now())
+        assert hint.state == STATE_CLAIM_RETRY_IN_PROGRESS
+        assert hint.severity == SEVERITY_INFO
 
     def test_failure_with_no_recovery_attempted_at_still_warning(self):
         """``recovery_attempted_at`` is only stamped by the explicit

@@ -939,6 +939,17 @@ document.addEventListener('alpine:init', () => {
         // and on starting a fresh swap.
         activeSwapClaimTxid: '',
         activeSwapClaimConfirmations: null,
+        // Boltz's lockup tx — they broadcast it on-chain after we pay
+        // the Lightning side; populated as soon as Boltz reports
+        // ``transaction.mempool``. Surfaced as a Mempool link during
+        // the wait window BEFORE we broadcast our own claim, so the
+        // user can watch the lockup confirm instead of staring at a
+        // blank "Confirming the on-chain transaction" progress step.
+        // Once ``activeSwapClaimTxid`` lands, the lockup link hides
+        // and the claim link replaces it (it's the more
+        // user-relevant artifact — the tx that lands in their wallet).
+        activeSwapLockupTxid: '',
+        activeSwapLockupConfirmations: null,
         // Recovery hint surfaced by the cold-storage swap detail
         // endpoint. Shape: ``{ state, severity, headline, detail,
         // actions: [...], metadata: {...} }``. ``null`` when the
@@ -1025,6 +1036,13 @@ document.addEventListener('alpine:init', () => {
         ciSwapStatus: null,
         ciClaimTxid: '',
         ciClaimConfirmations: null,
+        // Boltz's lockup tx — they broadcast this on-chain after we
+        // pay the LN side; populated as soon as Boltz reports
+        // ``transaction.mempool``. Surface it as a Mempool link so the
+        // user can watch confirmations during the wait window before
+        // we can broadcast our own claim tx (which sets ``ciClaimTxid``).
+        ciLockupTxid: '',
+        ciLockupConfirmations: null,
         ciSwapError: '',
         ciSwapRecovery: null,      // backend recovery hint for a stuck swap
         ciRecoveryBusy: false,
@@ -1296,6 +1314,16 @@ document.addEventListener('alpine:init', () => {
             const r = this.activeSwapRecovery;
             return !!(r && (r.severity === 'warning' || r.severity === 'critical'));
         },
+        /** Cold Storage progress view: show the Boltz lockup-tx
+         *  Mempool link IFF we know the lockup txid AND our own claim
+         *  hasn't broadcast yet. Once ``activeSwapClaimTxid`` lands,
+         *  the claim panel takes over (it's the more user-relevant
+         *  link — the tx that actually arrives in their wallet). Mirrors
+         *  ``ciShouldShowLockupTxid`` for the per-channel Open Inbound
+         *  flow. */
+        get shouldShowActiveSwapLockupTxid() {
+            return !!this.activeSwapLockupTxid && !this.activeSwapClaimTxid;
+        },
         /** Whether the active swap-recovery banner has actions to render. */
         get swapRecoveryHasActions() {
             const r = this.activeSwapRecovery;
@@ -1326,6 +1354,8 @@ document.addEventListener('alpine:init', () => {
             this.activeSwapId = null;
             this.activeSwapClaimTxid = '';
             this.activeSwapClaimConfirmations = null;
+            this.activeSwapLockupTxid = '';
+            this.activeSwapLockupConfirmations = null;
             this.coldBoltzAmount = null;
             this.coldBoltzAddress = '';
             this.coldBoltzAcceptStale = false;
@@ -6283,6 +6313,16 @@ document.addEventListener('alpine:init', () => {
             if (typeof data.claim_confirmations === 'number') {
                 this.activeSwapClaimConfirmations = data.claim_confirmations;
             }
+            // Same pattern for the Boltz lockup tx — surfaced as a
+            // Mempool link during the wait window before our own claim
+            // tx broadcasts. See ``shouldShowActiveSwapLockupTxid`` and
+            // the dedicated template panel.
+            if (data.lockup_txid) {
+                this.activeSwapLockupTxid = data.lockup_txid;
+            }
+            if (typeof data.lockup_confirmations === 'number') {
+                this.activeSwapLockupConfirmations = data.lockup_confirmations;
+            }
             this.activeSwapRecovery = (data && data.recovery) ? data.recovery : null;
             // Shared 0-3 status mapping (see ``_swapUserStepIndex``
             // at module top) — keeps Cold Storage + inbound
@@ -6390,6 +6430,9 @@ document.addEventListener('alpine:init', () => {
             this.activeSwapClaimTxid = data.claim_txid || '';
             this.activeSwapClaimConfirmations =
                 (typeof data.claim_confirmations === 'number') ? data.claim_confirmations : null;
+            this.activeSwapLockupTxid = data.lockup_txid || '';
+            this.activeSwapLockupConfirmations =
+                (typeof data.lockup_confirmations === 'number') ? data.lockup_confirmations : null;
             this.coldTab = 'lightning';
             this.coldStep = 'progress';
             this.showColdStorage = true;
@@ -7442,6 +7485,21 @@ document.addEventListener('alpine:init', () => {
             if (!this.ciClaimTxid) return false;
             return (this.ciSwapStatus === 'claimed' || this.ciSwapStatus === 'completed');
         },
+        /** Show the Boltz lockup-tx Mempool link IFF:
+         *
+         *    1. we know the lockup txid (Boltz has reported it), and
+         *    2. our claim hasn't yet broadcast — once ``claim_txid`` is
+         *       set, the claim tx is the more user-relevant link (it's
+         *       the one that lands in the user's wallet); we hide the
+         *       lockup link so the progress panel doesn't show two
+         *       parallel mempool entries that confuse the user.
+         *
+         *  Result: during the "we paid LN, waiting for Boltz's lockup to
+         *  confirm before we can claim" window the user sees a working
+         *  Mempool link instead of a blank wait. */
+        get ciShouldShowLockupTxid() {
+            return !!this.ciLockupTxid && !this.ciClaimTxid;
+        },
         /** Recovery banner gates — computed in JS because the CSP
          *  evaluator can't short-circuit dotted access on a null. */
         get ciShowRecoveryBanner() {
@@ -7511,6 +7569,8 @@ document.addEventListener('alpine:init', () => {
             this.ciError = '';
             this.ciClaimTxid = '';
             this.ciClaimConfirmations = null;
+            this.ciLockupTxid = '';
+            this.ciLockupConfirmations = null;
             this.ciSwapError = '';
             // Clear any prior (terminal) swap identity so a fresh start
             // can't be confused with a stale completed/failed swap.
@@ -7680,6 +7740,9 @@ document.addEventListener('alpine:init', () => {
                 this.ciClaimTxid = data.claim_txid || '';
                 this.ciClaimConfirmations = (typeof data.claim_confirmations === 'number')
                     ? data.claim_confirmations : null;
+                this.ciLockupTxid = data.lockup_txid || '';
+                this.ciLockupConfirmations = (typeof data.lockup_confirmations === 'number')
+                    ? data.lockup_confirmations : null;
                 // Backend recovery classifier hint — drives the
                 // one-tap "Retry claim" / "Recover on-chain" banner
                 // for a stuck swap.

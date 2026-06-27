@@ -5847,6 +5847,30 @@
                                 </div>
                             </template>
                         </div>
+                        <template x-if="ciShouldShowLockupTxid">
+                            <div>
+                                <p class="text-xs uppercase tracking-wider text-gray-500 mb-1.5">Boltz lockup transaction</p>
+                                <div class="flex items-center gap-2 bg-navy-800 border border-navy-700 rounded px-3 py-2">
+                                    <span class="font-mono text-xs text-gray-300 truncate flex-1" x-text="ciLockupTxid"></span>
+                                    <button @click="copyText(ciLockupTxid)" class="text-gray-500 hover:text-neon-green transition-colors" title="Copy transaction ID">
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                    </button>
+                                    <a :href="mempoolTxUrl(ciLockupTxid)" target="_blank" rel="noopener" class="text-gray-500 hover:text-neon-green transition-colors" title="View in mempool explorer">
+                                        <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                                    </a>
+                                </div>
+                                <p class="text-[11px] text-gray-500 mt-1.5 text-center leading-relaxed">
+                                    <template x-if="ciLockupConfirmations !== null">
+                                        <span>
+                                            <span x-text="ciLockupConfirmations"></span> confirmation<span x-text="ciLockupConfirmations === 1 ? '' : 's'"></span> on Boltz's lockup. Once it has enough, we'll claim it to your wallet.
+                                        </span>
+                                    </template>
+                                    <template x-if="ciLockupConfirmations === null">
+                                        <span>Boltz has locked the funds on-chain. Once the lockup confirms, we'll claim it to your wallet.</span>
+                                    </template>
+                                </p>
+                            </div>
+                        </template>
                         <template x-if="ciShouldShowClaimTxid">
                             <div>
                                 <p class="text-xs uppercase tracking-wider text-gray-500 mb-1.5">Bitcoin transaction</p>
@@ -6760,6 +6784,46 @@
                          confirmation independently — same policy
                          applied to the onboarding wizard's
                          ``connecting`` step and the inbound dialog. -->
+                    <!-- Boltz lockup tx, surfaced during the wait window
+                         between LN payment and our own claim broadcast.
+                         Same affordance set as the claim panel below
+                         (copy + mempool explorer link) so the user can
+                         watch the lockup confirmations instead of
+                         staring at a blank "Confirming the on-chain
+                         transaction" step. Mutually exclusive with
+                         the claim panel: once the claim broadcasts,
+                         this hides and the claim panel takes over. -->
+                    <template x-if="shouldShowActiveSwapLockupTxid">
+                        <div class="bg-navy-900/50 border border-navy-700 rounded-lg p-3 space-y-2.5">
+                            <span class="text-[10px] text-gray-500 uppercase tracking-wider block">Boltz lockup transaction</span>
+                            <p class="font-mono text-xs text-gray-300 break-all select-all" x-text="activeSwapLockupTxid"></p>
+                            <div class="flex gap-2 pt-1">
+                                <button @click="copyText(activeSwapLockupTxid)"
+                                        title="Copy transaction ID"
+                                        class="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-xs bg-navy-700 border border-navy-600 text-gray-300 hover:border-blue-500/30 hover:text-white transition-all">
+                                    <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                    <span>Copy ID</span>
+                                </button>
+                                <a :href="mempoolTxUrl(activeSwapLockupTxid)"
+                                   target="_blank" rel="noopener noreferrer"
+                                   title="View on mempool explorer"
+                                   class="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded text-xs bg-navy-700 border border-navy-600 text-gray-300 hover:border-blue-500/30 hover:text-white transition-all">
+                                    <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                                    <span>View on explorer</span>
+                                </a>
+                            </div>
+                            <p class="text-[11px] text-gray-500 text-center pt-1 leading-relaxed">
+                                <template x-if="activeSwapLockupConfirmations !== null">
+                                    <span>
+                                        <span x-text="activeSwapLockupConfirmations"></span> confirmation<span x-text="activeSwapLockupConfirmations === 1 ? '' : 's'"></span> on Boltz's lockup. Once it has enough, we'll claim it to your wallet.
+                                    </span>
+                                </template>
+                                <template x-if="activeSwapLockupConfirmations === null">
+                                    <span>Boltz has locked the funds on-chain. Once the lockup confirms, we'll claim it to your wallet.</span>
+                                </template>
+                            </p>
+                        </div>
+                    </template>
                     <template x-if="activeSwapClaimTxid">
                         <div class="bg-navy-900/50 border border-navy-700 rounded-lg p-3 space-y-2.5">
                             <span class="text-[10px] text-gray-500 uppercase tracking-wider block">On-chain claim transaction</span>

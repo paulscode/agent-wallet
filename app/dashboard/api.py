@@ -2244,6 +2244,7 @@ async def cold_storage_swap_detail(
         "onchain_amount_sats": swap.onchain_amount_sats,
         "destination_address": swap.destination_address,
         "claim_txid": swap.claim_txid,
+        "lockup_txid": swap.lockup_txid,
         "timeout_block_height": swap.timeout_block_height,
         "error_message": swap.error_message,
         "status_history": swap.status_history,
@@ -2258,6 +2259,17 @@ async def cold_storage_swap_detail(
             claim_confirmations = confs.get("confirmations")
             resp["claim_confirmations"] = claim_confirmations
             resp["claim_block_height"] = confs.get("block_height")
+    # Same enrichment for the lockup so the UI can show
+    # "✅ confirmed" / "⏳ N confirmations" alongside the Mempool link
+    # for the lockup tx. Doesn't extend the cold-path latency — the
+    # lockup is typically already confirmed by the time the dashboard
+    # is polling this endpoint, but the call returns None gracefully
+    # when electrum is unreachable.
+    if swap.lockup_txid:
+        confs = await mempool_fee_service.optional_confirmations(swap.lockup_txid)
+        if confs is not None:
+            resp["lockup_confirmations"] = confs.get("confirmations")
+            resp["lockup_block_height"] = confs.get("block_height")
     tip = mempool_fee_service.cached_tip_height
     if tip is not None:
         resp["current_block_height"] = tip

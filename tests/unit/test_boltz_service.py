@@ -749,6 +749,86 @@ class TestAdvanceSwap:
         assert result_swap.completed_at is not None
 
     @pytest.mark.asyncio
+    async def test_transaction_mempool_persists_lockup_txid(self, db_session):
+        """2026-06-27: when Boltz reports the lockup tx via
+        ``transaction.mempool``, persist the txid on the swap row so the
+        dashboard can surface a Mempool link while the user waits for
+        the lockup to confirm. Prior to this commit the field was only
+        used for the address-verification check and was never written
+        to the DB for reverse swaps."""
+        svc = BoltzSwapService()
+        swap = self._make_swap(status=SwapStatus.INVOICE_PAID)
+        swap.boltz_lockup_address = "bcrt1qexpected_lockup"
+        db_session.add(swap)
+        await db_session.commit()
+
+        lockup_id = "ab" * 32
+        with (
+            patch.object(
+                svc,
+                "get_swap_status_from_boltz",
+                new_callable=AsyncMock,
+                return_value=("transaction.mempool", {"transaction": {"id": lockup_id}}, None),
+            ),
+            # Make optional_verify_tx return None so the address-mismatch
+            # branch doesn't fire — we only want to verify the persist.
+            patch(
+                "app.services.mempool_fee_service.mempool_fee_service.optional_verify_tx",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                svc, "get_lockup_transaction",
+                new_callable=AsyncMock, return_value=(None, "skip claim path"),
+            ),
+        ):
+            result_swap, _err = await svc.advance_swap(db_session, swap)
+
+        assert result_swap.lockup_txid == lockup_id, (
+            "lockup_txid must be persisted the first time the "
+            "transaction.mempool event reports it so the UI can render "
+            "a working Mempool link during the lockup-confirm wait."
+        )
+
+    @pytest.mark.asyncio
+    async def test_transaction_mempool_does_not_overwrite_existing_lockup_txid(
+        self, db_session,
+    ):
+        """Idempotence: if the swap row already has a lockup_txid (e.g.
+        from a previous tick), a subsequent tick must NOT overwrite it.
+        Boltz may rotate the reported txid during RBF; we keep the first
+        observation as the canonical id so the UI's Mempool link stays
+        stable for the user."""
+        svc = BoltzSwapService()
+        swap = self._make_swap(status=SwapStatus.INVOICE_PAID)
+        swap.boltz_lockup_address = "bcrt1qexpected_lockup"
+        original_txid = "cd" * 32
+        swap.lockup_txid = original_txid
+        db_session.add(swap)
+        await db_session.commit()
+
+        with (
+            patch.object(
+                svc,
+                "get_swap_status_from_boltz",
+                new_callable=AsyncMock,
+                return_value=("transaction.mempool", {"transaction": {"id": "ef" * 32}}, None),
+            ),
+            patch(
+                "app.services.mempool_fee_service.mempool_fee_service.optional_verify_tx",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                svc, "get_lockup_transaction",
+                new_callable=AsyncMock, return_value=(None, "skip claim path"),
+            ),
+        ):
+            result_swap, _err = await svc.advance_swap(db_session, swap)
+
+        assert result_swap.lockup_txid == original_txid
+
+    @pytest.mark.asyncio
     async def test_lockup_address_mismatch_withholds_claim(self, db_session):
         """When the independent electrs check is reachable and the lockup
         tx does NOT pay the address committed at swap creation, the claim

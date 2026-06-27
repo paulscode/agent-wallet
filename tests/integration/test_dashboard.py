@@ -1579,6 +1579,50 @@ class TestDashboardColdStorageEndpoints:
         assert resp.json()["boltz_swap_id"] == "swap123"
 
     @pytest.mark.asyncio
+    async def test_cold_storage_swap_detail_surfaces_lockup_txid(
+        self, dashboard_client, auth_cookies,
+    ):
+        """2026-06-27: the swap-detail endpoint must include
+        ``lockup_txid`` so the Open Inbound progress UI can render a
+        Mempool link during the wait period between LN payment and claim
+        broadcast. Without this, the user stares at a "Confirming the
+        on-chain transaction" step with no way to see what's happening
+        on-chain."""
+        mock_swap = MagicMock()
+        mock_swap.id = uuid4()
+        mock_swap.boltz_swap_id = "swap-lockup"
+        mock_swap.status.value = "claiming"
+        mock_swap.boltz_status = "transaction.mempool"
+        mock_swap.invoice_amount_sats = 100000
+        mock_swap.onchain_amount_sats = 95000
+        mock_swap.destination_address = "bcrt1q..."
+        mock_swap.claim_txid = None             # claim not yet broadcast
+        mock_swap.lockup_txid = "ab" * 32       # lockup observed in mempool
+        mock_swap.error_message = None
+        mock_swap.status_history = []
+        mock_swap.created_at.isoformat.return_value = "2026-06-27T00:00:00"
+        mock_swap.completed_at = None
+
+        with patch(
+            "app.dashboard.api.boltz_service.get_swap_by_id",
+            new_callable=AsyncMock, return_value=mock_swap,
+        ):
+            resp = await dashboard_client.get(
+                f"/dashboard/api/cold-storage/swaps/{mock_swap.id}",
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["lockup_txid"] == "ab" * 32, (
+            "lockup_txid must be present in the response so the "
+            "Open-Inbound UI can render its 'Boltz lockup transaction' "
+            "Mempool link during the pre-claim wait window."
+        )
+        # And claim_txid is None at this stage — the UI's
+        # ciShouldShowLockupTxid getter hides the lockup link once the
+        # claim broadcast lands (claim becomes the more relevant link).
+        assert body["claim_txid"] is None
+
+    @pytest.mark.asyncio
     async def test_cold_storage_swap_detail_not_found(self, dashboard_client, auth_cookies):
         with patch(
             "app.dashboard.api.boltz_service.get_swap_by_id",

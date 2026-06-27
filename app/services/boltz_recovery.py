@@ -76,12 +76,23 @@ LIQUID_REVERSE_CLAIM_STUCK_THRESHOLD_SECONDS: int = 3600
 #: the classifier soft-pedals the failure (returns INFO "Retrying claim
 #: shortly" rather than WARNING "Claim attempt failed; retry available")
 #: while the auto-retry pipeline gets a chance to land the next attempt.
-#: Picked to cover the per-swap Boltz poll (30 s, scheduled task) plus
-#: some slack — long enough that the typical fail-then-auto-succeed
-#: window doesn't surface a scary banner to the user, short enough that
-#: genuinely-stuck swaps still escalate well before the user gives up
-#: on the dialog.
-CLAIM_RETRY_GRACE_SECONDS: int = 90
+#:
+#: The auto-retry happens on whichever of these fires first: the Boltz
+#: status-poll task (30 s), the periodic ``recover_boltz_swaps`` sweep
+#: (5 min), or an external block notification when Boltz confirms the
+#: lockup transaction. The CHAIN event is usually the trigger — a
+#: cooperative claim can only succeed once the lockup tx has the right
+#: confirmations on Boltz's side. So in practice the window between
+#: "first attempt failed (chain not ready)" and "next attempt succeeds"
+#: is bounded by the NEXT BLOCK on mainnet — ~10 min average, sometimes
+#: 30+ min during mempool congestion. Picking 20 minutes covers this
+#: cleanly. Genuinely-stuck swaps (worker crashed, persistent claim
+#: failure) still escalate to the WARNING + retry banner, just after
+#: the natural quiet period — and the timeout-aware variants (CRITICAL
+#: / WARNING based on ``blocks_until_timeout``) take over well before
+#: the lockup actually expires, so the operator never misses a true
+#: urgency.
+CLAIM_RETRY_GRACE_SECONDS: int = 20 * 60
 
 
 # ─── Action identifiers ───────────────────────────────────────────────
