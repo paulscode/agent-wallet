@@ -32,14 +32,23 @@ import urllib.error
 import urllib.request
 
 
-# Known pubkeys to skip even if they appear well-connected. Either
-# self-rejecting (Megalithic) or custodial-wallet (never accept opens).
+# Known pubkeys to skip even if they appear well-connected, beyond
+# what the disabled-outbound filter catches. Self-rejecting nodes,
+# custodial wallets that never accept opens, and confirmed non-routing
+# nodes from prior empirical investigation.
 SKIP_PUBKEYS = {
     # Megalithic main (large channels) and small-channels sibling —
     # the latter is the one we're trying to find alternatives to.
     "02a98c86ef366ce226aad6e7706959456e1701058915c3cbf527b37da143bb1441",
     # Wallet of Satoshi — custodial.
     "035e4ff418fc8b5554c5d9eea66396c227bd429a3251c8cbc711002ba215bfc226",
+    # 1ML.com node ALPHA — accepts opens but disables their own
+    # outbound on 82% of channels (deliberate "I'm a gossip collector,
+    # not a router" policy). Confirmed 2026-06-27: opened a 150k
+    # channel, three subsequent reverse-swap attempts hit
+    # FAILURE_REASON_NO_ROUTE. See ``internal_docs/peer_probe_hits.md``
+    # "Anti-pattern" section.
+    "0217890e3aad8d35bc054f43acc00084b25229ecff0ab68debd82883ad65ee8266",
 }
 
 
@@ -163,6 +172,15 @@ def main() -> int:
         help="keep nodes whose only address is .onion. Default skips "
              "them since Ocean-side routability through Tor is unreliable.",
     )
+    ap.add_argument(
+        "--max-disabled-outbound-ratio", type=float, default=0.50,
+        help="exclude nodes whose own OUTBOUND policy is disabled on "
+             "more than this fraction of their channels (default: 0.50). "
+             "Catches 'accepts opens, won't route' nodes like 1ML.com "
+             "node ALPHA (82%% disabled outbound on 2026-06-27) that "
+             "pass every well-connected heuristic but refuse to forward "
+             "HTLCs outward. Set to 1.0 to disable the filter entirely.",
+    )
     args = ap.parse_args()
 
     rest_url, headers, ctx = make_lnd_client()
@@ -188,8 +206,10 @@ def main() -> int:
         file=sys.stderr,
     )
 
-    # Step 3: build per-node summary (channel count, capacity, addresses).
-    print("[3/4] tabulating channel counts …", file=sys.stderr)
+    # Step 3: build per-node summary (channel count, capacity, addresses)
+    # AND tabulate the per-node outbound-enable ratio so we can filter
+    # out non-routing nodes (see ``--max-disabled-outbound-ratio``).
+    print("[3/4] tabulating channel counts + outbound policies …", file=sys.stderr)
     by_pk: dict[str, dict] = {}
     for n in nodes_raw:
         pk = n.get("pub_key")
@@ -201,14 +221,37 @@ def main() -> int:
             "chan_count": 0,
             "capacity_sat": 0,
             "addresses": n.get("addresses", []) or [],
+            # Per-direction outbound policy counts. Used by the
+            # disabled-outbound filter — see the 2026-06-27 1ML.com
+            # node ALPHA case study in
+            # ``internal_docs/peer_probe_hits.md``.
+            "out_enabled": 0,
+            "out_disabled": 0,
         }
     for e in edges_raw:
         cap = int(e.get("capacity") or 0)
+        # Capacity + channel-count (both nodes own the edge in this sense).
         for pk_field in ("node1_pub", "node2_pub"):
             pk = e.get(pk_field)
             if pk in by_pk:
                 by_pk[pk]["chan_count"] += 1
                 by_pk[pk]["capacity_sat"] += cap
+        # Outbound policy is per-direction. Each side owns the policy
+        # that describes the HTLCs they're WILLING TO FORWARD. A
+        # ``disabled`` flag here is the operator's explicit "don't
+        # route through me on this edge."
+        for pol_field, pk_field in (
+            ("node1_policy", "node1_pub"),
+            ("node2_policy", "node2_pub"),
+        ):
+            pol = e.get(pol_field)
+            pk = e.get(pk_field)
+            if not isinstance(pol, dict) or pk not in by_pk:
+                continue
+            if pol.get("disabled"):
+                by_pk[pk]["out_disabled"] += 1
+            else:
+                by_pk[pk]["out_enabled"] += 1
 
     all_nodes = list(by_pk.values())
     all_nodes.sort(key=lambda r: r["chan_count"], reverse=True)
@@ -238,6 +281,7 @@ def main() -> int:
     # Step 4: filter + score + rank.
     print("[4/4] filtering, scoring, ranking …", file=sys.stderr)
     candidates = []
+    skipped_non_routing = 0
     for n in all_nodes:
         pk = n["pubkey"]
         if pk == our_pubkey or pk in SKIP_PUBKEYS:
@@ -248,6 +292,25 @@ def main() -> int:
         if addr is None:
             continue
         if not is_clearnet and not args.include_tor_only:
+            continue
+        # Disabled-outbound filter — see the 2026-06-27 1ML.com node
+        # ALPHA case in ``internal_docs/peer_probe_hits.md``. We use
+        # the count of edges where THIS node has a gossiped policy
+        # (enabled + disabled) as the denominator, NOT chan_count,
+        # because a not-yet-propagated edge (no policy from this side)
+        # shouldn't count against the operator. A node whose outbound
+        # is disabled on more than ``--max-disabled-outbound-ratio``
+        # of their POLICY-PUBLISHED edges is treated as non-routing
+        # and dropped.
+        pol_total = n["out_enabled"] + n["out_disabled"]
+        out_disabled_ratio = (
+            n["out_disabled"] / pol_total if pol_total > 0 else 0.0
+        )
+        if (
+            pol_total > 0
+            and out_disabled_ratio > args.max_disabled_outbound_ratio
+        ):
+            skipped_non_routing += 1
             continue
         hub = hub_conn.get(pk, 0)
         capacity_btc = n["capacity_sat"] / 100_000_000
@@ -260,8 +323,17 @@ def main() -> int:
             "chan_count": n["chan_count"],
             "capacity_sat": n["capacity_sat"],
             "top_hub_connections": hub,
+            "out_enabled": n["out_enabled"],
+            "out_disabled": n["out_disabled"],
+            "out_disabled_ratio": round(out_disabled_ratio, 3),
             "score": round(score, 1),
         })
+    if skipped_non_routing:
+        print(
+            f"      skipped {skipped_non_routing} non-routing nodes "
+            f"(outbound disabled > {args.max_disabled_outbound_ratio:.0%})",
+            file=sys.stderr,
+        )
 
     # Re-sort by composite score (hub connectivity dominates).
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -292,6 +364,7 @@ def main() -> int:
             f"chans={c['chan_count']:>4}  "
             f"cap={c['capacity_sat']/1e8:>6.2f}BTC  "
             f"hub_conn={c['top_hub_connections']:>3}  "
+            f"out_disabled={c['out_disabled_ratio']:>4.0%}  "
             f"score={c['score']:>7.1f}",
             file=sys.stderr,
         )
