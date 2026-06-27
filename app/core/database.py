@@ -54,7 +54,21 @@ def _create_engine() -> AsyncEngine:
         # SQLite's default StaticPool does not accept pool_size/
         # max_overflow; production-only knobs are skipped.
         return create_async_engine(url, echo=settings.debug)
-    connect_args: dict = {"server_settings": {"statement_timeout": "30000"}}
+    connect_args: dict = {
+        "server_settings": {
+            "statement_timeout": "30000",
+            # Safety net for sessions that get abandoned mid-
+            # transaction (e.g. a coroutine that holds the connection
+            # across a blocking subprocess + then the event loop is
+            # torn down, or an HTTP call that hangs past the SQLAlchemy
+            # pool_timeout). Without this, the connection sits at
+            # Postgres in ``idle in transaction`` forever — eventually
+            # exhausting the pool (size 10 + overflow 20). 5 min is
+            # long enough to outlast any legitimate awaited operation
+            # (LND HTTP 30s + Boltz HTTP 30s + node subprocess 120s).
+            "idle_in_transaction_session_timeout": "300000",
+        }
+    }
     if settings.database_require_ssl:
         import ssl as _ssl
 

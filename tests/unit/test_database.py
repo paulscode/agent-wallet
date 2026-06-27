@@ -306,3 +306,28 @@ class TestDatabaseSslEnforcement:
             mock_create.assert_called_once()
             call_kwargs = mock_create.call_args[1]
             assert "ssl" in call_kwargs["connect_args"]
+
+    def test_create_engine_sets_idle_in_transaction_timeout(self):
+        """The async engine must hand asyncpg an
+        ``idle_in_transaction_session_timeout`` server_setting so a
+        session that gets abandoned mid-transaction (e.g. a coroutine
+        holds the connection across a stalled HTTP call) is reaped by
+        Postgres instead of sitting in ``idle in transaction`` until
+        the pool (size 10 + overflow 20) is exhausted."""
+        from app.core.database import _create_engine
+
+        with (
+            patch("app.core.database.settings") as mock_settings,
+            patch("app.core.database.create_async_engine") as mock_create,
+        ):
+            mock_settings.database_url = "postgresql+asyncpg://user:pass@remote:5432/db"
+            mock_settings.database_require_ssl = False
+            mock_settings.debug = False
+
+            _create_engine()
+
+            mock_create.assert_called_once()
+            server_settings = mock_create.call_args[1]["connect_args"]["server_settings"]
+            assert server_settings.get("idle_in_transaction_session_timeout") == "300000"
+            # statement_timeout was already present; ensure it's still there.
+            assert server_settings.get("statement_timeout") == "30000"

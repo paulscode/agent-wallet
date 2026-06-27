@@ -44,6 +44,36 @@ def _patch_capped(*, return_value=None, side_effect=None):
     )
 
 
+def _mock_node_subprocess(
+    *,
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+    communicate_side_effect=None,
+):
+    """Patch ``asyncio.create_subprocess_exec`` in boltz_service.
+
+    The production code now spawns the Node.js claim / refund scripts
+    via ``asyncio.create_subprocess_exec`` + ``proc.communicate`` instead
+    of the blocking ``subprocess.run``. Tests stub both seams: the
+    factory returns a mock ``proc`` whose ``communicate`` is an
+    ``AsyncMock`` either returning ``(stdout, stderr)`` bytes or
+    raising (typically ``asyncio.TimeoutError`` for the timeout path).
+    """
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock(return_value=None)
+    if communicate_side_effect is not None:
+        proc.communicate = AsyncMock(side_effect=communicate_side_effect)
+    else:
+        proc.communicate = AsyncMock(return_value=(stdout.encode(), stderr.encode()))
+    return patch(
+        "app.services.boltz_service.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=proc),
+    )
+
+
 def _patch_pin_noop():
     """Skip clearnet IP-pinning DNS in tests, preserving the original URL."""
     return patch(
@@ -1111,14 +1141,10 @@ class TestCooperativeClaim:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"txid": "abcdef1234567890"}\n'
-
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: f"decrypted_{x}"),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=0, stdout='{"txid": "abcdef1234567890"}\n'),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_claim(swap, "0200000001...")
@@ -1143,14 +1169,10 @@ class TestCooperativeClaim:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = "Error: invalid preimage"
-
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=1, stderr="Error: invalid preimage"),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_claim(swap, "0200000001...")
@@ -1160,13 +1182,15 @@ class TestCooperativeClaim:
 
     @pytest.mark.asyncio
     async def test_claim_script_timeout(self):
+        import asyncio as _asyncio
+
         svc = BoltzSwapService()
         swap = self._make_swap()
 
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", side_effect=subprocess.TimeoutExpired("node", 60)),
+            _mock_node_subprocess(communicate_side_effect=_asyncio.TimeoutError()),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_claim(swap, "0200000001...")
@@ -1179,14 +1203,10 @@ class TestCooperativeClaim:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "not valid json"
-
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=0, stdout="not valid json"),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_claim(swap, "0200000001...")
@@ -1199,14 +1219,10 @@ class TestCooperativeClaim:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"result": "ok"}\n'
-
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=0, stdout='{"result": "ok"}\n'),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_claim(swap, "0200000001...")
@@ -1222,7 +1238,10 @@ class TestCooperativeClaim:
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", side_effect=FileNotFoundError),
+            patch(
+                "app.services.boltz_service.asyncio.create_subprocess_exec",
+                new=AsyncMock(side_effect=FileNotFoundError),
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_claim(swap, "0200000001...")
@@ -2942,7 +2961,6 @@ class TestUnilateralRefundSubmarine:
     async def test_broadcasts_post_timeout(self):
         svc = BoltzSwapService()
         swap = self._make_swap(timeout_block_height=800_000)
-        completed = MagicMock(returncode=0, stdout='{"txid": "refund_txid_abc"}', stderr="")
         with (
             patch.object(
                 svc,
@@ -2951,7 +2969,7 @@ class TestUnilateralRefundSubmarine:
                 return_value=("020000...", None),
             ),
             patch("app.services.boltz_service.decrypt_field", return_value="aa" * 32),
-            patch("subprocess.run", return_value=completed),
+            _mock_node_subprocess(returncode=0, stdout='{"txid": "refund_txid_abc"}'),
         ):
             txid, err = await svc.unilateral_refund_submarine(
                 swap, refund_address="bcrt1qrefund", btc_tip_height=800_001
@@ -2979,17 +2997,30 @@ class TestUnilateralClaimSubprocess:
         swap = self._make_swap()
         captured = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["input"] = kwargs.get("input")
-            r = MagicMock()
-            r.returncode = 0
-            r.stdout = '{"event": "claim_broadcast_complete", "txid": "uni_abc", "mode": "unilateral"}\n'
-            return r
+        # Capture the stdin payload passed to communicate(). The
+        # production path now drives the subprocess via
+        # ``asyncio.create_subprocess_exec`` + ``proc.communicate``;
+        # the mock here records what bytes would have been sent.
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=None)
 
+        async def _capture(input=None):
+            captured["input"] = input.decode() if input is not None else None
+            return (
+                b'{"event": "claim_broadcast_complete", "txid": "uni_abc", "mode": "unilateral"}\n',
+                b"",
+            )
+
+        proc.communicate = AsyncMock(side_effect=_capture)
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: f"decrypted_{x}"),
-            patch("subprocess.run", side_effect=fake_run),
+            patch(
+                "app.services.boltz_service.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=proc),
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.unilateral_claim(swap, "0200000001...")
@@ -3004,15 +3035,10 @@ class TestUnilateralClaimSubprocess:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        mock_result.stderr = "script blew up"
-        mock_result.stdout = ""
-
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: f"decrypted_{x}"),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=1, stderr="script blew up"),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.unilateral_claim(swap, "0200000001...")
@@ -3027,16 +3053,20 @@ class TestUnilateralClaimSubprocess:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
+        spawn_mock = AsyncMock()
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
-            patch("subprocess.run") as mock_run,
+            patch(
+                "app.services.boltz_service.asyncio.create_subprocess_exec",
+                new=spawn_mock,
+            ),
         ):
             mock_path.exists.return_value = False
             txid, err = await svc.unilateral_claim(swap, "0200000001...")
 
         assert txid is None
         assert "Claim script not found" in err
-        mock_run.assert_not_called()
+        spawn_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_txid_event_returns_error(self):
@@ -3046,15 +3076,14 @@ class TestUnilateralClaimSubprocess:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        # Two well-formed JSON lines, neither carrying a txid.
-        mock_result.stdout = '{"event": "progress"}\n{"event": "almost"}\n'
-
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: f"decrypted_{x}"),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(
+                returncode=0,
+                # Two well-formed JSON lines, neither carrying a txid.
+                stdout='{"event": "progress"}\n{"event": "almost"}\n',
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.unilateral_claim(swap, "0200000001...")
@@ -3064,13 +3093,15 @@ class TestUnilateralClaimSubprocess:
 
     @pytest.mark.asyncio
     async def test_timeout_returns_error(self):
+        import asyncio as _asyncio
+
         svc = BoltzSwapService()
         swap = self._make_swap()
 
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", side_effect=subprocess.TimeoutExpired("node", 60)),
+            _mock_node_subprocess(communicate_side_effect=_asyncio.TimeoutError()),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.unilateral_claim(swap, "0200000001...")
@@ -3086,7 +3117,10 @@ class TestUnilateralClaimSubprocess:
         with (
             patch("app.services.boltz_service.CLAIM_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", side_effect=FileNotFoundError),
+            patch(
+                "app.services.boltz_service.asyncio.create_subprocess_exec",
+                new=AsyncMock(side_effect=FileNotFoundError),
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.unilateral_claim(swap, "0200000001...")
@@ -3292,6 +3326,7 @@ class TestCooperativeRefundSubmarine:
         failure surfaces the lookup error and never spawns the script."""
         svc = BoltzSwapService()
         swap = self._make_swap()
+        spawn_mock = AsyncMock()
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
             patch.object(
@@ -3300,13 +3335,16 @@ class TestCooperativeRefundSubmarine:
                 new_callable=AsyncMock,
                 return_value=(None, "lockup 404"),
             ),
-            patch("subprocess.run") as mock_run,
+            patch(
+                "app.services.boltz_service.asyncio.create_subprocess_exec",
+                new=spawn_mock,
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(swap, "bcrt1qrefund")
         assert txid is None
         assert "lockup 404" in err
-        mock_run.assert_not_called()
+        spawn_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_backfills_claim_pubkey_from_boltz_status(self):
@@ -3315,10 +3353,6 @@ class TestCooperativeRefundSubmarine:
         to broadcast."""
         svc = BoltzSwapService()
         swap = self._make_swap(boltz_claim_public_key_hex=None)
-
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"txid": "refund_via_status"}\n'
 
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
@@ -3329,7 +3363,7 @@ class TestCooperativeRefundSubmarine:
                 return_value=({"claimPublicKey": "02" + "bc" * 32}, None),
             ),
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=0, stdout='{"txid": "refund_via_status"}\n'),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(
@@ -3349,13 +3383,16 @@ class TestCooperativeRefundSubmarine:
         swap = self._make_swap()
         captured = {}
 
-        def fake_run(cmd, **kwargs):
-            captured["input"] = kwargs.get("input")
-            r = MagicMock()
-            r.returncode = 0
-            r.stdout = '{"txid": "refund_clamped"}\n'
-            return r
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=None)
 
+        async def _capture(input=None):
+            captured["input"] = input.decode() if input is not None else None
+            return (b'{"txid": "refund_clamped"}\n', b"")
+
+        proc.communicate = AsyncMock(side_effect=_capture)
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
@@ -3363,7 +3400,10 @@ class TestCooperativeRefundSubmarine:
                 "app.services.chain.backend.clamp_feerate_sat_per_vb",
                 return_value=42.0,
             ),
-            patch("subprocess.run", side_effect=fake_run),
+            patch(
+                "app.services.boltz_service.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=proc),
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(
@@ -3382,14 +3422,13 @@ class TestCooperativeRefundSubmarine:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"event": "progress"}\n{"txid": "refund_txid_abc"}\n'
-
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: f"decrypted_{x}"),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(
+                returncode=0,
+                stdout='{"event": "progress"}\n{"txid": "refund_txid_abc"}\n',
+            ),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(
@@ -3405,14 +3444,10 @@ class TestCooperativeRefundSubmarine:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 2
-        mock_result.stderr = "musig2 aggregation failed"
-
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=2, stderr="musig2 aggregation failed"),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(
@@ -3428,14 +3463,10 @@ class TestCooperativeRefundSubmarine:
         svc = BoltzSwapService()
         swap = self._make_swap()
 
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = '{"result": "ok"}\n'
-
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", return_value=mock_result),
+            _mock_node_subprocess(returncode=0, stdout='{"result": "ok"}\n'),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(
@@ -3448,13 +3479,15 @@ class TestCooperativeRefundSubmarine:
 
     @pytest.mark.asyncio
     async def test_script_timeout_returns_error(self):
+        import asyncio as _asyncio
+
         svc = BoltzSwapService()
         swap = self._make_swap()
 
         with (
             patch("app.services.boltz_service.REFUND_SCRIPT_PATH") as mock_path,
             patch("app.services.boltz_service.decrypt_field", side_effect=lambda x: x),
-            patch("subprocess.run", side_effect=subprocess.TimeoutExpired("node", 60)),
+            _mock_node_subprocess(communicate_side_effect=_asyncio.TimeoutError()),
         ):
             mock_path.exists.return_value = True
             txid, err = await svc.cooperative_refund_submarine(

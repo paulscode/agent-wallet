@@ -17,6 +17,7 @@ Key improvements over earlier implementations:
 import hashlib
 import hmac
 import json
+import asyncio
 import logging
 import os
 import secrets
@@ -1097,45 +1098,70 @@ class BoltzSwapService:
         if proxy:
             claim_input["socksProxy"] = proxy
 
+        script_timeout = 120 if proxy else 60
+        # Use ``asyncio.create_subprocess_exec`` so the 60-120 s wait
+        # for the Node.js claim script does NOT block the event loop.
+        # The previous ``subprocess.run`` froze every coroutine in this
+        # loop for the script's lifetime — including any open DB
+        # session — which is what wedged 30 connections in ``idle in
+        # transaction`` and exhausted the SQLAlchemy pool. Other
+        # callers' HTTP requests + LND/Boltz timeouts now get to
+        # observe their own deadlines instead of starving.
+        stdout_bytes = b""
+        stderr_bytes = b""
         try:
-            script_timeout = 120 if proxy else 60
-            result = subprocess.run(
-                [_NODE_BIN, str(CLAIM_SCRIPT_PATH)],
-                input=json.dumps(claim_input),
-                capture_output=True,
-                text=True,
-                timeout=script_timeout,
+            proc = await asyncio.create_subprocess_exec(
+                _NODE_BIN,
+                str(CLAIM_SCRIPT_PATH),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=str(CLAIM_SCRIPT_DIR),
                 env=_SUBPROCESS_ENV,
             )
-            if result.returncode != 0:
-                stderr_safe = result.stderr[:500] if result.stderr else ""
-                logger.error("Claim script failed (exit %d)", result.returncode)
-                return None, f"Claim script failed: {stderr_safe}"
-
-            output = json.loads(result.stdout.strip())
-            txid = output.get("txid")
-            if not txid:
-                return None, f"Claim script returned no txid: {output}"
-            tx_hex = output.get("txHex")
-            if tx_hex:
-                verr = await self._verify_claim_output(swap, tx_hex)
-                if verr:
-                    return None, verr
-            else:
-                logger.warning(
-                    "claim script returned no txHex; output cross-check skipped for swap %s",
-                    swap.boltz_swap_id,
-                )
-            return txid, None
-        except subprocess.TimeoutExpired:
-            return None, f"Claim script timed out ({script_timeout}s)"
-        except json.JSONDecodeError:
-            return None, f"Claim script returned invalid JSON: {result.stdout[:500]}"
         except FileNotFoundError:
             return None, "Node.js not found for claim script execution"
-        except Exception as e:
-            return None, f"Claim script error: {e}"
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(claim_input).encode()),
+                timeout=script_timeout,
+            )
+        except asyncio.TimeoutError:
+            # ``proc.communicate`` doesn't kill the child on its own
+            # timeout — drain explicitly so the subprocess doesn't
+            # outlive its handle.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, f"Claim script timed out ({script_timeout}s)"
+        if proc.returncode != 0:
+            stderr_safe = stderr_bytes[:500].decode("utf-8", errors="replace") if stderr_bytes else ""
+            logger.error("Claim script failed (exit %d)", proc.returncode)
+            return None, f"Claim script failed: {stderr_safe}"
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        try:
+            output = json.loads(stdout_text.strip())
+        except json.JSONDecodeError:
+            return None, f"Claim script returned invalid JSON: {stdout_text[:500]}"
+        txid = output.get("txid")
+        if not txid:
+            return None, f"Claim script returned no txid: {output}"
+        tx_hex = output.get("txHex")
+        if tx_hex:
+            verr = await self._verify_claim_output(swap, tx_hex)
+            if verr:
+                return None, verr
+        else:
+            logger.warning(
+                "claim script returned no txHex; output cross-check skipped for swap %s",
+                swap.boltz_swap_id,
+            )
+        return txid, None
 
     async def unilateral_claim(
         self,
@@ -1175,48 +1201,62 @@ class BoltzSwapService:
         if proxy:
             claim_input["socksProxy"] = proxy
 
+        script_timeout = 120 if proxy else 60
+        # See ``cooperative_claim``: blocking ``subprocess.run`` here
+        # froze the event loop for up to 120 s and was the upstream
+        # cause of leaked ``idle in transaction`` connections.
         try:
-            script_timeout = 120 if proxy else 60
-            result = subprocess.run(
-                [_NODE_BIN, str(CLAIM_SCRIPT_PATH)],
-                input=json.dumps(claim_input),
-                capture_output=True,
-                text=True,
-                timeout=script_timeout,
+            proc = await asyncio.create_subprocess_exec(
+                _NODE_BIN,
+                str(CLAIM_SCRIPT_PATH),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=str(CLAIM_SCRIPT_DIR),
                 env=_SUBPROCESS_ENV,
             )
-            if result.returncode != 0:
-                stderr_safe = result.stderr[:500] if result.stderr else ""
-                logger.error("Unilateral claim script failed (exit %d)", result.returncode)
-                return None, f"Unilateral claim script failed: {stderr_safe}"
-
-            # The unilateral mode emits the same event envelope as
-            # the cooperative path: ``{"event": "claim_broadcast_complete", "txid": "..."}``.
-            for line in result.stdout.strip().splitlines():
-                try:
-                    parsed = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, dict) and parsed.get("txid"):
-                    tx_hex = parsed.get("txHex")
-                    if tx_hex:
-                        verr = await self._verify_claim_output(swap, tx_hex)
-                        if verr:
-                            return None, verr
-                    else:
-                        logger.warning(
-                            "unilateral claim script returned no txHex; output cross-check skipped for swap %s",
-                            swap.boltz_swap_id,
-                        )
-                    return parsed["txid"], None
-            return None, f"Unilateral claim script returned no txid: {result.stdout[:500]}"
-        except subprocess.TimeoutExpired:
-            return None, f"Unilateral claim script timed out ({script_timeout}s)"
         except FileNotFoundError:
             return None, "Node.js not found for unilateral claim script execution"
-        except Exception as e:  # noqa: BLE001
-            return None, f"Unilateral claim script error: {e}"
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(claim_input).encode()),
+                timeout=script_timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, f"Unilateral claim script timed out ({script_timeout}s)"
+        if proc.returncode != 0:
+            stderr_safe = stderr_bytes[:500].decode("utf-8", errors="replace") if stderr_bytes else ""
+            logger.error("Unilateral claim script failed (exit %d)", proc.returncode)
+            return None, f"Unilateral claim script failed: {stderr_safe}"
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        # The unilateral mode emits the same event envelope as
+        # the cooperative path: ``{"event": "claim_broadcast_complete", "txid": "..."}``.
+        for line in stdout_text.strip().splitlines():
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("txid"):
+                tx_hex = parsed.get("txHex")
+                if tx_hex:
+                    verr = await self._verify_claim_output(swap, tx_hex)
+                    if verr:
+                        return None, verr
+                else:
+                    logger.warning(
+                        "unilateral claim script returned no txHex; output cross-check skipped for swap %s",
+                        swap.boltz_swap_id,
+                    )
+                return parsed["txid"], None
+        return None, f"Unilateral claim script returned no txid: {stdout_text[:500]}"
 
     async def retry_cooperative_claim(
         self,
@@ -1481,39 +1521,51 @@ class BoltzSwapService:
             if clamped is not None:
                 refund_input["feeRate"] = float(clamped)
 
+        script_timeout = 120 if proxy else 60
         try:
-            script_timeout = 120 if proxy else 60
-            result = subprocess.run(
-                [_NODE_BIN, str(REFUND_SCRIPT_PATH)],
-                input=json.dumps(refund_input),
-                capture_output=True,
-                text=True,
-                timeout=script_timeout,
+            proc = await asyncio.create_subprocess_exec(
+                _NODE_BIN,
+                str(REFUND_SCRIPT_PATH),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=str(CLAIM_SCRIPT_DIR),
                 env=_SUBPROCESS_ENV,
             )
-            if result.returncode != 0:
-                stderr_safe = result.stderr[:500] if result.stderr else ""
-                logger.error(
-                    "Refund script failed (exit %d): %s",
-                    result.returncode,
-                    stderr_safe,
-                )
-                return None, (f"Refund script failed (exit {result.returncode}): {stderr_safe}")
-            try:
-                output = json.loads(result.stdout.strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                return None, (f"Refund script returned invalid JSON: {result.stdout[:500]}")
-            txid = output.get("txid")
-            if not txid:
-                return None, f"Refund script returned no txid: {output}"
-            return txid, None
-        except subprocess.TimeoutExpired:
-            return None, f"Refund script timed out ({script_timeout}s)"
         except FileNotFoundError:
             return None, "Node.js not found for refund script execution"
-        except Exception as e:  # pragma: no cover - defensive
-            return None, f"Refund script error: {e}"
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(refund_input).encode()),
+                timeout=script_timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, f"Refund script timed out ({script_timeout}s)"
+        if proc.returncode != 0:
+            stderr_safe = stderr_bytes[:500].decode("utf-8", errors="replace") if stderr_bytes else ""
+            logger.error(
+                "Refund script failed (exit %d): %s",
+                proc.returncode,
+                stderr_safe,
+            )
+            return None, (f"Refund script failed (exit {proc.returncode}): {stderr_safe}")
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        try:
+            output = json.loads(stdout_text.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None, (f"Refund script returned invalid JSON: {stdout_text[:500]}")
+        txid = output.get("txid")
+        if not txid:
+            return None, f"Refund script returned no txid: {output}"
+        return txid, None
 
     async def unilateral_refund_submarine(
         self,
@@ -1589,39 +1641,51 @@ class BoltzSwapService:
             if clamped is not None:
                 refund_input["feeRate"] = float(clamped)
 
+        script_timeout = 120 if proxy else 60
         try:
-            script_timeout = 120 if proxy else 60
-            result = subprocess.run(
-                [_NODE_BIN, str(REFUND_SCRIPT_PATH)],
-                input=json.dumps(refund_input),
-                capture_output=True,
-                text=True,
-                timeout=script_timeout,
+            proc = await asyncio.create_subprocess_exec(
+                _NODE_BIN,
+                str(REFUND_SCRIPT_PATH),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=str(CLAIM_SCRIPT_DIR),
                 env=_SUBPROCESS_ENV,
             )
-            if result.returncode != 0:
-                stderr_safe = result.stderr[:500] if result.stderr else ""
-                logger.error(
-                    "Unilateral refund script failed (exit %d): %s",
-                    result.returncode,
-                    stderr_safe,
-                )
-                return None, (f"Unilateral refund script failed (exit {result.returncode}): {stderr_safe}")
-            try:
-                output = json.loads(result.stdout.strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                return None, (f"Unilateral refund script returned invalid JSON: {result.stdout[:500]}")
-            txid = output.get("txid")
-            if not txid:
-                return None, f"Unilateral refund script returned no txid: {output}"
-            return txid, None
-        except subprocess.TimeoutExpired:
-            return None, f"Unilateral refund script timed out ({script_timeout}s)"
         except FileNotFoundError:
             return None, "Node.js not found for refund script execution"
-        except Exception as e:  # pragma: no cover - defensive
-            return None, f"Unilateral refund script error: {e}"
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(input=json.dumps(refund_input).encode()),
+                timeout=script_timeout,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, f"Unilateral refund script timed out ({script_timeout}s)"
+        if proc.returncode != 0:
+            stderr_safe = stderr_bytes[:500].decode("utf-8", errors="replace") if stderr_bytes else ""
+            logger.error(
+                "Unilateral refund script failed (exit %d): %s",
+                proc.returncode,
+                stderr_safe,
+            )
+            return None, (f"Unilateral refund script failed (exit {proc.returncode}): {stderr_safe}")
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        try:
+            output = json.loads(stdout_text.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None, (f"Unilateral refund script returned invalid JSON: {stdout_text[:500]}")
+        txid = output.get("txid")
+        if not txid:
+            return None, f"Unilateral refund script returned no txid: {output}"
+        return txid, None
 
     async def _backfill_claim_txid_from_wallet(self, swap: BoltzSwap) -> None:
         """Best-effort recovery of a reverse-swap ``claim_txid`` that was
