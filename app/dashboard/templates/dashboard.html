@@ -670,7 +670,7 @@
                                                  cap is gone so wide windows show the full name; the
                                                  title attribute reveals it on hover when clipped. -->
                                             <div class="flex items-center gap-2 min-w-0 flex-1">
-                                                <span class="w-2 h-2 rounded-full shrink-0" :class="ch.active ? 'bg-neon-green' : 'bg-gray-600'"></span>
+                                                <span class="w-2 h-2 rounded-full shrink-0" :class="channelStatusDotClass(ch)" :title="channelStatusTooltip(ch)"></span>
                                                 <span class="text-white text-sm font-mono truncate min-w-0" :title="channelAlias(ch)" x-text="channelAlias(ch)"></span>
                                             </div>
                                             <span class="text-xs text-gray-500 shrink-0"

@@ -1451,6 +1451,56 @@ document.addEventListener('alpine:init', () => {
             return ch.remote_pubkey ? ch.remote_pubkey.slice(0, 16) + '…' : '';
         },
 
+        /** Three-state channel-status classifier used by the dot icon
+         *  next to each channel row. Returns:
+         *
+         *    'active'       — fully routable (green dot)
+         *    'waiting'      — funded + peer connected, but peer hasn't
+         *                     finalised ``channel_ready`` yet, usually
+         *                     because their LND requires more
+         *                     confirmations than ours did. Resolves on
+         *                     its own once the peer catches up. (yellow)
+         *    'offline'      — peer not currently connected; channel
+         *                     can't carry HTLCs until the peer
+         *                     reconnects. (grey)
+         *
+         *  When the backend couldn't determine ``peer_connected`` (LND
+         *  ``/peers`` call failed), the field is missing — fall back to
+         *  the historical binary green/grey behaviour by treating
+         *  ``ch.active=false`` as 'offline' so we don't surface a
+         *  yellow dot we can't actually justify.
+         */
+        channelStatus(ch) {
+            if (!ch) return 'offline';
+            if (ch.active) return 'active';
+            if (ch.peer_connected === true) return 'waiting';
+            return 'offline';
+        },
+        /** CSS class for the dot. */
+        channelStatusDotClass(ch) {
+            switch (this.channelStatus(ch)) {
+                case 'active':  return 'bg-neon-green';
+                case 'waiting': return 'bg-neon-yellow';
+                default:        return 'bg-gray-600';
+            }
+        },
+        /** Tooltip text — what the dot's colour means in plain English. */
+        channelStatusTooltip(ch) {
+            switch (this.channelStatus(ch)) {
+                case 'active':
+                    return 'Active — ready to send and receive payments.';
+                case 'waiting':
+                    return 'Funded and peer is connected, but they ' +
+                           "haven't finalised the channel yet (usually " +
+                           'because their node requires more confirmations ' +
+                           'than ours did). This typically clears in a few ' +
+                           'blocks.';
+                default:
+                    return 'Peer is offline. The channel will become ' +
+                           'usable again as soon as the peer reconnects.';
+            }
+        },
+
         /** Unique key for a pending channel. */
         pendingChannelKey(pc) {
             return pc.channel_point || JSON.stringify(pc);

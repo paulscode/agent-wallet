@@ -446,6 +446,78 @@ class TestDashboardReadEndpoints:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_channels_enriches_with_peer_connected(self, dashboard_client, auth_cookies):
+        """The dashboard's three-state channel-status icon (green=
+        active, yellow=waiting-for-channel-ready, grey=peer-offline)
+        relies on a ``peer_connected`` field that the backend enriches
+        from a parallel ``/v1/peers`` query. Pin that:
+
+        * ``peer_connected`` is added per channel, and
+        * matches whether the channel's ``remote_pubkey`` appears in
+          the connected-peers set.
+        """
+        peer_a = "02aa" + "00" * 31
+        peer_b = "02bb" + "00" * 31
+        channels = [
+            # active=true is "fully ready" (icon stays green regardless).
+            {"chan_id": "111", "remote_pubkey": peer_a, "active": True},
+            # active=false + peer connected → waiting-for-channel_ready (yellow).
+            {"chan_id": "222", "remote_pubkey": peer_b, "active": False},
+            # active=false + peer NOT connected → offline (grey).
+            {"chan_id": "333", "remote_pubkey": "02cc" + "00" * 31, "active": False},
+        ]
+        with (
+            patch(
+                "app.dashboard.api.lnd_service.get_channels",
+                new_callable=AsyncMock,
+                return_value=(channels, None),
+            ),
+            patch(
+                "app.dashboard.api.lnd_service.list_peer_pubkeys",
+                new_callable=AsyncMock,
+                return_value=({peer_a, peer_b}, None),
+            ),
+        ):
+            resp = await dashboard_client.get("/dashboard/api/channels")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert {c["chan_id"]: c.get("peer_connected") for c in body} == {
+            "111": True,   # active channel with connected peer
+            "222": True,   # the waiting-for-channel_ready case
+            "333": False,  # peer truly offline
+        }
+
+    @pytest.mark.asyncio
+    async def test_channels_omits_peer_connected_when_peers_lookup_fails(
+        self, dashboard_client, auth_cookies,
+    ):
+        """If ``/v1/peers`` errors out, the enrichment is skipped
+        entirely — channels render with binary green/grey using just
+        ``active``. The endpoint must NOT 502 just because the
+        peer-connection lookup failed."""
+        channels = [{"chan_id": "111", "remote_pubkey": "02aa" + "00" * 31, "active": False}]
+        with (
+            patch(
+                "app.dashboard.api.lnd_service.get_channels",
+                new_callable=AsyncMock,
+                return_value=(channels, None),
+            ),
+            patch(
+                "app.dashboard.api.lnd_service.list_peer_pubkeys",
+                new_callable=AsyncMock,
+                return_value=(None, "connection refused"),
+            ),
+        ):
+            resp = await dashboard_client.get("/dashboard/api/channels")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "peer_connected" not in body[0], (
+            "When peers lookup fails the field must NOT be present so the "
+            "JS falls back to its binary green/grey rendering — adding a "
+            "default boolean would mislead the icon."
+        )
+
+    @pytest.mark.asyncio
     async def test_payments_success(self, dashboard_client, auth_cookies):
         with patch(
             "app.dashboard.api.lnd_service.get_recent_payments",

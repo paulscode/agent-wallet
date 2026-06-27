@@ -947,27 +947,39 @@ async def _safe_channel_last_used() -> dict[str, int]:
 
 @router.get("/channels", dependencies=[Depends(_require_auth)])
 async def get_channels() -> Any:
-    # ``get_channels`` and ``get_channel_last_used`` are independent LND
-    # reads (the latter never consumes the former's result), so fire them
-    # concurrently rather than back-to-back. Over Tor each call is several
-    # seconds; serialising them stacked the endpoint's latency high enough
-    # to trip the browser's read timeout and surface a spurious "couldn't
-    # load channels" — running them in parallel roughly halves the cold path.
-    channels_res, last_used_res = await asyncio.gather(
+    # ``get_channels``, ``get_channel_last_used`` and ``list_peer_pubkeys``
+    # are independent LND reads, so fire them concurrently rather than
+    # back-to-back. Over Tor each call is several seconds; serialising
+    # them stacked the endpoint's latency high enough to trip the
+    # browser's read timeout and surface a spurious "couldn't load
+    # channels" — running them in parallel roughly halves the cold path.
+    channels_res, last_used_res, peers_res = await asyncio.gather(
         lnd_service.get_channels(),
         # Best-effort enrichment: any failure here must not break the
         # channel list, so swallow it and fall back to no enrichment.
         _safe_channel_last_used(),
+        lnd_service.list_peer_pubkeys(),
     )
     data, error = channels_res
     if error:
         return JSONResponse(status_code=502, content={"detail": sanitize_upstream_error(error, "LND")})
     channels = list(data or [])
     last_used = last_used_res
+    # Peer-pubkey set drives the channel-status three-state icon: a
+    # channel with ``active=False`` AND ``peer_connected=True`` is
+    # "waiting for ``channel_ready`` finalisation" (yellow), while
+    # ``active=False`` AND ``peer_connected=False`` is "peer offline"
+    # (grey). If the peer query failed (``peer_pubkeys is None``) the
+    # frontend falls back to its old binary green/grey rendering.
+    peer_pubkeys, _peers_err = peers_res
     for ch in channels:
         ts = last_used.get(ch.get("chan_id", ""))
         if ts:
             ch["last_used"] = ts
+        if peer_pubkeys is not None:
+            ch["peer_connected"] = (
+                ch.get("remote_pubkey", "") in peer_pubkeys
+            )
     return channels
 
 

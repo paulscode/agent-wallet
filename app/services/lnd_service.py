@@ -542,6 +542,31 @@ class LNDService:
 
     # ─── Channels ─────────────────────────────────────────────────────
 
+    async def list_peer_pubkeys(self) -> tuple[Optional[set[str]], Optional[str]]:
+        """Return the set of currently-connected peers' pubkeys.
+
+        Used by the dashboard's channel-status enrichment to distinguish
+        "channel inactive because peer is offline" (grey) from "channel
+        inactive because we're still waiting for ``channel_ready`` after
+        the open" (yellow). Both states surface as ``active=False`` on
+        the channel record itself — the peer-connection check is the
+        only signal that separates them.
+
+        Best-effort: any error returns ``(None, error_str)``; callers
+        must treat ``None`` as "unknown, fall back to binary green/grey".
+        """
+        data, error = await self._request("GET", "/v1/peers")
+        if error:
+            return None, error
+        if not isinstance(data, dict):
+            return set(), None
+        pubs: set[str] = set()
+        for p in data.get("peers", []) or []:
+            pk = (p or {}).get("pub_key") or ""
+            if pk:
+                pubs.add(pk)
+        return pubs, None
+
     async def get_channels(self) -> tuple[Optional[list[ChannelInfo]], Optional[str]]:
         """Get list of open channels.
 
