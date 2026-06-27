@@ -57,9 +57,14 @@ def _make_swap(
     claim_txid: str | None = None,
     recovery_count: int = 0,
     age_seconds: int = 1,
+    recovery_attempted_seconds_ago: int | None = None,
 ) -> BoltzSwap:
     now = _now()
     created_at = now - timedelta(seconds=age_seconds)
+    recovery_attempted_at = (
+        now - timedelta(seconds=recovery_attempted_seconds_ago)
+        if recovery_attempted_seconds_ago is not None else None
+    )
     return BoltzSwap(
         id=uuid4(),
         api_key_id=uuid4(),
@@ -72,6 +77,7 @@ def _make_swap(
         error_message=error_message,
         claim_txid=claim_txid,
         recovery_count=recovery_count,
+        recovery_attempted_at=recovery_attempted_at,
         created_at=created_at,
         updated_at=created_at,
     )
@@ -158,6 +164,72 @@ class TestClaimingPhase:
         assert hint.state == STATE_CLAIM_RETRY_AVAILABLE
         assert ACTION_COOPERATIVE_CLAIM in hint.actions
         assert hint.metadata.get("recovery_count") == 1
+
+    def test_recent_failure_softpedaled_to_info(self):
+        """2026-06-27 UX regression: a transient failure followed by an
+        in-flight auto-retry surfaced a scary 'Claim attempt failed;
+        retry available' WARNING banner overlaid on a healthy 'Confirming
+        the on-chain transaction' step indicator. The classifier now soft-
+        pedals to INFO 'Retrying claim shortly' when the last failure
+        happened within ``CLAIM_RETRY_GRACE_SECONDS``."""
+        from app.services.boltz_recovery import (
+            CLAIM_RETRY_GRACE_SECONDS,
+            STATE_CLAIM_RETRY_IN_PROGRESS,
+        )
+        swap = _make_swap(
+            status=SwapStatus.CLAIMING,
+            recovery_count=1,
+            error_message="cooperative claim subprocess failed",
+            timeout_block_height=900_000,
+            recovery_attempted_seconds_ago=30,
+        )
+        hint = classify_recovery_state(swap, btc_tip_height=800_000, now=_now())
+        assert hint.state == STATE_CLAIM_RETRY_IN_PROGRESS
+        assert hint.severity == SEVERITY_INFO, (
+            "An in-flight retry must NOT surface as a warning — the "
+            "frontend banner gate (severity in {warning, critical}) "
+            "would otherwise show a scary failure message overlaid on "
+            "a healthy progress indicator."
+        )
+        # Retry action stays available — user can still force-retry
+        # manually if they don't want to wait.
+        assert ACTION_COOPERATIVE_CLAIM in hint.actions
+        assert hint.metadata.get("seconds_since_last_attempt") == 30
+        assert hint.metadata.get("grace_seconds") == CLAIM_RETRY_GRACE_SECONDS
+
+    def test_old_failure_still_warning(self):
+        """When the failed attempt is OLDER than the grace window, the
+        auto-retry pipeline has clearly not landed; escalate back to the
+        WARNING-level 'Claim attempt failed' banner so the user sees the
+        retry button."""
+        swap = _make_swap(
+            status=SwapStatus.CLAIMING,
+            recovery_count=1,
+            error_message="cooperative claim subprocess failed",
+            timeout_block_height=900_000,
+            recovery_attempted_seconds_ago=10 * 60,  # 10 minutes ago
+        )
+        hint = classify_recovery_state(swap, btc_tip_height=800_000, now=_now())
+        assert hint.state == STATE_CLAIM_RETRY_AVAILABLE
+        assert hint.severity == SEVERITY_WARNING
+        assert ACTION_COOPERATIVE_CLAIM in hint.actions
+
+    def test_failure_with_no_recovery_attempted_at_still_warning(self):
+        """``recovery_attempted_at`` is only stamped by the explicit
+        retry path. If a failure was recorded by some other code path
+        (or the field was never persisted, e.g. on older swap rows),
+        we can't tell whether a retry is in flight — fall back to the
+        WARNING to be safe."""
+        swap = _make_swap(
+            status=SwapStatus.CLAIMING,
+            recovery_count=1,
+            error_message="cooperative claim subprocess failed",
+            timeout_block_height=900_000,
+            recovery_attempted_seconds_ago=None,
+        )
+        hint = classify_recovery_state(swap, btc_tip_height=800_000, now=_now())
+        assert hint.state == STATE_CLAIM_RETRY_AVAILABLE
+        assert hint.severity == SEVERITY_WARNING
 
     def test_claiming_fresh(self):
         swap = _make_swap(status=SwapStatus.CLAIMING, timeout_block_height=900_000)

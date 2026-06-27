@@ -72,6 +72,17 @@ LIQUID_SUBMARINE_STUCK_THRESHOLD_SECONDS: int = 3600
 #: claim, so the classifier surfaces the post-timeout unilateral claim.
 LIQUID_REVERSE_CLAIM_STUCK_THRESHOLD_SECONDS: int = 3600
 
+#: Grace window after a failed cooperative-claim attempt during which
+#: the classifier soft-pedals the failure (returns INFO "Retrying claim
+#: shortly" rather than WARNING "Claim attempt failed; retry available")
+#: while the auto-retry pipeline gets a chance to land the next attempt.
+#: Picked to cover the per-swap Boltz poll (30 s, scheduled task) plus
+#: some slack — long enough that the typical fail-then-auto-succeed
+#: window doesn't surface a scary banner to the user, short enough that
+#: genuinely-stuck swaps still escalate well before the user gives up
+#: on the dialog.
+CLAIM_RETRY_GRACE_SECONDS: int = 90
+
 
 # ─── Action identifiers ───────────────────────────────────────────────
 # Strings the dashboard / API consumers match on. Keep stable — they
@@ -114,6 +125,7 @@ STATE_TRANSIENT_PAYMENT_ERROR = "transient_payment_error"
 STATE_STUCK_INVOICE_PAID = "stuck_in_invoice_paid"
 STATE_AWAITING_LOCKUP_CONFIRMATION = "awaiting_lockup_confirmation"
 STATE_AWAITING_CLAIM = "awaiting_claim"
+STATE_CLAIM_RETRY_IN_PROGRESS = "claim_retry_in_progress"
 STATE_CLAIM_RETRY_AVAILABLE = "claim_retry_available"
 STATE_TIMEOUT_WARNING = "timeout_warning"
 STATE_TIMEOUT_IMMINENT = "timeout_imminent"
@@ -430,6 +442,37 @@ def _classify_status(
 
         # Generic claim-phase rows.
         if (swap.recovery_count or 0) > 0 or error_message:
+            # Soft-pedal the warning if the most recent attempt is fresh.
+            # The auto-retry pipeline (periodic Boltz poll → advance_swap)
+            # typically lands the next attempt within seconds-to-a-minute;
+            # during that window the user would otherwise see a scary
+            # "Claim attempt failed" banner overlaid on a healthy
+            # "Confirming the on-chain transaction" progress label. Keep
+            # the same retry button available — just downgrade the copy
+            # and severity so the user doesn't think the swap is stuck.
+            recent_failure_age = _seconds_since(
+                swap.recovery_attempted_at, now,
+            )
+            if (
+                recent_failure_age is not None
+                and recent_failure_age < CLAIM_RETRY_GRACE_SECONDS
+            ):
+                return RecoveryHint(
+                    state=STATE_CLAIM_RETRY_IN_PROGRESS,
+                    severity=SEVERITY_INFO,
+                    headline="Retrying claim shortly",
+                    detail=(
+                        "A claim attempt didn't land on the first try. "
+                        "The system is about to retry automatically — "
+                        "this usually clears within a minute."
+                    ),
+                    actions=(ACTION_COOPERATIVE_CLAIM,),
+                    metadata={
+                        "recovery_count": swap.recovery_count or 0,
+                        "seconds_since_last_attempt": int(recent_failure_age),
+                        "grace_seconds": CLAIM_RETRY_GRACE_SECONDS,
+                    },
+                )
             return RecoveryHint(
                 state=STATE_CLAIM_RETRY_AVAILABLE,
                 severity=SEVERITY_WARNING,
@@ -439,6 +482,10 @@ def _classify_status(
                 metadata={
                     "recovery_count": swap.recovery_count or 0,
                     "error_message": error_message,
+                    "seconds_since_last_attempt": (
+                        int(recent_failure_age)
+                        if recent_failure_age is not None else None
+                    ),
                 },
             )
         return RecoveryHint(
