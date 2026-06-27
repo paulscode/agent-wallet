@@ -258,8 +258,11 @@ xxd -ps -u -c 1000 ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon
 ```
 
 Create your first admin API key. The wallet ships no bootstrap CLI,
-so the first key is inserted directly into the database — every
-subsequent key can be minted via `POST /v1/admin/api-keys`:
+so the first key is inserted directly into the database. Once you can
+log in to the dashboard with that key, every subsequent key (create,
+rename, scope toggle, rotate, revoke, purge) is managed point-and-click
+from the dashboard's **⚙ Settings → API Keys** panel — see
+[docs/api-keys.md](docs/api-keys.md):
 
 ```bash
 docker compose exec api python3 - <<'PY'
@@ -636,21 +639,17 @@ Query the configured Mempool Explorer instance for on-chain data.
 
 | Method | Path | Body | Description |
 |---|---|---|---|
-| `POST` | `/v1/admin/api-keys` | `{name, is_admin?, expires_in_days?}` | Create API key — **plaintext key returned only once** |
 | `GET` | `/v1/admin/api-keys` | — | List all API keys (hashed, no plaintext) |
-| `PATCH` | `/v1/admin/api-keys/{key_id}` | `{name?, is_active?, is_admin?}` | Update API key |
-| `DELETE` | `/v1/admin/api-keys/{key_id}` | — | Revoke an API key (cannot delete own key) |
 | `GET` | `/v1/admin/audit-log?limit=50&action=...` | — | View audit log (max 200) |
 | `GET` | `/v1/admin/audit-log/verify?limit=...` | — | Walk the audit-log hash chain and report any tampered entries: `{checked, ok, first_bad_id, first_bad_reason}` |
 | `POST` | `/v1/admin/audit-log/reanchor` | — | Re-anchor the keyed hash chain under the current `SECRET_KEY` after a database restore or key rotation. Deliberate, admin-only; records its own audit entry: `{reanchored, was_consistent, first_bad_id}` |
-| `POST` | `/v1/admin/api-keys/{key_id}/purge` | — | Hard-delete a soft-deleted API key. Refuses to run until `AUDIT_LOG_RETENTION_DAYS` has elapsed since `deleted_at` |
 | `GET` | `/v1/admin/health` | — | Health check: `{status, lnd_connected, lnd_info}` |
 
-| Model | Field | Type | Default | Constraints |
-|---|---|---|---|---|
-| `CreateAPIKeyRequest` | `name` | `str` | *required* | 1–128 chars |
-| | `is_admin` | `bool` | `false` | |
-| | `expires_in_days` | `int?` | `null` | 1–`API_KEY_MAX_TTL_DAYS` (default 365); values above are clamped server-side |
+> **Creating, updating, revoking, or purging API keys** is intentionally
+> dashboard-only — those operations are session-authenticated and
+> CSRF-gated at `POST | PATCH | DELETE /dashboard/api/api-keys[...]`,
+> not exposed on the admin REST surface. See
+> [docs/api-keys.md](docs/api-keys.md) for the operator guide.
 
 ### System (no auth)
 
@@ -862,7 +861,7 @@ CREATED → PAYING_INVOICE → INVOICE_PAID → CLAIMING → CLAIMED → COMPLET
  CANCELLED                     FAILED ←── (any step can fail)
 ```
 
-- **Automatic Retry**: Failed swaps retry up to 200 times with tiered backoff (10s → 30s → 120s → 300s)
+- **Automatic Retry**: Failed swaps retry up to 200 times with tiered backoff (15s for the first 10 retries → 60s for the next 20 → 300s thereafter)
 - **Startup Recovery**: Pending swaps automatically recovered when the API starts
 - **Cooperative Claims**: Musig2 Taproot claims via boltz-core (Node.js) for lower fees
 - **Status History**: Every state transition recorded with timestamps
@@ -950,7 +949,7 @@ revocation in Redis, CSRF double-submit tokens, optional IP binding, a
 ```bash
 source .venv/bin/activate
 
-# Run all tests (~1400 tests, ~100s)
+# Run all tests (~3,900 tests across 376 files)
 python -m pytest tests/ -v
 
 # Unit tests only
@@ -1037,7 +1036,7 @@ agent-wallet/
 │   └── config.example.toml           # Sample gateway config
 ├── proto/
 │   └── bolt12_gateway.proto          # gRPC schema shared by Python + Rust
-├── alembic/                          # Database migrations (current head: 043)
+├── alembic/                          # Database migrations (current head: 047)
 ├── scripts/                          # Node.js Boltz claim, regtest smoke tests, helpers
 ├── tor-proxy/                        # Tor SOCKS5 proxy (`tor-proxy` compose service)
 ├── tests/
