@@ -1422,6 +1422,113 @@ class TestDashboardChannelEndpoints:
         mock_connect.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_reconnect_channel_peer_happy_path(
+        self, dashboard_client, auth_cookies,
+    ):
+        """The dashboard's "Reconnect peer" affordance for a channel
+        stuck in the waiting-for-channel_ready state must:
+
+        * Resolve the channel + peer pubkey from ``get_channels``.
+        * Pick a clearnet address from the peer's gossiped node info.
+        * Fire disconnect → connect on LND.
+        * Return ``{ status: 'reconnected', address: ... }``.
+
+        Pins the contract end-to-end so a future refactor can't drop
+        any step silently."""
+        peer_pubkey = "02" + "aa" * 32
+        channel = {
+            "chan_id": "1234567",
+            "remote_pubkey": peer_pubkey,
+            "active": False,
+        }
+        node_info = {
+            "node": {
+                "pub_key": peer_pubkey,
+                "alias": "absolute.money",
+                "addresses": [
+                    {"network": "tcp", "addr": "5.11.92.140:9735"},
+                ],
+            },
+        }
+        with (
+            patch(
+                "app.dashboard.api.lnd_service.get_channels",
+                new_callable=AsyncMock, return_value=([channel], None),
+            ),
+            patch(
+                "app.dashboard.api.lnd_service.get_node_info",
+                new_callable=AsyncMock, return_value=(node_info, None),
+            ),
+            patch(
+                "app.dashboard.api.lnd_service.disconnect_peer",
+                new_callable=AsyncMock, return_value=({}, None),
+            ) as mock_disc,
+            patch(
+                "app.dashboard.api.lnd_service.connect_peer",
+                new_callable=AsyncMock, return_value=({}, None),
+            ) as mock_conn,
+        ):
+            resp = await dashboard_client.post(
+                "/dashboard/api/channels/1234567/reconnect-peer",
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "reconnected"
+        assert body["address"] == "5.11.92.140:9735"
+        mock_disc.assert_awaited_once_with(peer_pubkey)
+        mock_conn.assert_awaited_once_with(peer_pubkey, "5.11.92.140:9735")
+
+    @pytest.mark.asyncio
+    async def test_reconnect_channel_peer_channel_not_found(
+        self, dashboard_client, auth_cookies,
+    ):
+        with patch(
+            "app.dashboard.api.lnd_service.get_channels",
+            new_callable=AsyncMock, return_value=([], None),
+        ):
+            resp = await dashboard_client.post(
+                "/dashboard/api/channels/9999/reconnect-peer",
+            )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_reconnect_channel_peer_no_published_address(
+        self, dashboard_client, auth_cookies,
+    ):
+        """If the peer hasn't published a reachable address in gossip,
+        we can't auto-reconnect — fail BEFORE disconnecting (so we don't
+        leave the user with a dropped peer they then have to manually
+        reconnect)."""
+        peer_pubkey = "02" + "bb" * 32
+        channel = {"chan_id": "111", "remote_pubkey": peer_pubkey}
+        node_info = {
+            "node": {"pub_key": peer_pubkey, "alias": "shy", "addresses": []},
+        }
+        with (
+            patch(
+                "app.dashboard.api.lnd_service.get_channels",
+                new_callable=AsyncMock, return_value=([channel], None),
+            ),
+            patch(
+                "app.dashboard.api.lnd_service.get_node_info",
+                new_callable=AsyncMock, return_value=(node_info, None),
+            ),
+            patch(
+                "app.dashboard.api.lnd_service.disconnect_peer",
+                new_callable=AsyncMock, return_value=({}, None),
+            ) as mock_disc,
+        ):
+            resp = await dashboard_client.post(
+                "/dashboard/api/channels/111/reconnect-peer",
+            )
+        assert resp.status_code == 400
+        assert "reachable address" in resp.json()["detail"]
+        mock_disc.assert_not_awaited(), (
+            "must short-circuit BEFORE disconnecting — otherwise the "
+            "peer is left dropped with no automatic reconnect path."
+        )
+
+    @pytest.mark.asyncio
     async def test_open_channel_peer_connect_failure(self, dashboard_client, auth_cookies):
         with patch(
             "app.dashboard.api.lnd_service.connect_peer",

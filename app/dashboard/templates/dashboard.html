@@ -719,6 +719,43 @@
                                                 </button>
                                             </div>
                                         </div>
+                                        <!-- Waiting-for-channel_ready banner: appears when the channel
+                                             is funded + peer connected, but the peer hasn't sent
+                                             ``channel_ready`` to finalise the open. Offers the operator
+                                             a "Reconnect peer" affordance which fires a quick
+                                             disconnect/reconnect on the peer — the standard LND remedy
+                                             for stuck channel_ready exchange (no funds touched). -->
+                                        <template x-if="channelStatus(ch) === 'waiting'">
+                                            <div class="mt-2.5 p-2.5 rounded-md bg-neon-yellow/5 border border-neon-yellow/20">
+                                                <div class="flex items-start gap-2">
+                                                    <i data-lucide="info" class="w-3.5 h-3.5 text-neon-yellow shrink-0 mt-0.5"></i>
+                                                    <div class="flex-1 text-[11px] text-gray-300 leading-relaxed">
+                                                        <p>
+                                                            Funded and peer is connected, but they haven't finalised the channel yet.
+                                                            This usually clears in a few blocks. If it persists, you can nudge the
+                                                            peer to re-handshake — safe to retry, no funds touched.
+                                                        </p>
+                                                        <template x-if="channelReconnectResult[ch.chan_id]">
+                                                            <p class="mt-1.5"
+                                                               :class="channelReconnectResult[ch.chan_id] && channelReconnectResult[ch.chan_id].ok ? 'text-neon-green' : 'text-neon-pink'"
+                                                               x-text="channelReconnectResult[ch.chan_id] && channelReconnectResult[ch.chan_id].message"></p>
+                                                        </template>
+                                                    </div>
+                                                    <button @click.stop="reconnectChannelPeer(ch)"
+                                                            :disabled="channelReconnectBusy[ch.chan_id]"
+                                                            class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium bg-neon-yellow/10 border border-neon-yellow/30 text-neon-yellow hover:bg-neon-yellow/20 hover:border-neon-yellow/50 transition-all disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                                                            :title="channelReconnectBusy[ch.chan_id] ? 'Reconnecting…' : 'Disconnect + reconnect this peer to nudge channel_ready'">
+                                                        <template x-if="channelReconnectBusy[ch.chan_id]">
+                                                            <span class="w-3 h-3 border-2 border-neon-yellow border-t-transparent rounded-full animate-spin"></span>
+                                                        </template>
+                                                        <template x-if="!channelReconnectBusy[ch.chan_id]">
+                                                            <i data-lucide="rotate-cw" class="w-3 h-3"></i>
+                                                        </template>
+                                                        <span>Reconnect peer</span>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </template>
                                     </div>
                                 </template>
                             </div>

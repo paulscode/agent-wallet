@@ -1955,6 +1955,41 @@ class LNDService:
             return None, error
         return data or {}, None
 
+    async def disconnect_peer(
+        self, pubkey: str,
+    ) -> tuple[Optional[dict], Optional[str]]:
+        """Drop the LN-layer TCP connection to a peer.
+
+        Used by the dashboard's "Reconnect peer" affordance to unwedge a
+        channel stuck in the ``waiting-for-channel_ready`` state: LND
+        re-runs the channel-ready check on each peer reconnect, so a
+        disconnect/reconnect pair often clears a channel that's been
+        sitting at ``active=false`` after enough confirmations.
+
+        Idempotent — returns ``({}, None)`` if the peer wasn't connected
+        in the first place, since the goal state (not connected) is
+        already satisfied.
+        """
+        data, error = await self._request("DELETE", f"/v1/peers/{pubkey}")
+        if error:
+            text = (error or "").lower()
+            if "not connected" in text or "peer not found" in text:
+                return {}, None
+            return None, error
+        return data or {}, None
+
+    async def get_node_info(
+        self, pubkey: str,
+    ) -> tuple[Optional[dict], Optional[str]]:
+        """Fetch a peer's gossiped node record (addresses, alias,
+        features). Used by ``/channels/{id}/reconnect-peer`` to find a
+        reachable address for the reconnect, since we don't persist
+        peer addresses on our own channel rows."""
+        data, error = await self._request("GET", f"/v1/graph/node/{pubkey}")
+        if error:
+            return None, error
+        return data or {}, None
+
     async def open_channel(
         self,
         node_pubkey_hex: str,

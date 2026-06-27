@@ -991,6 +991,140 @@ async def get_pending_channels() -> Any:
     return data or []
 
 
+def _pick_clearnet_addr_from_node_info(node_info: dict) -> str | None:
+    """Pick the best peer address from an LND ``/v1/graph/node/{pk}``
+    response. Preference order: clearnet IPv4 → clearnet IPv6 → Tor.
+    Returns ``None`` if the node has no usable address.
+    """
+    node = (node_info or {}).get("node") or {}
+    addrs = node.get("addresses") or []
+    cn4 = cn6 = tor = None
+    for a in addrs:
+        addr = (a.get("addr") or "").strip()
+        if not addr:
+            continue
+        lo = addr.lower()
+        if ".onion:" in lo or lo.endswith(".onion"):
+            tor = tor or addr
+        elif addr.count(":") == 1:
+            cn4 = cn4 or addr
+        elif addr.startswith("["):
+            cn6 = cn6 or addr
+    return cn4 or cn6 or tor
+
+
+@router.post(
+    "/channels/{chan_id}/reconnect-peer",
+    dependencies=[Depends(_require_auth_csrf)],
+)
+async def reconnect_channel_peer(
+    chan_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Disconnect + reconnect the peer for a channel that's stuck in the
+    waiting-for-``channel_ready`` state.
+
+    Standard LND foot-gun remedy: after enough on-chain confirmations a
+    fresh peer handshake makes LND re-check pending channels and
+    re-send ``channel_ready`` if appropriate. No on-chain action; no
+    funds movement; safe to call against an already-active channel
+    (just a transient blip while the peer reconnects).
+
+    Returns ``{ "status": "reconnected", "address": "<host:port>" }``
+    on success. Surfaces a 4xx with a friendly message when the channel
+    can't be found or the peer has no gossiped address to dial.
+    """
+    ip = request.client.host if request.client else None
+
+    # 1) Resolve the channel + peer pubkey.
+    channels, err = await lnd_service.get_channels()
+    if err is not None:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": sanitize_upstream_error(err, "LND")},
+        )
+    chan = next(
+        (c for c in (channels or []) if c.get("chan_id") == chan_id), None,
+    )
+    if chan is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "Channel not found."},
+        )
+    pubkey = chan.get("remote_pubkey") or ""
+    if not pubkey:
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Channel has no remote pubkey on record."},
+        )
+
+    # 2) Look up the peer's gossiped address. Done BEFORE the
+    #    disconnect so a "no address available" condition fails fast
+    #    without leaving the peer dropped.
+    node_info, node_err = await lnd_service.get_node_info(pubkey)
+    if node_err is not None or node_info is None:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": (
+                "Couldn't find this peer in the gossip graph — try "
+                "again in a few minutes, or reconnect manually if you "
+                "know their address."
+            )},
+        )
+    addr = _pick_clearnet_addr_from_node_info(node_info)
+    if not addr:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": (
+                "This peer hasn't published a reachable address in the "
+                "gossip graph, so we can't reconnect to them "
+                "automatically."
+            )},
+        )
+
+    # 3) Disconnect + reconnect. ``disconnect_peer`` is idempotent —
+    #    "not connected" responses are treated as success.
+    _, disc_err = await lnd_service.disconnect_peer(pubkey)
+    if disc_err is not None:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": sanitize_upstream_error(disc_err, "LND")},
+        )
+    _, conn_err = await lnd_service.connect_peer(pubkey, addr)
+    if conn_err is not None:
+        # Log + surface — the peer is now disconnected and we
+        # couldn't reconnect, which is recoverable on the next LND
+        # gossip cycle but worth telling the user about.
+        await log_dashboard_action(
+            db, DASHBOARD_KEY_ID, "channel_reconnect_peer",
+            "channel", amount_sats=None,
+            details={
+                "chan_id": chan_id,
+                "peer_pubkey": pubkey,
+                "address": addr,
+                "step": "connect",
+            },
+            success=False, error_message=conn_err, ip_address=ip,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"detail": sanitize_upstream_error(conn_err, "LND")},
+        )
+
+    await log_dashboard_action(
+        db, DASHBOARD_KEY_ID, "channel_reconnect_peer",
+        "channel", amount_sats=None,
+        details={
+            "chan_id": chan_id,
+            "peer_pubkey": pubkey,
+            "address": addr,
+        },
+        success=True, error_message=None, ip_address=ip,
+    )
+    return {"status": "reconnected", "address": addr}
+
+
 @router.get("/payments", dependencies=[Depends(_require_auth)])
 async def get_payments() -> Any:
     data, error = await lnd_service.get_recent_payments(50)

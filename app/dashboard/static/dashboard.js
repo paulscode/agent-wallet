@@ -1531,6 +1531,52 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        /** Per-channel in-flight flag for the "Reconnect peer" button,
+         *  keyed by chan_id. Drives the spinner + disabled state. */
+        channelReconnectBusy: {},
+        /** Per-channel result toast (success or error) for the
+         *  "Reconnect peer" action. Keyed by chan_id. ``null`` clears it.
+         *  Shape: ``{ ok: bool, message: string }``. */
+        channelReconnectResult: {},
+
+        /** Run the disconnect/reconnect pair on this channel's peer.
+         *  Idempotent on the LND side (a healthy active channel just
+         *  blips briefly and reactivates); the operator decides when to
+         *  fire it based on the yellow dot + tooltip. */
+        async reconnectChannelPeer(ch) {
+            if (!ch || !ch.chan_id) return;
+            const id = ch.chan_id;
+            if (this.channelReconnectBusy[id]) return;
+            this.channelReconnectBusy = { ...this.channelReconnectBusy, [id]: true };
+            this.channelReconnectResult = { ...this.channelReconnectResult, [id]: null };
+            try {
+                const data = await this.api(
+                    'POST',
+                    '/channels/' + encodeURIComponent(id) + '/reconnect-peer',
+                );
+                this.channelReconnectResult = {
+                    ...this.channelReconnectResult,
+                    [id]: {
+                        ok: true,
+                        message: 'Reconnected. The channel will refresh in a moment.',
+                    },
+                };
+                // Refresh the channel list a beat later so the dot has
+                // a chance to flip green if this worked.
+                setTimeout(() => this.fetchChannels(), 2000);
+            } catch (e) {
+                this.channelReconnectResult = {
+                    ...this.channelReconnectResult,
+                    [id]: {
+                        ok: false,
+                        message: (e && e.message) || 'Reconnect failed. Try again in a few minutes.',
+                    },
+                };
+            }
+            this.channelReconnectBusy = { ...this.channelReconnectBusy, [id]: false };
+            this.$nextTick(() => this.initIcons());
+        },
+
         /** Unique key for a pending channel. */
         pendingChannelKey(pc) {
             return pc.channel_point || JSON.stringify(pc);
