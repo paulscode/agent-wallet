@@ -8763,7 +8763,9 @@
                                     <span class="font-mono text-gray-300"><span x-text="formatSats(braiinsDepositBoltzServiceFeeSats)"></span> sats</span>
                                 </div>
                                 <div class="flex items-center justify-between text-[11px]">
-                                    <span class="text-gray-500">Lightning routing headroom</span>
+                                    <span class="text-gray-500">Lightning routing headroom
+                                        <span class="cursor-help text-gray-500/70" title="A safety reserve for the Lightning leg — capped at 3% — not a fee you pay. The actual routing fee is usually a small fraction of this (often well under 0.5%). It is reserved so the payment has enough fee budget to find a route and won't fail; whatever isn't used stays in your wallet's Lightning balance. It is not paid to the wallet operator or to Braiins.">&#9432;</span>
+                                    </span>
                                     <span class="font-mono text-gray-300"><span x-text="formatSats(braiinsDepositRoutingFeeSats)"></span> sats</span>
                                 </div>
                                 <div class="flex items-center justify-between text-[11px]">
