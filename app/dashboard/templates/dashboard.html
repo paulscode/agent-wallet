@@ -8444,10 +8444,16 @@
 
                         <!-- Advanced: open a channel instead of a swap (on-chain
                              sources only, operator-enabled). The escape hatch for
-                             when a swap can't be routed to this node. -->
+                             when a swap can't be routed to this node — surfaced in
+                             the neon-yellow warning tone (matching the codebase's
+                             "pay attention" cue) because Boltz routability dips are
+                             common enough that users need to find this affordance
+                             without scanning. -->
                         <details x-show="braiinsDepositChannelOptionAvailable" x-cloak
                                  class="mt-2 text-[11px] text-gray-400">
-                            <summary class="cursor-pointer hover:text-gray-200">Advanced / having trouble?</summary>
+                            <summary class="cursor-pointer text-xs font-medium text-neon-yellow hover:text-neon-yellow/80">
+                                <i data-lucide="alert-triangle" class="w-3.5 h-3.5 inline align-text-bottom mr-1"></i>Advanced / having trouble?
+                            </summary>
                             <div class="mt-2 p-2.5 rounded-md bg-navy-900 border border-navy-700 space-y-2">
                                 <p class="leading-relaxed">
                                     If a swap can't be routed to your node, you can fund this deposit by <span class="font-semibold">opening a Lightning channel</span> to a recommended routing peer instead. Slower (~30-60 min to confirm) and ~1% stays in the new channel as receive capacity you keep, but it doesn't depend on inbound routing.
