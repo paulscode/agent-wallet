@@ -131,8 +131,14 @@
              ``|| onboardingCelebrating`` keeps the wizard mounted
              for ~2.4 s after a channel first goes active so the
              "You're connected!" view can play before the regular
-             dashboard takes over. -->
-        <template x-if="summary && (onboardingStep || onboardingCelebrating)">
+             dashboard takes over.
+             ``|| channelPlannerActive`` keeps the wrapper mounted
+             when the channel-mix planner is opened from the
+             Channels tab (post-onboarding); the planner panels
+             check ``channelPlanMode`` directly and the other
+             wizard steps stay hidden because their x-show keys off
+             ``onboardingStep``. -->
+        <template x-if="summary && (onboardingStep || onboardingCelebrating || channelPlannerActive)">
             <div class="max-w-2xl mx-auto">
                 <!-- WELCOME ─────────────────────────────────────────── -->
                 <div x-show="onboardingStep === 'welcome'" class="onboarding-fade-up text-center py-12">
@@ -208,7 +214,7 @@
                 </div>
 
                 <!-- READY TO CONNECT ──────────────────────────────────── -->
-                <div x-show="onboardingStep === 'ready_to_connect'" class="onboarding-fade-up py-10">
+                <div x-show="onboardingStep === 'ready_to_connect' && channelPlanMode === 'wizard_choice'" class="onboarding-fade-up py-10">
                     <div class="flex flex-col items-center mb-6">
                         <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-neon-green/15 border-2 border-neon-green/40 mb-3">
                             <i data-lucide="check" class="w-7 h-7 text-neon-green"></i>
@@ -247,39 +253,127 @@
                         <div>
                             <p class="text-xs uppercase tracking-wider text-gray-500 mb-3">Where should we connect?</p>
 
-                            <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors"
-                                   :class="onboardingPeerChoice === 'megalithic' ? 'border-neon-green/40 bg-neon-green/5' : 'border-navy-700 hover:border-navy-600'">
-                                <input type="radio" x-model="onboardingPeerChoice" value="megalithic" class="mt-1" style="accent-color: #06ffa5">
-                                <div class="flex-1">
-                                    <div class="flex items-center gap-2">
-                                        <span class="font-medium text-white">Megalithic</span>
-                                        <span class="text-[10px] uppercase tracking-wider text-neon-green/80 bg-neon-green/10 px-1.5 py-0.5 rounded">Recommended</span>
+                            <!-- Recommended default radio.
+                                 Hidden when the catalog isn't available
+                                 (operator opted out, non-mainnet, or
+                                 fetch failed). -->
+                            <template x-if="onboardingCatalogAvailable">
+                                <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors"
+                                       :class="onboardingPeerChoiceMode === 'recommended_default' ? 'border-neon-green/40 bg-neon-green/5' : 'border-navy-700 hover:border-navy-600'">
+                                    <input type="radio" x-model="onboardingPeerChoiceMode" value="recommended_default" class="mt-1" style="accent-color: #06ffa5">
+                                    <div class="flex-1">
+                                        <div class="flex items-center gap-2">
+                                            <span class="font-medium text-white">Recommended</span>
+                                            <span class="text-[10px] uppercase tracking-wider text-neon-green/80 bg-neon-green/10 px-1.5 py-0.5 rounded">⭐ vetted</span>
+                                        </div>
+                                        <p class="text-xs text-gray-400 mt-1">Empirically-verified peer that accepts your amount.</p>
+                                        <template x-if="onboardingPeerChoiceMode === 'recommended_default' && onboardingRecommendedPeer">
+                                            <p class="text-[11px] text-gray-500 mt-1.5">
+                                                → Will use: <span class="text-gray-300" x-text="onboardingRecommendedPeer.alias"></span>
+                                                <span class="text-gray-600" x-text="' · ' + onboardingRecommendedPeer.location"></span>
+                                            </p>
+                                        </template>
+                                        <template x-if="onboardingPeerChoiceMode === 'recommended_default' && onboardingAmountTooSmallReason">
+                                            <p class="text-[11px] text-neon-pink mt-1.5" x-text="onboardingAmountTooSmallReason"></p>
+                                        </template>
                                     </div>
-                                    <p class="text-xs text-gray-400 mt-1">Reliable, well-connected node operated by the Megalithic team.</p>
-                                    <template x-if="onboardingPeerChoice === 'megalithic' && onboardingMegalithicNode">
-                                        <p class="text-[11px] text-gray-500 mt-1.5">
-                                            → Will use: <span class="text-gray-300" x-text="onboardingMegalithicNode.label"></span>
-                                        </p>
-                                    </template>
-                                    <template x-if="onboardingPeerChoice === 'megalithic' && onboardingPeerError">
-                                        <p class="text-[11px] text-neon-pink mt-1.5" x-text="onboardingPeerError"></p>
-                                    </template>
-                                </div>
-                            </label>
+                                </label>
+                            </template>
 
+                            <!-- Pick-from-catalog radio. Disclosed table
+                                 expands when the radio is selected. -->
+                            <template x-if="onboardingCatalogAvailable">
+                                <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors mt-2"
+                                       :class="onboardingPeerChoiceMode === 'pick_from_list' ? 'border-neon-cyan/40 bg-neon-cyan/5' : 'border-navy-700 hover:border-navy-600'">
+                                    <input type="radio" x-model="onboardingPeerChoiceMode" value="pick_from_list" class="mt-1 accent-neon-cyan">
+                                    <div class="flex-1">
+                                        <div class="flex items-center gap-2">
+                                            <span class="font-medium text-white">Pick from catalog</span>
+                                            <span class="text-[10px] uppercase tracking-wider text-gray-500" x-text="onboardingPeerStats"></span>
+                                        </div>
+                                        <p class="text-xs text-gray-400 mt-1">Browse the verified peers and pick one yourself.</p>
+                                        <template x-if="onboardingPeerChoiceMode === 'pick_from_list'">
+                                            <div class="mt-3">
+                                                <div class="flex items-center gap-2 mb-1.5 text-[10px] uppercase tracking-wider text-gray-500">
+                                                    <span>Sort by:</span>
+                                                    <button type="button"
+                                                            class="hover:text-neon-cyan"
+                                                            :class="onboardingPickFromListSort === 'fee' ? 'text-neon-cyan' : ''"
+                                                            @click="onboardingPickFromListSort = 'fee'">fee</button>
+                                                    <button type="button"
+                                                            class="hover:text-neon-cyan"
+                                                            :class="onboardingPickFromListSort === 'channels' ? 'text-neon-cyan' : ''"
+                                                            @click="onboardingPickFromListSort = 'channels'">channels</button>
+                                                    <button type="button"
+                                                            class="hover:text-neon-cyan"
+                                                            :class="onboardingPickFromListSort === 'capacity' ? 'text-neon-cyan' : ''"
+                                                            @click="onboardingPickFromListSort = 'capacity'">capacity</button>
+                                                </div>
+                                                <div class="bg-navy-800 border border-navy-700 rounded max-h-64 overflow-y-auto">
+                                                    <template x-for="peer in onboardingFilteredPeers" :key="peer.node_id_hex">
+                                                        <button type="button"
+                                                                class="w-full text-left px-2 py-1.5 border-b border-navy-700 last:border-b-0 hover:bg-navy-700/50 transition-colors"
+                                                                :class="onboardingPickedPubkey === peer.node_id_hex ? 'bg-neon-cyan/10' : ''"
+                                                                @click="onboardingPickCatalogPeer(peer.node_id_hex)">
+                                                            <div class="flex items-center justify-between gap-2 text-xs">
+                                                                <span class="font-medium text-white truncate" x-text="peer.alias"></span>
+                                                                <span class="font-mono text-gray-500 shrink-0"
+                                                                      x-text="((peer.typical.fee_base_msat / 1000) | 0) + 'sat + ' + peer.typical.fee_rate_milli_msat + 'ppm'"></span>
+                                                            </div>
+                                                            <div class="flex items-center justify-between gap-2 text-[10px] text-gray-500 mt-0.5">
+                                                                <span x-text="peer.channels_count + ' chans · ' + peer.capacity_btc.toFixed(2) + ' BTC'"></span>
+                                                                <span x-text="'min ' + formatSats(peer.min_channel_size_sats) + ' sat'"></span>
+                                                            </div>
+                                                            <div class="text-[10px] text-gray-500 mt-0.5" x-text="peer.location || ''"></div>
+                                                            <!-- Selected-row details: full per-peer summary. -->
+                                                            <template x-if="onboardingPickedPubkey === peer.node_id_hex && peer.summary">
+                                                                <p class="text-[11px] text-gray-300 mt-1.5 leading-relaxed border-t border-navy-700 pt-1.5" x-text="peer.summary"></p>
+                                                            </template>
+                                                        </button>
+                                                    </template>
+                                                </div>
+                                                <template x-if="onboardingCatalogSnapshotDate">
+                                                    <p class="text-[10px] text-gray-600 mt-1.5">
+                                                        Verified <span x-text="onboardingCatalogSnapshotDate"></span> ·
+                                                        <a href="/static/docs/small-channel-peers.html" target="_blank" rel="noopener" class="text-neon-cyan hover:underline">how this list was built</a>
+                                                    </p>
+                                                </template>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </label>
+                            </template>
+
+                            <!-- A different node — always available. -->
                             <label class="flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors mt-2"
-                                   :class="onboardingPeerChoice === 'custom' ? 'border-neon-cyan/40 bg-neon-cyan/5' : 'border-navy-700 hover:border-navy-600'">
-                                <input type="radio" x-model="onboardingPeerChoice" value="custom" class="mt-1 accent-neon-cyan">
+                                   :class="onboardingPeerChoiceMode === 'custom' ? 'border-neon-cyan/40 bg-neon-cyan/5' : 'border-navy-700 hover:border-navy-600'">
+                                <input type="radio" x-model="onboardingPeerChoiceMode" value="custom" class="mt-1 accent-neon-cyan">
                                 <div class="flex-1">
                                     <span class="font-medium text-white">A different node</span>
                                     <p class="text-xs text-gray-400 mt-1">I have a pubkey or connection string from another operator.</p>
-                                    <template x-if="onboardingPeerChoice === 'custom'">
+                                    <template x-if="onboardingPeerChoiceMode === 'custom'">
                                         <textarea rows="2" x-model="onboardingCustomUri" placeholder="pubkey@host:port"
                                                   autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
                                                   class="w-full mt-2 bg-navy-800 border border-navy-700 rounded px-2 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-neon-cyan/40"></textarea>
                                     </template>
                                 </div>
                             </label>
+
+                            <!-- Catalog-fetch failed footer + retry. -->
+                            <template x-if="smallChannelPeerCatalogLoadState === 'failed'">
+                                <div class="mt-3 flex items-start gap-2 text-[11px] text-gray-500">
+                                    <i data-lucide="alert-triangle" class="w-3.5 h-3.5 shrink-0 mt-0.5"></i>
+                                    <p>
+                                        Couldn't load the peer catalog — please paste a pubkey above, or
+                                        <button type="button" @click="onboardingRetryCatalog()" class="text-neon-cyan hover:underline">retry</button>.
+                                    </p>
+                                </div>
+                            </template>
+                            <!-- Custom-only explanation for the non-failure cases
+                                 (operator kill-switch off, non-mainnet network). -->
+                            <template x-if="onboardingCustomOnlyExplanation">
+                                <p class="mt-3 text-[11px] text-gray-500" x-text="onboardingCustomOnlyExplanation"></p>
+                            </template>
                         </div>
 
                         <template x-if="onboardingError">
@@ -300,10 +394,311 @@
                         </button>
                     </div>
 
-                    <p class="text-xs text-gray-500 text-center mt-6">
+                    <template x-if="onboardingPlannerOffered">
+                        <p class="text-xs text-gray-500 text-center mt-4">
+                            Have enough to split across a few peers?
+                            <button @click="openChannelPlanner()" class="text-neon-cyan hover:underline">Plan multiple channels</button>
+                        </p>
+                    </template>
+
+                    <p class="text-xs text-gray-500 text-center mt-2">
                         Prefer the regular dashboard?
                         <button @click="onboardingSkip()" class="text-neon-cyan hover:underline">Skip to dashboard</button>
                     </p>
+                </div>
+
+                <!-- PLANNER: form ─────────────────────────────────── -->
+                <div x-show="channelPlanMode === 'plan_form'" class="onboarding-fade-up py-10">
+                    <h2 class="text-xl font-semibold text-white text-center mb-2">Plan a channel mix</h2>
+                    <p class="text-sm text-gray-400 text-center max-w-md mx-auto mb-6">
+                        We'll open a few small channels for you across the verified peer catalog. Tell us the rough budget;
+                        you'll see the exact funding number before anything happens on-chain.
+                    </p>
+
+                    <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
+                        <div>
+                            <label class="text-xs uppercase tracking-wider text-gray-500 mb-1.5 block">
+                                Roughly how much to commit?
+                            </label>
+                            <div class="relative">
+                                <input type="number" min="1" x-model.number="channelPlanForm.target_capacity_sats"
+                                       class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40 focus:ring-1 focus:ring-neon-green/20 transition-all">
+                                <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
+                            </div>
+                            <p class="text-[11px] text-gray-500 mt-1">
+                                Available: <span x-text="formatSats(onboardingOnchainSats)"></span> sats. The planner picks the channel count.
+                            </p>
+                        </div>
+
+                        <div>
+                            <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">Balance shape</p>
+                            <div class="grid grid-cols-3 gap-1.5">
+                                <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.outbound_option === 'send_heavy' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.outbound_option" value="send_heavy" class="sr-only">
+                                    Send-heavy
+                                </label>
+                                <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.outbound_option === 'balanced' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.outbound_option" value="balanced" class="sr-only">
+                                    Balanced
+                                </label>
+                                <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.outbound_option === 'receive_heavy' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.outbound_option" value="receive_heavy" class="sr-only">
+                                    Receive-heavy
+                                </label>
+                            </div>
+                        </div>
+
+                        <div>
+                            <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">Peer mix</p>
+                            <div class="space-y-1.5">
+                                <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.peer_mix_mode === 'recommended_diverse' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.peer_mix_mode" value="recommended_diverse" class="mt-0.5 accent-neon-cyan">
+                                    <span><span class="text-white">Recommended (diverse)</span> — mix of vetted peers; spread across regions.</span>
+                                </label>
+                                <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.peer_mix_mode === 'cheapest_only' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.peer_mix_mode" value="cheapest_only" class="mt-0.5 accent-neon-cyan">
+                                    <span><span class="text-white">Cheapest fees</span> — minimise routing cost; less diverse.</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                                <input type="checkbox" x-model="channelPlanForm.leave_room_for_one_more" class="accent-neon-cyan">
+                                Leave room for one more channel later
+                            </label>
+                        </div>
+
+                        <template x-if="channelPlanError">
+                            <div class="flex items-start gap-2 p-3 rounded-lg bg-neon-pink/10 border border-neon-pink/20">
+                                <i data-lucide="alert-circle" class="w-4 h-4 text-neon-pink shrink-0 mt-0.5"></i>
+                                <p class="text-xs text-neon-pink" x-text="channelPlanError"></p>
+                            </div>
+                        </template>
+
+                        <div class="flex items-center gap-2">
+                            <button @click="closeChannelPlanner()"
+                                    class="flex-1 px-4 py-2.5 rounded-lg border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 text-sm transition-colors">
+                                Back
+                            </button>
+                            <button @click="submitChannelPlan()" :disabled="!channelPlanCanSubmit"
+                                    class="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-neon-cyan/15 border border-neon-cyan/40 text-neon-cyan font-medium hover:bg-neon-cyan/25 hover:border-neon-cyan/60 transition-all disabled:opacity-40 disabled:cursor-not-allowed text-sm">
+                                <template x-if="channelPlanLoading">
+                                    <span class="flex items-center gap-2"><span class="w-3.5 h-3.5 border-2 border-neon-cyan border-t-transparent rounded-full animate-spin"></span> Planning…</span>
+                                </template>
+                                <template x-if="!channelPlanLoading">
+                                    <span>Show the plan</span>
+                                </template>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- PLANNER: preview ──────────────────────────────── -->
+                <div x-show="channelPlanMode === 'plan_preview'" class="onboarding-fade-up py-10">
+                    <template x-if="channelPlanHasResult">
+                        <div>
+                            <h2 class="text-xl font-semibold text-white text-center mb-1">Here's the plan</h2>
+                            <p class="text-sm text-gray-400 text-center max-w-md mx-auto mb-6">
+                                <span x-text="channelPlanPerChannel.length"></span> channels across
+                                <span x-text="channelPlanPerChannel.length"></span> peers.
+                            </p>
+
+                            <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
+                                <!-- Headline two-number display -->
+                                <div class="text-center">
+                                    <p class="text-xs uppercase tracking-wider text-gray-500 mb-1">
+                                        <template x-if="!channelPlanShowMinimum">
+                                            <span>Recommended funding</span>
+                                        </template>
+                                        <template x-if="channelPlanShowMinimum">
+                                            <span>Minimum funding</span>
+                                        </template>
+                                    </p>
+                                    <p class="text-3xl font-bold font-mono text-white">
+                                        <span x-text="formatSats(channelPlanHeadlineSats)"></span>
+                                        <span class="text-base text-gray-500 font-normal">sats</span>
+                                    </p>
+                                    <p class="text-[11px] text-gray-500 mt-2">
+                                        <template x-if="!channelPlanShowMinimum">
+                                            <span>
+                                                Send at least <span class="text-gray-300" x-text="formatSats(channelPlanMinimumSats)"></span> sats,
+                                                or this larger amount for a more comfortable buffer.
+                                            </span>
+                                        </template>
+                                        <template x-if="channelPlanShowMinimum">
+                                            <span>
+                                                Or send <span class="text-gray-300" x-text="formatSats(channelPlanRecommendedSats)"></span> sats for a more comfortable buffer.
+                                            </span>
+                                        </template>
+                                    </p>
+                                    <button type="button" @click="channelPlanShowMinimum = !channelPlanShowMinimum"
+                                            class="text-[11px] text-neon-cyan hover:underline mt-2">
+                                        <template x-if="!channelPlanShowMinimum">
+                                            <span>Send the minimum instead</span>
+                                        </template>
+                                        <template x-if="channelPlanShowMinimum">
+                                            <span>Show recommended</span>
+                                        </template>
+                                    </button>
+                                </div>
+
+                                <!-- Buffer disclosure -->
+                                <template x-if="channelPlanShowBuffer && !channelPlanShowMinimum">
+                                    <div class="border-t border-navy-700 pt-4">
+                                        <button type="button" @click="channelPlanWhyOpen = !channelPlanWhyOpen"
+                                                class="w-full flex items-center justify-between text-left text-xs text-gray-400 hover:text-white">
+                                            <span>Why the buffer?</span>
+                                            <i :data-lucide="channelPlanWhyOpen ? 'chevron-up' : 'chevron-down'" class="w-3.5 h-3.5"></i>
+                                        </button>
+                                        <template x-if="channelPlanWhyOpen">
+                                            <div class="mt-3 space-y-1.5 text-[11px] text-gray-400">
+                                                <div class="flex justify-between">
+                                                    <span>Close reserve</span>
+                                                    <span class="font-mono text-gray-300" x-text="formatSats(channelPlanBreakdown.close_reserve_sats || 0) + ' sat'"></span>
+                                                </div>
+                                                <div class="flex justify-between">
+                                                    <span>Fee-spike cushion</span>
+                                                    <span class="font-mono text-gray-300" x-text="formatSats(channelPlanBreakdown.fee_spike_cushion_sats || 0) + ' sat'"></span>
+                                                </div>
+                                                <template x-if="channelPlanFutureChannelSlotSats > 0">
+                                                    <div class="flex justify-between">
+                                                        <span>Room for one more</span>
+                                                        <span class="font-mono text-gray-300" x-text="formatSats(channelPlanFutureChannelSlotSats) + ' sat'"></span>
+                                                    </div>
+                                                </template>
+                                                <p class="pt-2 text-gray-500 leading-relaxed">
+                                                    The reserve and cushion stay on-chain so you can close cleanly even if mempool fees spike.
+                                                </p>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+
+                                <!-- Per-channel list -->
+                                <div class="border-t border-navy-700 pt-4">
+                                    <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">Channels</p>
+                                    <ul class="space-y-2">
+                                        <template x-for="(ch, idx) in channelPlanPerChannel" :key="idx">
+                                            <li class="bg-navy-800 border border-navy-700 rounded px-3 py-2 text-xs">
+                                                <div class="flex items-center justify-between">
+                                                    <span class="font-medium text-white" x-text="ch.peer.alias"></span>
+                                                    <span class="font-mono text-gray-300" x-text="formatSats(ch.capacity) + ' sat'"></span>
+                                                </div>
+                                                <div class="text-[10px] text-gray-500 mt-0.5" x-text="ch.peer.location || ''"></div>
+                                            </li>
+                                        </template>
+                                    </ul>
+                                </div>
+
+                                <template x-if="channelPlanWarnings.length">
+                                    <div class="border-t border-navy-700 pt-4">
+                                        <ul class="space-y-1">
+                                            <template x-for="w in channelPlanWarnings" :key="w">
+                                                <li class="text-[11px] text-neon-yellow flex items-start gap-1.5">
+                                                    <i data-lucide="alert-triangle" class="w-3 h-3 shrink-0 mt-0.5"></i>
+                                                    <span x-text="w"></span>
+                                                </li>
+                                            </template>
+                                        </ul>
+                                    </div>
+                                </template>
+
+                                <template x-if="channelPlanError">
+                                    <div class="flex items-start gap-2 p-3 rounded-lg bg-neon-pink/10 border border-neon-pink/20">
+                                        <i data-lucide="alert-circle" class="w-4 h-4 text-neon-pink shrink-0 mt-0.5"></i>
+                                        <p class="text-xs text-neon-pink" x-text="channelPlanError"></p>
+                                    </div>
+                                </template>
+
+                                <div class="flex items-center gap-2 pt-2">
+                                    <button @click="closeChannelPlanner()"
+                                            class="flex-1 px-4 py-2.5 rounded-lg border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 text-sm transition-colors">
+                                        Cancel
+                                    </button>
+                                    <button @click="executeChannelPlan()" :disabled="channelPlanLoading"
+                                            class="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green font-medium hover:bg-neon-green/25 hover:border-neon-green/60 transition-all disabled:opacity-40 disabled:cursor-not-allowed text-sm">
+                                        <template x-if="channelPlanLoading">
+                                            <span class="flex items-center gap-2"><span class="w-3.5 h-3.5 border-2 border-neon-green border-t-transparent rounded-full animate-spin"></span> Starting…</span>
+                                        </template>
+                                        <template x-if="!channelPlanLoading">
+                                            <span class="flex items-center gap-2"><i data-lucide="zap" class="w-4 h-4"></i> Open channels</span>
+                                        </template>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- PLANNER: executing / done ─────────────────────── -->
+                <div x-show="channelPlanMode === 'executing' || channelPlanMode === 'done'" class="onboarding-fade-up py-10">
+                    <div class="flex items-center justify-center mb-6">
+                        <template x-if="channelPlanMode === 'executing'">
+                            <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-neon-yellow/15 border-2 border-neon-yellow/40 animate-pulse-neon">
+                                <i data-lucide="zap" class="w-7 h-7 text-neon-yellow"></i>
+                            </div>
+                        </template>
+                        <template x-if="channelPlanMode === 'done'">
+                            <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-neon-green/15 border-2 border-neon-green/40">
+                                <i data-lucide="check" class="w-7 h-7 text-neon-green"></i>
+                            </div>
+                        </template>
+                    </div>
+
+                    <h2 class="text-xl font-semibold text-white text-center mb-2">
+                        <template x-if="channelPlanMode === 'executing'"><span>Opening your channels…</span></template>
+                        <template x-if="channelPlanMode === 'done'"><span>All done</span></template>
+                    </h2>
+
+                    <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto">
+                        <template x-if="channelMixRunChannels.length">
+                            <ul class="space-y-2">
+                                <template x-for="(ch, idx) in channelMixRunChannels" :key="idx">
+                                    <li class="bg-navy-800 border border-navy-700 rounded px-3 py-2 text-xs">
+                                        <div class="flex items-center justify-between">
+                                            <span class="font-medium text-white" x-text="ch.peer_alias"></span>
+                                            <span class="font-mono text-gray-300" x-text="formatSats(ch.capacity_sats) + ' sat'"></span>
+                                        </div>
+                                        <div class="flex items-center justify-between mt-1">
+                                            <span class="text-[10px] text-gray-500">
+                                                <span x-text="ch.open_state.replace(/_/g, ' ')"></span>
+                                                <template x-if="ch.seed_state !== 'skipped'">
+                                                    <span> · seed: <span x-text="ch.seed_state.replace(/_/g, ' ')"></span></span>
+                                                </template>
+                                            </span>
+                                            <template x-if="ch.open_state === 'open_active'">
+                                                <i data-lucide="check" class="w-3.5 h-3.5 text-neon-green"></i>
+                                            </template>
+                                            <template x-if="ch.open_state === 'open_failed' || ch.seed_state === 'seed_failed'">
+                                                <i data-lucide="x" class="w-3.5 h-3.5 text-neon-pink"></i>
+                                            </template>
+                                            <template x-if="ch.open_state === 'opening' || ch.open_state === 'open_pending' || ch.seed_state === 'swapping'">
+                                                <span class="w-3 h-3 border-2 border-neon-yellow border-t-transparent rounded-full animate-spin"></span>
+                                            </template>
+                                        </div>
+                                        <template x-if="ch.open_error">
+                                            <p class="text-[10px] text-neon-pink mt-1" x-text="ch.open_error"></p>
+                                        </template>
+                                        <template x-if="ch.seed_error">
+                                            <p class="text-[10px] text-neon-pink mt-1" x-text="ch.seed_error"></p>
+                                        </template>
+                                    </li>
+                                </template>
+                            </ul>
+                        </template>
+                    </div>
+
+                    <template x-if="channelPlanMode === 'done'">
+                        <p class="text-xs text-gray-500 text-center mt-6">
+                            <button @click="closeChannelPlanner()" class="text-neon-cyan hover:underline">Back to dashboard</button>
+                        </p>
+                    </template>
                 </div>
 
                 <!-- CONNECTING ───────────────────────────────────────── -->
@@ -408,7 +803,7 @@
             </div>
         </template>
 
-        <template x-if="summary && !onboardingStep && !onboardingCelebrating">
+        <template x-if="summary && !onboardingStep && !onboardingCelebrating && !channelPlannerActive">
             <div class="space-y-6">
 
                 <!-- ═══ BALANCE CARDS ═══ -->
@@ -645,11 +1040,31 @@
                                             title="Close one or more channels and free their funds on-chain">
                                         <i data-lucide="unplug" class="w-3.5 h-3.5"></i> Close Channels…
                                     </button>
+                                    <button @click="openChannelPlanner()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-neon-cyan/10 border border-neon-cyan/30 text-neon-cyan hover:bg-neon-cyan/20 hover:border-neon-cyan/50 transition-all"
+                                            title="Plan and open several small channels at once, drawn from the verified peer catalog">
+                                        <i data-lucide="layers" class="w-3.5 h-3.5"></i> Plan multiple channels…
+                                    </button>
                                     <button @click="showOpenChannel = true" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-500/15 border border-blue-500/30 text-blue-400 hover:bg-blue-500/25 hover:border-blue-500/50 transition-all">
                                         <i data-lucide="plus" class="w-3.5 h-3.5"></i> Open Channel
                                     </button>
                                 </div>
                             </div>
+                            <!-- Catalog-matched summary line.
+                                 Renders only when at least one of the
+                                 user's channels matches the catalog, so a
+                                 no-match wallet sees nothing here (we
+                                 don't draw attention to the gap). -->
+                            <template x-if="shouldShowCatalogMatchedSummary">
+                                <p class="text-[11px] text-gray-500 mb-3">
+                                    <span x-text="catalogMatchedChannelCount"></span> of your
+                                    <span x-text="totalChannelCount"></span>
+                                    channels are with peers in our vetted catalog
+                                    (<a href="/static/docs/small-channel-peers.html"
+                                        target="_blank"
+                                        rel="noopener"
+                                        class="text-neon-cyan hover:underline">learn more</a>).
+                                </p>
+                            </template>
                             <template x-if="channelsError">
                                 <div class="flex items-center justify-between gap-3 bg-neon-pink/5 border border-neon-pink/20 rounded-lg px-3 py-2 mb-3 text-sm">
                                     <span class="text-neon-pink/80" x-text="channelsError"></span>
@@ -672,6 +1087,89 @@
                                             <div class="flex items-center gap-2 min-w-0 flex-1">
                                                 <span class="w-2 h-2 rounded-full shrink-0" :class="channelStatusDotClass(ch)" :title="channelStatusTooltip(ch)"></span>
                                                 <span class="text-white text-sm font-mono truncate min-w-0" :title="channelAlias(ch)" x-text="channelAlias(ch)"></span>
+                                                <!-- Catalog badge. ⭐ when the peer is a
+                                                     recommended-default catalog entry;
+                                                     ⚠️ when the catalog flagged a routing
+                                                     caveat. Silent miss when the peer
+                                                     isn't in the catalog. -->
+                                                <template x-if="channelPeerBadge(ch) === 'star'">
+                                                    <span class="shrink-0 text-[10px] text-neon-green/90"
+                                                          :title="'Recommended catalog peer'">⭐</span>
+                                                </template>
+                                                <template x-if="channelPeerBadge(ch) === 'warning'">
+                                                    <span class="shrink-0 text-[10px] text-neon-yellow"
+                                                          :title="'Catalog flagged a routing concern — open the info panel for details'">⚠️</span>
+                                                </template>
+                                                <!-- Catalog info icon — opens a per-card
+                                                     popover with the peer's summary, fee
+                                                     tier, outbound ratio, and snapshot
+                                                     date. Shown only when the catalog has
+                                                     an entry for the channel's peer. -->
+                                                <template x-if="channelPeerCatalogInfo(ch)">
+                                                    <div class="relative shrink-0"
+                                                         @click.outside="if (openChannelInfoTooltip === (ch.chan_id || ch.channel_point || '')) closeChannelInfo()"
+                                                         @keydown.escape.window="closeChannelInfo()">
+                                                        <button type="button"
+                                                                class="inline-flex items-center justify-center w-4 h-4 rounded-full text-gray-500 hover:text-neon-cyan transition-colors"
+                                                                @click.stop="toggleChannelInfo(ch)"
+                                                                :title="'Catalog notes about this peer'"
+                                                                :aria-expanded="openChannelInfoTooltip === (ch.chan_id || ch.channel_point || '') ? 'true' : 'false'">
+                                                            <i data-lucide="info" class="w-3 h-3"></i>
+                                                        </button>
+                                                        <template x-if="openChannelInfoTooltip === (ch.chan_id || ch.channel_point || '')">
+                                                            <div class="absolute z-10 left-0 top-5 w-72 max-w-[calc(100vw-2rem)] p-3 rounded-md bg-navy-800 border border-navy-600 shadow-lg text-xs"
+                                                                 role="dialog">
+                                                                <div class="flex items-center justify-between gap-2 mb-1.5">
+                                                                    <span class="font-medium text-white truncate" x-text="channelPeerCatalogInfo(ch).alias"></span>
+                                                                    <button type="button"
+                                                                            class="text-gray-500 hover:text-gray-200 shrink-0"
+                                                                            @click.stop="closeChannelInfo()"
+                                                                            title="Close">
+                                                                        <i data-lucide="x" class="w-3 h-3"></i>
+                                                                    </button>
+                                                                </div>
+                                                                <p class="text-gray-300 leading-relaxed text-[11px]"
+                                                                   x-text="channelPeerCatalogInfo(ch).summary"></p>
+                                                                <div class="mt-2 pt-2 border-t border-navy-700 space-y-1 text-[10px] text-gray-500">
+                                                                    <div class="flex justify-between gap-2">
+                                                                        <span>Fee tier</span>
+                                                                        <span class="text-gray-300" x-text="channelPeerFeeTierLabel(channelPeerCatalogInfo(ch))"></span>
+                                                                    </div>
+                                                                    <div class="flex justify-between gap-2">
+                                                                        <span>Connectivity</span>
+                                                                        <span class="text-gray-300" x-text="channelPeerConnectivityLabel(channelPeerCatalogInfo(ch))"></span>
+                                                                    </div>
+                                                                    <template x-if="channelPeerOutboundPct(channelPeerCatalogInfo(ch))">
+                                                                        <div class="flex justify-between gap-2">
+                                                                            <span>Outbound enabled</span>
+                                                                            <span class="text-gray-300" x-text="channelPeerOutboundPct(channelPeerCatalogInfo(ch))"></span>
+                                                                        </div>
+                                                                    </template>
+                                                                    <template x-if="channelPeerCatalogInfo(ch).location">
+                                                                        <div class="flex justify-between gap-2">
+                                                                            <span>Location</span>
+                                                                            <span class="text-gray-300 truncate" x-text="channelPeerCatalogInfo(ch).location"></span>
+                                                                        </div>
+                                                                    </template>
+                                                                    <div class="flex justify-between gap-2">
+                                                                        <span>Verified</span>
+                                                                        <span class="text-gray-300"
+                                                                              x-text="(channelPeerVerifiedDaysAgo(ch) != null)
+                                                                                       ? (channelPeerVerifiedDaysAgo(ch) === 0 ? 'today' : channelPeerVerifiedDaysAgo(ch) + ' days ago')
+                                                                                       : channelPeerCatalogInfo(ch).verified_at"></span>
+                                                                    </div>
+                                                                </div>
+                                                                <a href="/static/docs/small-channel-peers.html"
+                                                                   target="_blank"
+                                                                   rel="noopener"
+                                                                   class="mt-2 inline-flex items-center gap-1 text-[10px] text-neon-cyan hover:underline">
+                                                                    <span>Read more about this peer</span>
+                                                                    <i data-lucide="external-link" class="w-2.5 h-2.5"></i>
+                                                                </a>
+                                                            </div>
+                                                        </template>
+                                                    </div>
+                                                </template>
                                             </div>
                                             <span class="text-xs text-gray-500 shrink-0"
                                                   x-text="formatSats(ch.capacity || 0) + ' sats capacity'
@@ -770,6 +1268,70 @@
                                                     <span class="w-2 h-2 rounded-full shrink-0" :class="pendingDotClass(pc)"></span>
                                                     <span class="text-gray-300 shrink-0" x-text="pendingStatusLabel(pc)"></span>
                                                     <span class="text-gray-500 font-mono text-xs truncate" x-text="pendingPubkey(pc)"></span>
+                                                    <!-- Catalog badge + info icon for the
+                                                         pending channel's peer. Same UX as
+                                                         active channels (silent miss when
+                                                         the peer isn't in the catalog). -->
+                                                    <template x-if="channelPeerBadge(pc) === 'star'">
+                                                        <span class="shrink-0 text-[10px] text-neon-green/90" :title="'Recommended catalog peer'">⭐</span>
+                                                    </template>
+                                                    <template x-if="channelPeerBadge(pc) === 'warning'">
+                                                        <span class="shrink-0 text-[10px] text-neon-yellow" :title="'Catalog flagged a routing concern'">⚠️</span>
+                                                    </template>
+                                                    <template x-if="channelPeerCatalogInfo(pc)">
+                                                        <div class="relative shrink-0"
+                                                             @click.outside="if (openChannelInfoTooltip === (pc.channel_point || '')) closeChannelInfo()"
+                                                             @keydown.escape.window="closeChannelInfo()">
+                                                            <button type="button"
+                                                                    class="inline-flex items-center justify-center w-4 h-4 rounded-full text-gray-500 hover:text-neon-cyan transition-colors"
+                                                                    @click.stop="toggleChannelInfo(pc)"
+                                                                    :title="'Catalog notes about this peer'"
+                                                                    :aria-expanded="openChannelInfoTooltip === (pc.channel_point || '') ? 'true' : 'false'">
+                                                                <i data-lucide="info" class="w-3 h-3"></i>
+                                                            </button>
+                                                            <template x-if="openChannelInfoTooltip === (pc.channel_point || '')">
+                                                                <div class="absolute z-10 left-0 top-5 w-72 max-w-[calc(100vw-2rem)] p-3 rounded-md bg-navy-800 border border-navy-600 shadow-lg text-xs"
+                                                                     role="dialog">
+                                                                    <div class="flex items-center justify-between gap-2 mb-1.5">
+                                                                        <span class="font-medium text-white truncate" x-text="channelPeerCatalogInfo(pc).alias"></span>
+                                                                        <button type="button"
+                                                                                class="text-gray-500 hover:text-gray-200 shrink-0"
+                                                                                @click.stop="closeChannelInfo()"
+                                                                                title="Close">
+                                                                            <i data-lucide="x" class="w-3 h-3"></i>
+                                                                        </button>
+                                                                    </div>
+                                                                    <p class="text-gray-300 leading-relaxed text-[11px]" x-text="channelPeerCatalogInfo(pc).summary"></p>
+                                                                    <div class="mt-2 pt-2 border-t border-navy-700 space-y-1 text-[10px] text-gray-500">
+                                                                        <div class="flex justify-between gap-2">
+                                                                            <span>Fee tier</span>
+                                                                            <span class="text-gray-300" x-text="channelPeerFeeTierLabel(channelPeerCatalogInfo(pc))"></span>
+                                                                        </div>
+                                                                        <template x-if="channelPeerOutboundPct(channelPeerCatalogInfo(pc))">
+                                                                            <div class="flex justify-between gap-2">
+                                                                                <span>Outbound enabled</span>
+                                                                                <span class="text-gray-300" x-text="channelPeerOutboundPct(channelPeerCatalogInfo(pc))"></span>
+                                                                            </div>
+                                                                        </template>
+                                                                        <div class="flex justify-between gap-2">
+                                                                            <span>Verified</span>
+                                                                            <span class="text-gray-300"
+                                                                                  x-text="(channelPeerVerifiedDaysAgo(pc) != null)
+                                                                                           ? (channelPeerVerifiedDaysAgo(pc) === 0 ? 'today' : channelPeerVerifiedDaysAgo(pc) + ' days ago')
+                                                                                           : channelPeerCatalogInfo(pc).verified_at"></span>
+                                                                        </div>
+                                                                    </div>
+                                                                    <a href="/static/docs/small-channel-peers.html"
+                                                                       target="_blank"
+                                                                       rel="noopener"
+                                                                       class="mt-2 inline-flex items-center gap-1 text-[10px] text-neon-cyan hover:underline">
+                                                                        <span>Read more about this peer</span>
+                                                                        <i data-lucide="external-link" class="w-2.5 h-2.5"></i>
+                                                                    </a>
+                                                                </div>
+                                                            </template>
+                                                        </div>
+                                                    </template>
                                                 </div>
                                                 <span class="text-[11px] text-gray-500 shrink-0 font-mono"
                                                       x-show="(pc.local_balance || 0) > 0"
@@ -7888,7 +8450,7 @@
                             <summary class="cursor-pointer hover:text-gray-200">Advanced / having trouble?</summary>
                             <div class="mt-2 p-2.5 rounded-md bg-navy-900 border border-navy-700 space-y-2">
                                 <p class="leading-relaxed">
-                                    If a swap can't be routed to your node, you can fund this deposit by <span class="font-semibold">opening a Lightning channel</span> to Megalithic instead. Slower (~30-60 min to confirm) and ~1% stays in the new channel as receive capacity you keep, but it doesn't depend on inbound routing.
+                                    If a swap can't be routed to your node, you can fund this deposit by <span class="font-semibold">opening a Lightning channel</span> to a recommended routing peer instead. Slower (~30-60 min to confirm) and ~1% stays in the new channel as receive capacity you keep, but it doesn't depend on inbound routing.
                                     <button type="button"
                                             class="ml-1 text-gray-500 hover:text-emerald-400 focus:text-emerald-400 focus:outline-none align-middle"
                                             x-on:click.stop="braiinsDepositToggleInfoTip('open-a-channel')"

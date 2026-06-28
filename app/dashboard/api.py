@@ -63,6 +63,7 @@ from app.services.alert_service import send_alert
 from app.services.api_key_service import DashboardActor
 from app.services.audit_service import log_dashboard_action, reanchor_chain, verify_chain
 from app.services.boltz_service import boltz_service
+from app.services.channel_mix_planner import OutboundOption, PeerMixMode
 from app.services.lnd_service import lnd_service
 from app.services.lnd_types import Outpoint
 from app.services.lnurl_service import get_lnurl_service
@@ -2066,6 +2067,284 @@ async def cold_storage_fees() -> Any:
     if error:
         return JSONResponse(status_code=502, content={"detail": sanitize_upstream_error(error, "Boltz")})
     return data
+
+
+@router.get("/peer-catalog/small-channel", dependencies=[Depends(_require_auth)])
+async def peer_catalog_small_channel() -> Any:
+    """Dashboard-side wrapper for the small-channel peer catalog.
+
+    Mirrors the API-key-authed ``GET /v1/peer-catalog/small-channel``
+    endpoint but reads the session cookie instead, so the dashboard SPA
+    can fetch the catalog without holding (or being trusted with) a
+    long-lived API key. Body shape is identical to the underlying
+    endpoint: ``{enabled, snapshot_date, network, peers}``.
+    """
+    from dataclasses import asdict
+
+    from app.services.small_channel_peers import (
+        SNAPSHOT_DATE,
+        all_peers,
+    )
+
+    network = settings.bitcoin_network
+    peers = all_peers(network=network) if settings.small_channel_peer_catalog_enabled else ()
+    return {
+        "enabled": bool(settings.small_channel_peer_catalog_enabled),
+        "snapshot_date": SNAPSHOT_DATE,
+        "network": network,
+        "peers": [asdict(p) for p in peers],
+    }
+
+
+# ── Channel-mix planner (dashboard wrappers) ─────────────────────────
+
+
+class _DashChannelMixPlanRequest(BaseModel):
+    """Dashboard wrapper for the channel-mix planner inputs.
+
+    Mirrors the v1 ``ChannelMixPlanRequest`` shape and pins
+    ``outbound_option`` / ``peer_mix_mode`` to the planner's accepted
+    values so a garbage string reaches the user as a 422 validation
+    error rather than silently collapsing to the planner's default
+    branch.
+    """
+
+    target_capacity_sats: int = Field(gt=0, le=1_000_000_000)
+    outbound_option: OutboundOption = Field(default="balanced")
+    custom_inbound_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    peer_mix_mode: PeerMixMode = Field(default="recommended_diverse")
+    manual_picks: list[str] = Field(default_factory=list)
+    leave_room_for_one_more: bool = False
+    include_marginal_routing: bool = False
+
+
+class _DashChannelMixExecuteRequest(_DashChannelMixPlanRequest):
+    plan_token: str = Field(min_length=10, max_length=200)
+
+
+async def _dash_build_plan(request: _DashChannelMixPlanRequest):
+    """Run the planner on behalf of the dashboard SPA.
+
+    The dashboard's session implies wallet ownership; the v1 admin-key
+    surface does the same work behind an API key. Both paths share the
+    planner module.
+    """
+    from app.services.channel_mix_planner import plan_channel_mix
+    from app.services.mempool_fee_service import mempool_fee_service
+    from app.services.small_channel_peers import SNAPSHOT_DATE
+
+    async def _oracle():
+        return await mempool_fee_service.get_recommended_fees()
+
+    boltz_available = bool(settings.boltz_api_url)
+    return await plan_channel_mix(
+        target_capacity_sats=int(request.target_capacity_sats),
+        outbound_option=request.outbound_option,
+        peer_mix_mode=request.peer_mix_mode,
+        network=settings.bitcoin_network,
+        catalog_snapshot_date=SNAPSHOT_DATE,
+        fee_oracle=_oracle,
+        boltz_available=boltz_available,
+        leave_room_for_one_more=request.leave_room_for_one_more,
+        custom_inbound_pct=request.custom_inbound_pct,
+        manual_picks=tuple(request.manual_picks),
+        include_marginal_routing=request.include_marginal_routing,
+    )
+
+
+@router.post("/channel-mix/plan", dependencies=[Depends(_require_auth_csrf)])
+@limiter.limit("60/minute")
+async def channel_mix_plan(request: Request, body: _DashChannelMixPlanRequest) -> Any:
+    """Run the channel-mix planner and return ``{plan, plan_token}``.
+
+    Per-IP rate cap of 60/minute leaves ~1 plan/second of headroom, more
+    than enough for an interactive operator tweaking inputs in the
+    wizard while bounding a runaway loop.
+    """
+    from dataclasses import asdict as _asdict
+
+    from app.services.channel_mix_plan_token import sign_plan
+
+    plan = await _dash_build_plan(body)
+    return {
+        "plan": _asdict(plan),
+        "plan_token": sign_plan(plan),
+    }
+
+
+@router.post(
+    "/channel-mix/execute",
+    dependencies=[Depends(_require_auth_csrf)],
+)
+@limiter.limit("20/minute")
+async def channel_mix_execute(
+    request: Request,
+    response: Response,
+    body: _DashChannelMixExecuteRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Persist the planned run and enqueue the executor task.
+
+    Re-runs the planner with the same inputs and verifies the token; a
+    ``409 plan_stale`` ships a fresh plan back when the catalog or fees
+    have moved.
+
+    Per-IP rate cap of 20/minute is well above realistic interactive
+    use — the idempotency check folds duplicate submissions of the same
+    plan_token into a single run, so the limit only counts genuinely
+    distinct plans. Tripping it implies a runaway loop the limit is
+    there to stop.
+    """
+    from dataclasses import asdict as _asdict
+
+    from app.models.channel_mix_run import (
+        ChannelMixRun,
+        ChannelMixRunState,
+        make_channel_entry,
+    )
+    from app.services.channel_mix_plan_token import sign_plan, verify_plan_token
+
+    plan_inputs = _DashChannelMixPlanRequest(
+        **body.model_dump(exclude={"plan_token"})
+    )
+    plan = await _dash_build_plan(plan_inputs)
+    if not verify_plan_token(plan, body.plan_token):
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": "plan_stale",
+                    "message": "The plan has changed — review and re-confirm.",
+                    "plan": _asdict(plan),
+                    "plan_token": sign_plan(plan),
+                },
+            },
+        )
+    if not plan.per_channel:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": {
+                    "code": "empty_plan",
+                    "message": "The planner produced no channels for these inputs.",
+                    "plan": _asdict(plan),
+                },
+            },
+        )
+
+    # Idempotency: a re-submitted execute call carries the same
+    # ``plan_token``. Map duplicates back to the original run so a
+    # browser retry / network hiccup doesn't open every channel twice;
+    # the DB-level ``UNIQUE`` constraint on ``plan_token_digest`` is the
+    # backstop if two requests race past this lookup.
+    from app.services.channel_mix_plan_token import plan_token_digest
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+    token_digest = plan_token_digest(body.plan_token)
+    existing = (
+        await db.execute(
+            select(ChannelMixRun).where(ChannelMixRun.plan_token_digest == token_digest)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        # Idempotent replay: return 200 OK (the default for this route),
+        # not 201 Created, since no new row was created.
+        return {"mix_run_id": str(existing.id), "state": existing.state.value}
+
+    channels = [
+        make_channel_entry(
+            peer_alias=ch.peer.alias,
+            peer_pubkey=ch.peer.node_id_hex,
+            peer_host=ch.peer.address,
+            capacity_sats=ch.capacity,
+            push_sat=ch.push_sat,
+            expected_inbound_seed_sats=ch.expected_inbound_seed_sats,
+            inbound_seed_strategy=ch.inbound_seed_strategy,
+        )
+        for ch in plan.per_channel
+    ]
+    run = ChannelMixRun(
+        api_key_id=DASHBOARD_KEY_ID,
+        plan_token_digest=token_digest,
+        state=ChannelMixRunState.QUEUED,
+        minimum_sats=plan.minimum_sats,
+        recommended_sats=plan.recommended_sats,
+        channels=channels,
+        warnings=list(plan.diagnostics.warnings),
+    )
+    db.add(run)
+    try:
+        await db.commit()
+    except _IntegrityError:
+        await db.rollback()
+        existing = (
+            await db.execute(
+                select(ChannelMixRun).where(ChannelMixRun.plan_token_digest == token_digest)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return {"mix_run_id": str(existing.id), "state": existing.state.value}
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": {
+                    "code": "conflict",
+                    "message": "Couldn't persist the run; please retry.",
+                },
+            },
+        )
+    await db.refresh(run)
+
+    from app.tasks.channel_mix_tasks import process_channel_mix_run
+
+    process_channel_mix_run.delay(str(run.id))
+    # Fresh run actually created on this call — signal "201 Created".
+    response.status_code = 201
+    return {"mix_run_id": str(run.id), "state": run.state.value}
+
+
+@router.get(
+    "/channel-mix/runs/{mix_run_id}",
+    dependencies=[Depends(_require_auth)],
+)
+async def channel_mix_run_status(
+    mix_run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Return the current per-channel state of one mix run."""
+    from app.models.channel_mix_run import ChannelMixRun
+
+    result = await db.execute(
+        select(ChannelMixRun).where(ChannelMixRun.id == mix_run_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        return JSONResponse(status_code=404, content={"detail": "Channel-mix run not found"})
+    channels = list(run.channels or [])
+    total = len(channels)
+    active = sum(1 for c in channels if c.get("open_state") == "open_active")
+    failed = sum(
+        1 for c in channels
+        if c.get("open_state") == "open_failed" or c.get("seed_state") == "seed_failed"
+    )
+    return {
+        "mix_run_id": str(run.id),
+        "state": run.state.value,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "minimum_sats": run.minimum_sats,
+        "recommended_sats": run.recommended_sats,
+        "channels": channels,
+        "warnings": list(run.warnings),
+        "error_message": run.error_message,
+        "summary": {
+            "channels_total": total,
+            "channels_active": active,
+            "channels_failed": failed,
+            "overall_state": run.state.value,
+        },
+    }
 
 
 @router.post("/cold-storage/initiate", dependencies=[Depends(_require_auth_csrf)])

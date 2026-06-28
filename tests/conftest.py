@@ -193,6 +193,7 @@ from app.models.braiins_deposit_session import (  # noqa: F401
     BraiinsDepositSourceKind,
     BraiinsDepositStatus,
 )
+from app.models.channel_mix_run import ChannelMixRun  # noqa: F401
 from app.models.utxo_label import AddressPurpose, UtxoLabel  # noqa: F401
 
 

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Channel-open peer presets, selection, and capacity sizing.
 
-Canonical **server-side** source of truth for the Megalithic channel-open
-peers used by the Braiins on-chain deposit "channel" funding strategy.
-Mirrors the frontend's ``MEGALITHIC_NODES`` / ``_megalithicNodeFor``
-(``dashboard.js``); a test asserts the two copies agree so they can't
-drift.
+Canonical source of truth for the channel-open peers used by the Braiins
+on-chain deposit "channel" funding strategy. The two peers are
+operator-configured via the ``braiins_deposit_channel_peer_*`` settings;
+deployments that need a different routing partner can pin their own
+pubkeys without code changes.
 
 Selection is purely amount-driven (on the channel *capacity*, not the
 bin): prefer the proper node when ``capacity >= proper_min``, else the
@@ -86,9 +86,9 @@ def select_peer_for_capacity(capacity_sats: int) -> Optional[ChannelPeer]:
     preferring the proper (larger-min) node. ``None`` if no peer accepts
     a channel of this size (ineligible).
 
-    Mirrors ``_megalithicNodeFor`` (``capacity >= main.min`` → main;
-    ``capacity >= small.min`` → small; else null), but also honours an
-    optional per-peer ``max`` cap.
+    Order of preference: ``capacity >= main.min`` → main; else
+    ``capacity >= small.min`` → small; else ineligible. The optional
+    per-peer ``max`` cap can shrink either band.
     """
     cap = int(capacity_sats)
     # Sort by descending min so the proper (higher-min) node is preferred.

@@ -37,7 +37,7 @@ celery_app = Celery(
     # decorator in :mod:`app.tasks.braiins_deposit_tasks` never
     # ran. Caught 2026-06-05 alongside the bolt12-telemetry
     # rollout. Add future task modules here.
-    include=["app.tasks.braiins_deposit_tasks"],
+    include=["app.tasks.braiins_deposit_tasks", "app.tasks.channel_mix_tasks"],
 )
 
 celery_app.conf.update(
@@ -90,6 +90,13 @@ celery_app.conf.update(
         # plus any swaps abandoned by Celery worker crashes.
         "recover-boltz-swaps": {
             "task": "recover_boltz_swaps",
+            "schedule": 300.0,  # Every 5 minutes
+        },
+        # Same recovery role for channel-mix runs: a worker crash
+        # mid-run would otherwise leave the per-channel state machine
+        # idle until the next dashboard poll re-triggered the task.
+        "recover-channel-mix-runs": {
+            "task": "recover_channel_mix_runs",
             "schedule": 300.0,  # Every 5 minutes
         },
         # Sweep the UTXO label store: stamp spent_at on outpoints

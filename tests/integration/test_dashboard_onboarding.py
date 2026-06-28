@@ -286,3 +286,350 @@ class TestTransactionsShape:
             resp = await dashboard_client.get("/dashboard/api/transactions")
         order = [t["tx_hash"] for t in resp.json()]
         assert order == ["new", "mid", "old"]
+
+
+# ─── Picker surface ──────────────────────────────────────────────────
+#
+# The wizard's peer picker reads from the small-channel peer catalog
+# served at ``/dashboard/api/peer-catalog/small-channel``. There's no
+# JS test harness in this codebase, so the verification is split into
+# two layers:
+#
+# * **Static checks** against the JS / template / model sources confirm
+#   the hardcoded peer constants are gone and the catalog-driven
+#   bindings are present.
+# * **Catalog-shape contract** confirms the bundled JSON populates every
+#   field the dashboard JS reads off each peer.
+
+
+import re as _re  # noqa: E402 — module-level imports stay above the class
+from pathlib import Path as _Path  # noqa: E402
+
+_REPO_ROOT = _Path(__file__).resolve().parents[2]
+_DASHBOARD_JS_PATH = _REPO_ROOT / "app" / "dashboard" / "static" / "dashboard.js"
+_DASHBOARD_HTML_PATH = _REPO_ROOT / "app" / "dashboard" / "templates" / "dashboard.html"
+_BRAIINS_MODEL_PATH = _REPO_ROOT / "app" / "models" / "braiins_deposit_session.py"
+
+
+@pytest.fixture(scope="module")
+def dashboard_js_text() -> str:
+    return _DASHBOARD_JS_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def dashboard_html_text() -> str:
+    return _DASHBOARD_HTML_PATH.read_text(encoding="utf-8")
+
+
+@pytest.fixture(scope="module")
+def braiins_model_text() -> str:
+    return _BRAIINS_MODEL_PATH.read_text(encoding="utf-8")
+
+
+class TestPickerJSSurface:
+    """The wizard's picker reads from a fetched catalog rather than a
+    hardcoded peer constant."""
+
+    def test_hardcoded_peer_constant_is_absent(self, dashboard_js_text: str) -> None:
+        assert "MEGALITHIC_NODES" not in dashboard_js_text
+
+    def test_picker_state_fields_present(self, dashboard_js_text: str) -> None:
+        for field in (
+            "onboardingPeerChoiceMode",
+            "onboardingPickedPubkey",
+            "onboardingPickFromListSort",
+            "smallChannelPeerCatalog",
+            "smallChannelPeerCatalogLoadState",
+        ):
+            assert field in dashboard_js_text, f"missing field: {field}"
+
+    def test_picker_helper_methods_present(self, dashboard_js_text: str) -> None:
+        for fn in (
+            "_peersAcceptingAmount",
+            "_lookupCatalogPeer",
+            "_recommendedPeerForAmount",
+            "_ensureSmallChannelPeerCatalog",
+            "onboardingRetryCatalog",
+            "onboardingPickCatalogPeer",
+        ):
+            assert fn in dashboard_js_text, f"missing helper: {fn}"
+
+    def test_picker_getters_present(self, dashboard_js_text: str) -> None:
+        for getter in (
+            "onboardingRecommendedPeer",
+            "onboardingFilteredPeers",
+            "onboardingPeerStats",
+            "onboardingCatalogAvailable",
+            "onboardingCustomModeOnly",
+            "onboardingCatalogSnapshotDate",
+            "onboardingAmountTooSmallReason",
+        ):
+            assert getter in dashboard_js_text, f"missing getter: {getter}"
+
+    def test_catalog_fetch_uses_dashboard_endpoint(self, dashboard_js_text: str) -> None:
+        # The catalog comes through the session-authed wrapper so the
+        # dashboard SPA doesn't need an API key. The ``this.api(...)``
+        # helper auto-prepends ``/dashboard/api`` to every path it sends,
+        # so the catalog fetch must pass the BARE endpoint path —
+        # passing the full ``/dashboard/api/...`` string would
+        # double-prefix to ``/dashboard/api/dashboard/api/...`` and
+        # produce a 404.
+        assert "this.api('GET', '/peer-catalog/small-channel')" in dashboard_js_text
+        # Guard the same shape across every ``this.api(...)`` call so a
+        # different consumer can't introduce the double-prefix bug
+        # under cover of the api-helper's already-prepended root.
+        import re
+
+        for match in re.finditer(
+            r"this\.api\(\s*['\"](?:GET|POST|PUT|PATCH|DELETE)['\"]\s*,\s*['\"]([^'\"]+)['\"]",
+            dashboard_js_text,
+        ):
+            path = match.group(1)
+            assert not path.startswith("/dashboard/api"), (
+                f"double-prefixed api() path detected: {path!r} — the "
+                "api() helper auto-prepends /dashboard/api, so callers "
+                "must pass the bare endpoint path (e.g. '/foo' not "
+                "'/dashboard/api/foo')."
+            )
+
+    def test_catalog_retry_backoffs_defined(self, dashboard_js_text: str) -> None:
+        # The "couldn't load catalog" UX needs a retry budget. The
+        # constant naming is a contract the JS helpers reference.
+        assert "CATALOG_FETCH_RETRY_BACKOFFS_MS" in dashboard_js_text
+
+
+class TestPickerHTMLTemplate:
+    """Template binds the picker state fields and exposes all three
+    modes (recommended / pick-from-list / custom)."""
+
+    def test_three_picker_modes_rendered(self, dashboard_html_text: str) -> None:
+        # Each mode binds the ``onboardingPeerChoiceMode`` field to one
+        # of the three values.
+        for value in ("recommended_default", "pick_from_list", "custom"):
+            assert f'value="{value}"' in dashboard_html_text, f"missing radio for: {value}"
+
+    def test_pick_from_list_table_uses_catalog_data(self, dashboard_html_text: str) -> None:
+        # Catalog table iterates onboardingFilteredPeers and pulls each
+        # peer's identifying fields out.
+        assert "onboardingFilteredPeers" in dashboard_html_text
+        assert "onboardingPickCatalogPeer" in dashboard_html_text
+
+    def test_catalog_fetch_failed_footer_present(self, dashboard_html_text: str) -> None:
+        # The "couldn't load peer catalog" footer + retry affordance.
+        assert "smallChannelPeerCatalogLoadState === 'failed'" in dashboard_html_text
+        assert "onboardingRetryCatalog" in dashboard_html_text
+
+    def test_amount_too_small_reason_rendered(self, dashboard_html_text: str) -> None:
+        assert "onboardingAmountTooSmallReason" in dashboard_html_text
+
+
+class TestUserFacingCopyUsesCatalogNeutralLanguage:
+    """Every user-facing surface — the glossary, the Braiins channel-open
+    advisory, the wizard copy — describes the chosen peer in
+    catalog-neutral language. Code-comments and other non-user-facing
+    surfaces are out of scope here."""
+
+    def test_glossary_open_a_channel_uses_neutral_copy(self, dashboard_js_text: str) -> None:
+        # Find the glossary entry and verify the body doesn't surface
+        # "Megalithic" by name.
+        m = _re.search(r"'open-a-channel':\s*{[^}]*?body:\s*'([^']*?)'", dashboard_js_text, _re.DOTALL)
+        assert m, "glossary 'open-a-channel' entry not found"
+        body = m.group(1)
+        assert "Megalithic" not in body, body
+
+    def test_braiins_channel_open_advisory_uses_neutral_copy(self, dashboard_html_text: str) -> None:
+        # The "If a swap can't be routed to your node..." paragraph in
+        # the Braiins deposit wizard.
+        assert "to Megalithic" not in dashboard_html_text
+        # Sanity: the replacement copy is present.
+        assert "recommended routing peer" in dashboard_html_text
+
+    def test_braiins_deposit_session_docstrings_use_neutral_copy(self, braiins_model_text: str) -> None:
+        # Docstrings + column comments referenced "Megalithic" by name —
+        # generalised to "the recommended routing peer."
+        assert "Megalithic" not in braiins_model_text
+
+
+class TestCatalogShapeMatchesJSPickerExpectations:
+    """The JS picker reads specific fields off each peer. Pin that the
+    bundled catalog populates every one of those fields for every peer
+    so a future catalog refresh can't quietly break the picker."""
+
+    def test_every_field_the_js_picker_reads_is_populated(self) -> None:
+        from app.services.small_channel_peers import all_peers
+
+        peers = all_peers(network="bitcoin")
+        assert peers, "bundled catalog should ship with peers for mainnet"
+        for peer in peers:
+            assert peer.alias
+            assert peer.node_id_hex
+            assert peer.address
+            assert peer.min_channel_size_sats > 0
+            assert peer.typical.fee_base_msat >= 0
+            assert peer.typical.fee_rate_milli_msat >= 0
+            assert peer.channels_count > 0
+            assert peer.capacity_btc > 0
+            # ``location`` may be empty for one bundled entry; JS
+            # handles "" fine via ``peer.location || ''``.
+            assert isinstance(peer.location, str)
+            # ``tags`` is a tuple of strings; the picker checks
+            # ``(peer.tags || []).indexOf('recommended_default') !== -1``.
+            assert isinstance(peer.tags, tuple)
+
+
+class TestPeersAcceptingAmountContract:
+    """Server-side equivalents of the JS picker's
+    ``_peersAcceptingAmount(sats)``. Pin the behavior at the contract
+    boundary the JS reads from so a catalog refresh that bumps a peer's
+    ``min_channel_size_sats`` can't silently break the wizard's filter."""
+
+    def test_150k_sat_amount_returns_full_catalog(self) -> None:
+        # Every bundled peer's floor is 150k sats — at exactly that
+        # amount, all 15 peers must be eligible. The JS picker pivots
+        # on this: the "Pick from list" mode renders one row per
+        # eligible peer.
+        from app.services.small_channel_peers import for_amount
+
+        peers = for_amount(150_000, network="bitcoin")
+        assert len(peers) == 15
+
+    def test_below_smallest_floor_returns_empty(self) -> None:
+        # 100k sats is below every bundled peer's floor — the picker
+        # must surface the "amount too small" reason rather than an
+        # empty default.
+        from app.services.small_channel_peers import for_amount
+
+        peers = for_amount(100_000, network="bitcoin")
+        assert peers == ()
+
+    def test_non_mainnet_returns_empty_regardless_of_amount(self) -> None:
+        # ``_peersAcceptingAmount`` short-circuits to ``[]`` when the
+        # catalog is empty for the current network. The JS picker
+        # branches on this to render the custom-only mode.
+        from app.services.small_channel_peers import for_amount
+
+        for network in ("regtest", "testnet", "signet"):
+            assert for_amount(150_000, network=network) == ()
+
+
+class TestRecommendedSelectionExcludesMarginalRouting:
+    """Marginal-routing peers (``caveats: [{kind: 'marginal_routing'}]``)
+    must NOT be auto-picked by the Recommended mode. They stay visible
+    in Pick-from-list (rendered with a ⚠️ badge), but a fresh wallet
+    shouldn't auto-route into a peer whose own gossip says they refuse
+    to forward."""
+
+    def test_coingate_is_in_the_catalog(self) -> None:
+        from app.services.small_channel_peers import lookup
+
+        coingate = lookup(
+            "0242a4ae0c5bef18048fbecf995094b74bfb0f7391418d71ed394784373f41e4f3",
+            network="bitcoin",
+        )
+        assert coingate is not None
+        # Sanity: the marginal-routing caveat is present.
+        kinds = {c.kind for c in coingate.caveats}
+        assert "marginal_routing" in kinds
+
+    def test_recommended_picker_logic_skips_marginal_routing(self) -> None:
+        # Mirrors the JS ``_recommendedPeerForAmount`` filter chain:
+        # filter accepting peers by NOT marginal_routing, then rank by
+        # ⭐ tag, then by ppm + base. The ⭐ peers (Babylon, krut42,
+        # New Horizons) are all non-marginal, so the recommended at
+        # 150k sats is krut42 (cheapest ppm = 0).
+        from app.services.small_channel_peers import for_amount
+
+        accepting = for_amount(150_000, network="bitcoin")
+        # Apply the marginal-routing filter.
+        filtered = tuple(
+            p for p in accepting
+            if not any(c.kind == "marginal_routing" for c in p.caveats)
+        )
+        assert filtered, "filter shouldn't drop every peer"
+        # CoinGate is the only marginal_routing peer in the bundled
+        # catalog; the filter must drop exactly that one.
+        coingate_pub = "0242a4ae0c5bef18048fbecf995094b74bfb0f7391418d71ed394784373f41e4f3"
+        assert coingate_pub not in {p.node_id_hex for p in filtered}
+        # Recommended-default tag is the next pivot.
+        starred = tuple(p for p in filtered if "recommended_default" in p.tags)
+        assert starred, "expected ⭐ peers to remain after the marginal-routing filter"
+
+
+class TestPickerJSCustomOnlyExplanation:
+    """The JS picker collapses to custom-only mode in three scenarios.
+    The non-failure scenarios get explanatory copy via
+    ``onboardingCustomOnlyExplanation``; the failure scenario gets its
+    own retry footer. Pin the JS branches via static checks since
+    there's no JS test harness."""
+
+    def test_custom_only_explanation_getter_exists(self) -> None:
+        # The getter is what the template binds to.
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2]
+            / "app" / "dashboard" / "static" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        assert "onboardingCustomOnlyExplanation" in text
+
+    def test_explanation_distinguishes_non_mainnet_from_killswitch(self) -> None:
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2]
+            / "app" / "dashboard" / "static" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        # Non-mainnet branch surfaces a "mainnet-only" message.
+        assert "mainnet-only" in text
+        # Kill-switch branch surfaces a "turned off" message.
+        assert "turned off" in text
+
+    def test_failed_state_has_retry_button_not_explanation(self) -> None:
+        # The retry footer renders only when load state is 'failed'; the
+        # explanation getter explicitly returns '' for that state so the
+        # two surfaces don't compete.
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2]
+            / "app" / "dashboard" / "static" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        assert "onboardingRetryCatalog" in text
+        # The failed-state branch returns '' so the template's
+        # ``x-if="onboardingCustomOnlyExplanation"`` skips rendering
+        # when the retry footer is already showing.
+        assert "if (this.smallChannelPeerCatalogLoadState === 'failed') return ''" in text
+
+
+class TestCatalogFetchRetryBudget:
+    """The catalog fetch retries with a 500 ms / 2 s / 5 s backoff
+    budget. After the final attempt, the load state flips to ``failed``
+    and the picker collapses to custom-only with a retry affordance —
+    the open-the-channel button stays enabled because the custom mode
+    is still available."""
+
+    def test_retry_backoffs_use_planned_schedule(self) -> None:
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2]
+            / "app" / "dashboard" / "static" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        # Constant declares the three planned backoffs in ms.
+        # Together with the immediate first attempt the total wall-
+        # clock window before final failure is ~10 s.
+        assert "CATALOG_FETCH_RETRY_BACKOFFS_MS = [500, 2000, 5000]" in text
+
+    def test_failed_state_does_not_disable_custom_mode_open_button(self) -> None:
+        # ``onboardingCanOpen`` reads ``onboardingPeerChoiceMode`` and
+        # the custom URI — neither depends on the catalog state, so a
+        # failed fetch can't strand the user. Pin the JS branch.
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parents[2]
+            / "app" / "dashboard" / "static" / "dashboard.js"
+        ).read_text(encoding="utf-8")
+        # Custom mode's open-readiness checks the parsed pubkey/URI,
+        # not the catalog load state.
+        assert "_parsePubkeyOrUri(this.onboardingCustomUri)" in text

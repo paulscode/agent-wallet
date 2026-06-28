@@ -117,9 +117,10 @@ class BraiinsDepositFundingStrategy(str, enum.Enum):
 
     * ``SWAP`` (default) — submarine swap (on-chain → LN via Boltz). The
       original behaviour; requires Boltz to route *inbound* to our node.
-    * ``CHANNEL`` — open a Lightning channel to Megalithic with the
-      on-chain funds, then run the reverse swap (outbound-only). Bypasses
-      inbound routing entirely. Applies only to on-chain sources.
+    * ``CHANNEL`` — open a Lightning channel to a recommended routing
+      peer with the on-chain funds, then run the reverse swap
+      (outbound-only). Bypasses inbound routing entirely. Applies only
+      to on-chain sources.
     """
 
     SWAP = "swap"
@@ -195,8 +196,9 @@ class BraiinsDepositSession(Base):
     #   at high fees; surfaced to the user via an info bubble.
     include_extras: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=sa.true())
     # How an on-chain source is converted to LN (frozen at create time).
-    # ``swap`` (default) = submarine swap; ``channel`` = open a channel to
-    # Megalithic instead (swap-bypass). Ignored for Lightning sources.
+    # ``swap`` (default) = submarine swap; ``channel`` = open a channel
+    # to a recommended routing peer instead (swap-bypass). Ignored for
+    # Lightning sources.
     funding_strategy: Mapped[BraiinsDepositFundingStrategy] = mapped_column(
         Enum(
             BraiinsDepositFundingStrategy,
@@ -209,7 +211,7 @@ class BraiinsDepositSession(Base):
     )
 
     # ── Channel-open-leg resources (funding_strategy="channel") ──
-    # The Megalithic node we opened to + the funding outpoint
+    # The routing peer we opened to + the funding outpoint
     # (channel_point = ``channel_open_txid:channel_open_output_index``).
     channel_peer_pubkey: Mapped[Optional[str]] = mapped_column(String(66), nullable=True)
     channel_open_txid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

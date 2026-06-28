@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.1] - 2026-06-27
+## [0.1.1] - 2026-06-28
 
 ### Added
 
@@ -27,6 +27,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator can stop / resume across many rounds without losing
   state. Both honour an operator-supplied SKIP set and the new
   routing-health filter (see *Changed* below).
+- **Catalog-driven peer picker in the onboarding wizard.** The
+  first-channel `ready_to_connect` step offers three modes:
+  **Recommended** (auto-selects a ⭐ catalog peer that accepts the
+  entered amount), **Pick from list** (a sortable table of all
+  eligible peers with fee / channels / capacity / min-open / location
+  columns and a per-row details disclosure showing the catalog
+  summary), and **A different node** (paste a pubkey or
+  `pubkey@host:port`). ⚠️-flagged marginal-routing peers are excluded
+  from auto-pick and from the cheapest-only mode but remain visible
+  and pickable from the list, where their caveat renders inline.
+  Non-mainnet networks and operators who set
+  `SMALL_CHANNEL_PEER_CATALOG_ENABLED=false` collapse the wizard to
+  the custom-pubkey mode only. Operators can pin their own ⭐ via
+  `SMALL_CHANNEL_PEER_RECOMMENDED_DEFAULTS` (comma-separated pubkey
+  hex) or supply a JSON overrides file via
+  `SMALL_CHANNEL_PEER_OVERRIDES_PATH` to add, replace, or block
+  individual entries on top of the bundled catalog. The catalog
+  itself is served from `GET /v1/peer-catalog/small-channel`
+  (API-key auth) and a session-authed wrapper at
+  `/dashboard/api/peer-catalog/small-channel`.
+- **Channel-card catalog enrichment.** Each active or pending channel
+  whose peer matches the catalog renders an inline ⭐
+  (recommended-default) or ⚠️ (marginal-routing caveat) badge next to
+  the peer alias, plus an info icon that opens a CSP-safe popover
+  showing the peer's summary, fee tier, connectivity tier,
+  outbound-enabled ratio, location, and snapshot date. The Channels
+  tab header surfaces a one-line `X of your Y channels are with peers
+  in our vetted catalog` summary when at least one matches; the
+  summary stays hidden when none do, so a wallet whose peers aren't
+  in the catalog sees nothing drawn attention to.
+
+#### Channel-mix planner
+- **Guided wizard for opening several small channels in one pass.**
+  Appears in the onboarding wizard's `ready_to_connect` step alongside
+  the single-channel picker when on-chain balance exceeds 400,000 sats
+  (the `CHANNEL_PLANNER_AUTOOFFER_FLOOR_SATS` threshold), and from the
+  Channels tab via a **Plan multiple channels…** button so wallets
+  with existing channels can still run the planner to add capacity.
+  The user supplies a target Lightning capacity, a balance shape
+  (Send-heavy / Balanced / Receive-heavy / Custom inbound %), a peer
+  mix (Recommended diverse / Cheapest fees), and optionally opts in
+  to leave room for one more channel later. The planner returns two
+  prominent funding numbers: `minimum_sats` (sum of channel capacities
+  plus today's open fees at the medium-priority feerate) and
+  `recommended_sats` (adds a per-channel close-fee reserve so each
+  channel can be cleanly closed at high feerate, plus a fee-spike
+  cushion sized against the high-priority feerate so a mempool move
+  between deposit and broadcast doesn't strand the open). A *Why the
+  buffer?* inline disclosure breaks down each component; a *Send the
+  minimum instead* link collapses the headline with a soft warning
+  for users who specifically want to fund tight. Peer selection
+  always includes at least one ⭐ catalog entry when one fits the
+  amount, then fills remaining slots optimising geographic and
+  operator diversity at the cheapest fee tier. When both electrs and
+  the mempool HTTP backend are unreachable, the planner falls back to
+  a 20 sat/vB conservative estimate with an inline warning rather
+  than refusing to render.
+- **Plan-then-execute endpoints with HMAC plan-token gating.**
+  `POST /v1/wallet/channel-mix/plan` runs the planner with the
+  caller's inputs and returns `{plan, plan_token}`; the token is an
+  HMAC-SHA256 over the canonical-JSON-encoded plan body, keyed from
+  `SECRET_KEY` with a domain-separated subkey so it can't collide with
+  the audit-chain MAC or the API-key digest. `POST /v1/wallet/channel-mix/execute`
+  accepts the original inputs plus the token, re-runs the planner,
+  verifies the token against the freshly-computed digest, and either
+  persists a `ChannelMixRun` row + enqueues the executor task or
+  rejects with `409 plan_stale` and a fresh plan body so the caller
+  can re-confirm. Token verification is a re-run + canonical-JSON
+  comparison rather than a raw HMAC compare, so a stale plan whose
+  execution would now produce different per-channel allocations is
+  rejected even if the token decodes cleanly. A SHA-256 digest of the
+  token is persisted on the run row with a `UNIQUE` constraint, so a
+  re-submitted execute call (browser retry, double-click, transient
+  network loss) is mapped to the original run rather than opening
+  every channel twice. The session-authed dashboard exposes the same
+  surface at `/dashboard/api/channel-mix/{plan,execute,runs/{id}}`.
+  Both `plan` and `execute` carry per-IP rate caps (60/minute and
+  20/minute respectively) — comfortably above interactive use while
+  bounding a runaway loop that could otherwise hammer the mempool fee
+  oracle or enqueue executor work without limit.
+- **Per-channel atomic executor with crash-resilient state.** The
+  Celery executor opens each channel as an independent step — a
+  single failed open doesn't strand the others — and follows up with
+  a Boltz reverse-swap inbound-seed step on each channel that the
+  planner allocated one for. Each open and each open failure writes a
+  `channel_mix_open` audit-log row keyed by the executing run id, so
+  operator-side audit chain review covers executor-driven channels
+  with the same shape it covers hand-driven `/channel/open` calls.
+  Two Celery workers racing on the same run id — for example the
+  dashboard's initial enqueue plus the periodic recovery task — are
+  serialized by a `SELECT ... FOR UPDATE` lock on the
+  `channel_mix_runs` row, so only one worker can advance a given run
+  per tick and the funding-broadcast race is impossible.
+  `GET /v1/wallet/channel-mix/runs/{id}` returns per-channel state
+  (`open_state` in `queued` / `opening` / `open_pending` /
+  `open_active` / `open_failed`, paired with `seed_state` in `queued`
+  / `swapping` / `seeded` / `seed_failed` / `skipped`) plus the
+  run-wide rollup (`queued` / `in_progress` / `complete` /
+  `partial_failure` / `cancelled`). The dashboard polls every 5 s and
+  renders the per-channel progress with inline error strings on
+  failed slots. A periodic `recover_channel_mix_runs` Celery-beat
+  task runs every 5 minutes to pick up any run left non-terminal
+  after a worker crash.
 
 #### Dashboard
 - **Reverse-swap lockup transaction surfaced in the UI.** `BoltzSwap.lockup_txid`

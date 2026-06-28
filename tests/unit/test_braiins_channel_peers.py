@@ -3,13 +3,7 @@
 presets, amount-driven selection, and capacity sizing.
 """
 
-from pathlib import Path
-
-from app.core.config import settings
 from app.services import braiins_channel_peers as peers
-
-_REPO = Path(__file__).resolve().parents[2]
-_DASHBOARD_JS = _REPO / "app" / "dashboard" / "static" / "dashboard.js"
 
 
 class TestPeerSelection:
@@ -86,21 +80,3 @@ class TestCapacitySizing:
         assert cap5 > cap0
 
 
-class TestSingleSourceOfTruth:
-    """The backend presets MUST match the frontend MEGALITHIC_NODES so
-    the two copies can't drift (D2)."""
-
-    def test_backend_presets_match_dashboard_js(self):
-        js = _DASHBOARD_JS.read_text(encoding="utf-8")
-        # Both pubkeys + mins from config must appear verbatim in the JS.
-        assert settings.braiins_deposit_channel_peer_pubkey in js, (
-            "main pubkey missing from dashboard.js MEGALITHIC_NODES"
-        )
-        assert settings.braiins_deposit_channel_peer_small_pubkey in js, (
-            "small pubkey missing from dashboard.js MEGALITHIC_NODES"
-        )
-        assert "minSats: 1000000" in js or "minSats: 1_000_000" in js
-        assert "minSats:   150000" in js or "minSats: 150000" in js or "minSats: 150_000" in js
-        # Hosts too.
-        assert settings.braiins_deposit_channel_peer_host in js
-        assert settings.braiins_deposit_channel_peer_small_host in js

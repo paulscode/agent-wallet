@@ -742,6 +742,29 @@ class Settings(BaseSettings):
     # on Continue. Keyed on (handle, amount_sats, comment). Set to 0 to disable.
     lnurl_invoice_cache_ttl_seconds: int = 30
 
+    # ── Small-channel peer catalog ──────────────────────────────────
+    # A bundled list of LN peers empirically confirmed to accept ~150k
+    # sat channel opens. Powers the onboarding wizard's peer picker,
+    # the Braiins channel-mode swap-bypass, and the channel-card
+    # enrichment surface. The data lives in
+    # ``app/services/small_channel_peers.json``; the user-facing guide
+    # is at ``docs/small-channel-peers.md``.
+    small_channel_peer_catalog_enabled: bool = True
+    # Optional path to an operator-supplied JSON file that adds,
+    # replaces, or blocks entries on top of the bundled catalog.
+    # Override semantics: ``{"node_id_hex": "...", "blocked": true}``
+    # removes a pubkey; an entry whose pubkey matches a bundled one
+    # replaces it field-by-field (omitted fields keep the bundled
+    # value); a new pubkey appends. Bad JSON logs a warning and falls
+    # back to the bundled catalog unchanged.
+    small_channel_peer_overrides_path: str = ""
+    # Comma-separated pubkey hex list that replaces the bundled
+    # ⭐ recommended-default selection with the operator's picks.
+    # Pubkeys absent from the post-overrides catalog are silently
+    # skipped with a logged warning, so the override is robust to
+    # typos.
+    small_channel_peer_recommended_defaults: str = ""
+
     # ── Braiins Deposit ────────────────────────────────────────────
     # The feature ships enabled but never triggers any swap or
     # payment activity until the user opens the wizard and clicks

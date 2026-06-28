@@ -1364,11 +1364,13 @@ async def security_headers(request: Request, call_next: Any) -> Response:
 # ─── Routers ──────────────────────────────────────────────────────────
 from app.api.admin import router as admin_router
 from app.api.bolt12 import router as bolt12_router
+from app.api.channel_mix import router as channel_mix_router
 from app.api.channels import router as channels_router
 from app.api.cold_storage import router as cold_storage_router
 from app.api.livez import router as livez_router
 from app.api.mempool import router as mempool_router
 from app.api.payments import router as payments_router
+from app.api.peer_catalog import router as peer_catalog_router
 from app.api.tor_metrics import router as tor_metrics_router
 from app.api.wallet import router as wallet_router
 
@@ -1380,6 +1382,8 @@ app.include_router(cold_storage_router)
 app.include_router(mempool_router)
 app.include_router(admin_router)
 app.include_router(bolt12_router)
+app.include_router(peer_catalog_router)
+app.include_router(channel_mix_router)
 app.include_router(tor_metrics_router)
 
 # ─── Sign / Verify Message ──────────────────────────────────────────

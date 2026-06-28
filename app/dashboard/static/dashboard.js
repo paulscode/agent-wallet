@@ -7,26 +7,29 @@
  * helpers that were previously in an inline <script> block live here.
  */
 
-// Node presets used by the new-user onboarding wizard. The wizard
-// picks ``main`` vs ``small`` based on the requested channel size so
-// the user doesn't need to know which node to use. Both keys are
-// mainnet; switching networks would require operator guidance anyway,
-// so we don't auto-route around them. These are the upstream project's
-// recommended public LN peers — forks can repoint them to any node.
-const MEGALITHIC_NODES = {
-    main:  {
-        pubkey: '0322d0e43b3d92d30ed187f4e101a9a9605c3ee5fc9721e6dac3ce3d7732fbb13e',
-        host:   '164.92.106.32:9735',
-        minSats: 1000000,
-        label:  'Megalithic (main node)',
-    },
-    small: {
-        pubkey: '02a98c86ef366ce226aad6e7706959456e1701058915c3cbf527b37da143bb1441',
-        host:   '146.190.169.210:9735',
-        minSats: 150000,
-        label:  'Megalithic (small-channel node)',
-    },
-};
+// Onboarding wizard peer picker — sourced from the small-channel peer
+// catalog served at ``/dashboard/api/peer-catalog/small-channel``.
+// The catalog ships in-repo (``app/services/small_channel_peers.json``)
+// and is read once per dashboard session, cached in component state.
+// Retry budget for the lazy fetch is bounded by ``CATALOG_FETCH_RETRY_BACKOFFS_MS``
+// (below) — total wall-clock attempt window of ~10 s. On final
+// failure or when the operator has disabled the catalog
+// (``SMALL_CHANNEL_PEER_CATALOG_ENABLED=false``), the picker collapses
+// to the "A different node" mode only and surfaces a retry affordance.
+const CATALOG_FETCH_RETRY_BACKOFFS_MS = [500, 2000, 5000];
+
+// Onchain confirmed-balance threshold at which the onboarding wizard
+// offers the multi-channel planner alongside the single-channel
+// picker. Below this, the planner's output is approximately one
+// channel anyway — we save the user a decision by keeping the
+// existing single-channel flow.
+const CHANNEL_PLANNER_AUTOOFFER_FLOOR_SATS = 400000;
+
+// How often the dashboard polls the channel-mix run status while the
+// executor is driving the per-channel state machine. Tracks the
+// cadence the Boltz / Braiins polling already use so the dashboard
+// doesn't accumulate background timers at different rates.
+const CHANNEL_MIX_RUN_POLL_MS = 5000;
 
 // Onboarding default-amount safety buffer (sats). We pre-fill the
 // channel amount as ``onchain - buffer`` so the wallet keeps a small
@@ -122,7 +125,7 @@ const BRAIINS_DEPOSIT_GLOSSARY = {
     },
     'open-a-channel': {
         title: 'Open a channel (instead of a swap)',
-        body: 'For on-chain deposits, instead of a submarine swap this opens a new Lightning channel to Megalithic with your funds, then converts that to a fresh Bitcoin transaction for Braiins. It works even when a swap can\'t be routed to your node — slower (~30-60 min for the channel to confirm), and ~1% stays in the new channel as receive capacity you keep.',
+        body: 'For on-chain deposits, instead of a submarine swap this opens a new Lightning channel to a recommended routing peer with your funds, then converts that to a fresh Bitcoin transaction for Braiins. It works even when a swap can\'t be routed to your node — slower (~30-60 min for the channel to confirm), and ~1% stays in the new channel as receive capacity you keep.',
     },
     'channel-reserve': {
         title: 'Channel reserve',
@@ -1108,7 +1111,7 @@ document.addEventListener('alpine:init', () => {
         braiinsDepositSourceKind: 'lightning',
         // Channel-open alternative for on-chain sources. ``'swap'``
         // (default) = submarine swap; ``'channel'`` = open a channel to
-        // Megalithic instead (swap-bypass). Surfaced behind an "Advanced"
+        // the configured routing peer instead (swap-bypass). Surfaced behind an "Advanced"
         // toggle on on-chain sources; reset to 'swap' whenever the source
         // changes. ``braiinsDepositChannelOpenEnabled`` gates whether the
         // toggle is shown at all (operator flag, set from presets).
@@ -1194,12 +1197,78 @@ document.addEventListener('alpine:init', () => {
         // user-controlled inputs (peer choice, amount, custom URI)
         // and a transient "I just submitted, suppress flicker" flag.
         onboardingSkipped: false,
-        onboardingPeerChoice: 'megalithic',         // 'megalithic' | 'custom'
+        // Which mode the wizard's picker is in. ``recommended_default``
+        // auto-picks the cheapest ⭐ catalog peer that accepts the
+        // current amount; ``pick_from_list`` lets the user choose any
+        // catalog entry; ``custom`` accepts a pubkey or pubkey@host:port
+        // pasted into a textarea.
+        onboardingPeerChoiceMode: 'recommended_default',
+        // Selected pubkey in ``pick_from_list`` mode; empty until the
+        // user clicks a row in the catalog table.
+        onboardingPickedPubkey: '',
+        // Sort key for the catalog table in ``pick_from_list`` mode.
+        // One of ``'fee'`` (ascending median ppm, base as tiebreaker),
+        // ``'channels'`` (descending count), or ``'capacity'``
+        // (descending BTC).
+        onboardingPickFromListSort: 'fee',
         onboardingCustomUri: '',
         onboardingAmountSats: null,
         onboardingAmountTouched: false,             // user typed a value → stop auto-defaulting
         onboardingLoading: false,
         onboardingError: '',
+        // Small-channel peer catalog, fetched on dashboard mount so
+        // the channel-card enrichment (catalog badges + per-card info
+        // tooltip) renders without waiting for the onboarding wizard.
+        // ``null`` until the first fetch completes; the load state
+        // below disambiguates "not started" from "loading" from
+        // "loaded" from "failed."
+        smallChannelPeerCatalog: null,
+        smallChannelPeerCatalogLoadState: 'idle',
+        // Channel card whose info tooltip is currently open — chan_id
+        // for active channels, channel_point for pending opens, or ``''``
+        // when no card is open. At most one tooltip is open at a time
+        // so the dashboard doesn't accumulate floating popups.
+        openChannelInfoTooltip: '',
+
+        // ── Channel-mix planner ──
+        // Tracks the multi-channel planner flow. Drives both the
+        // onboarding wizard's "Plan multiple channels" branch and the
+        // standalone planner the Channels tab exposes.
+        //
+        // ``channelPlanMode`` enumerates the wizard step within the
+        // planner: 'wizard_choice' (the user is being asked whether
+        // they want one channel or many), 'plan_form' (the planner's
+        // inputs are open), 'plan_preview' (the planner has produced a
+        // plan), 'executing' (the executor is running), 'done' (the
+        // run reached a terminal state).
+        channelPlanMode: 'wizard_choice',
+        // Form inputs. Defaults are filled in when the planner opens.
+        channelPlanForm: {
+            target_capacity_sats: 0,
+            outbound_option: 'balanced',
+            custom_inbound_pct: null,
+            peer_mix_mode: 'recommended_diverse',
+            manual_picks: [],
+            leave_room_for_one_more: false,
+            include_marginal_routing: false,
+        },
+        // The {plan, plan_token} returned by ``/wallet/channel-mix/plan``.
+        channelPlanResult: null,
+        // Toggles between "send the recommended amount" (default) and
+        // "send the bare minimum" (user opts in via the link).
+        channelPlanShowMinimum: false,
+        // Whether the "Why the buffer?" disclosure is expanded.
+        channelPlanWhyOpen: false,
+        // ``true`` while a /plan or /execute call is in flight, so the
+        // submit button can render its loading state.
+        channelPlanLoading: false,
+        // Last user-visible error from /plan or /execute.
+        channelPlanError: '',
+        // Channel-mix run we're currently polling.
+        channelMixRunId: '',
+        // Latest polled status of that run.
+        channelMixRun: null,
+        _channelMixPollTimer: null,
         // True for a brief window after a channel first goes active
         // so the wizard's celebration view can play before the regular
         // dashboard takes over.
@@ -1853,6 +1922,11 @@ document.addEventListener('alpine:init', () => {
                 }
                 if (newStep === 'ready_to_connect') {
                     this._maybePrefillOnboardingAmount();
+                    // Fetch the small-channel catalog so the picker can
+                    // render the recommended-default + pick-from-catalog
+                    // modes. Fire-and-forget; the load-state field
+                    // drives the template gating.
+                    this._ensureSmallChannelPeerCatalog();
                 }
                 // The wallet just became usable — only celebrate when
                 // we came from ``connecting`` (a channel-open the user
@@ -1873,7 +1947,10 @@ document.addEventListener('alpine:init', () => {
             });
             // Kick the poller for the initial state.
             if (this.onboardingStep) this._startOnboardingPoller();
-            if (this.onboardingStep === 'ready_to_connect') this._maybePrefillOnboardingAmount();
+            if (this.onboardingStep === 'ready_to_connect') {
+                this._maybePrefillOnboardingAmount();
+                this._ensureSmallChannelPeerCatalog();
+            }
 
             // Resume an in-progress inbound-liquidity swap from a
             // previous session if the user refreshed mid-flow. Fires
@@ -4667,6 +4744,12 @@ document.addEventListener('alpine:init', () => {
             const paymentsP  = this.api('GET', '/payments');
             const invoicesP  = this.api('GET', '/invoices');
             const txP        = this.api('GET', '/transactions');
+            // Fire-and-forget catalog fetch so the channel-card
+            // enrichment (badges + per-card info tooltip) renders as
+            // soon as ``/channels`` lands. The catalog's load-state
+            // field gates the bindings; an in-flight or failed fetch
+            // surfaces nothing on the cards (silent miss).
+            this._ensureSmallChannelPeerCatalog();
 
             try {
                 this.summary = await summaryP;
@@ -6695,50 +6778,157 @@ document.addEventListener('alpine:init', () => {
          *  Pending-open detail entries don't include ``peer_alias``
          *  (that field only exists on active channels via
          *  ``peer_alias_lookup=true``), so the fallback chain is:
-         *  Megalithic preset match → truncated pubkey → generic. */
+         *  catalog match → truncated pubkey → generic. */
         get onboardingPendingPeerLabel() {
             const ch = this.onboardingPendingChannel;
             if (!ch) return '';
             const pk = (ch.remote_node_pub || '').toLowerCase();
-            if (pk === MEGALITHIC_NODES.main.pubkey)  return 'Megalithic';
-            if (pk === MEGALITHIC_NODES.small.pubkey) return 'Megalithic';
+            const catalogEntry = this._lookupCatalogPeer(pk);
+            if (catalogEntry) return catalogEntry.alias;
             if (pk) return pk.slice(0, 10) + '…' + pk.slice(-4);
             return 'your chosen node';
         },
 
-        /** Megalithic node preset for the currently-entered amount.
-         *  Returns null if the amount is below the small-channel
-         *  minimum. Used by the ready_to_connect step to show
-         *  "Will use:" + an inline minimum-warning. */
-        get onboardingMegalithicNode() {
-            return this._megalithicNodeFor(this.onboardingAmountSats);
+        /** The cheapest ⭐-tagged catalog peer whose ``min_channel_size_sats``
+         *  fits the currently-entered amount. ``null`` when:
+         *    * the catalog hasn't loaded yet, or
+         *    * the catalog is empty (non-mainnet / kill-switch off / fetch failed), or
+         *    * no recommended peer accepts an amount this small.
+         *  Used by the ready_to_connect step to show "Will use:" alongside
+         *  the recommended radio. */
+        get onboardingRecommendedPeer() {
+            return this._recommendedPeerForAmount(this.onboardingAmountSats);
         },
 
-        /** True when the amount + peer choice form a valid open
-         *  request (so we can enable the submit button). */
+        /** Catalog peers whose ``min_channel_size_sats`` fits the
+         *  currently-entered amount. Sorted by the active table sort
+         *  key (``fee`` / ``channels`` / ``capacity``).
+         *  Drives the "Pick from list" table. */
+        get onboardingFilteredPeers() {
+            const peers = this._peersAcceptingAmount(this.onboardingAmountSats);
+            const sort = this.onboardingPickFromListSort;
+            // Make a shallow copy so the sort doesn't mutate the cached catalog.
+            const copy = peers.slice();
+            if (sort === 'channels') {
+                copy.sort((a, b) => (b.channels_count || 0) - (a.channels_count || 0));
+            } else if (sort === 'capacity') {
+                copy.sort((a, b) => (b.capacity_btc || 0) - (a.capacity_btc || 0));
+            } else {
+                // ``fee``: ascending ppm, base as tiebreaker. Matches the
+                // server-side ``cheapest_n`` helper's order.
+                copy.sort((a, b) => {
+                    const ppmA = a.typical?.fee_rate_milli_msat || 0;
+                    const ppmB = b.typical?.fee_rate_milli_msat || 0;
+                    if (ppmA !== ppmB) return ppmA - ppmB;
+                    return (a.typical?.fee_base_msat || 0) - (b.typical?.fee_base_msat || 0);
+                });
+            }
+            return copy;
+        },
+
+        /** Short text summary of the catalog filter result. Used as the
+         *  "N / M peers fit your amount" caption above the table. */
+        get onboardingPeerStats() {
+            const total = this.smallChannelPeerCatalog?.peers?.length || 0;
+            if (total === 0) return '';
+            const fitting = this.onboardingFilteredPeers.length;
+            if (fitting === total) return total + ' peers verified';
+            return fitting + ' of ' + total + ' peers fit your amount';
+        },
+
+        /** True when the operator has the catalog enabled, the current
+         *  network is mainnet, and the catalog has loaded successfully
+         *  with at least one entry. False otherwise. Drives the
+         *  visibility of the recommended-default + pick-from-catalog
+         *  modes (the custom mode is always available). */
+        get onboardingCatalogAvailable() {
+            if (this.smallChannelPeerCatalogLoadState !== 'loaded') return false;
+            const cat = this.smallChannelPeerCatalog;
+            if (!cat || !cat.enabled) return false;
+            const peers = cat.peers || [];
+            return peers.length > 0;
+        },
+
+        /** True when the wizard should expose ONLY the custom mode —
+         *  catalog endpoint failed, kill-switch is off, or current
+         *  network is non-mainnet. The picker collapses to a single
+         *  radio in that case (the user sees no choice to make). */
+        get onboardingCustomModeOnly() {
+            return !this.onboardingCatalogAvailable
+                && this.smallChannelPeerCatalogLoadState !== 'loading';
+        },
+
+        /** Short explanation for why the picker collapsed to custom-only.
+         *  Returns '' when not in custom-only mode (or when the failure
+         *  has its own retry footer). The fetch-failed state is handled
+         *  separately by the retry footer; non-mainnet and kill-switch
+         *  cases get the lines below. */
+        get onboardingCustomOnlyExplanation() {
+            if (!this.onboardingCustomModeOnly) return '';
+            if (this.smallChannelPeerCatalogLoadState === 'failed') return '';
+            const cat = this.smallChannelPeerCatalog;
+            // Catalog endpoint returned ``enabled: false`` — operator
+            // opted out. Nothing the user can do about it.
+            if (cat && cat.enabled === false) {
+                return 'The peer catalog is turned off on this wallet. Paste a pubkey to continue.';
+            }
+            // Catalog enabled but network isn't mainnet. The bundled
+            // peers are all mainnet identities.
+            if (cat && cat.network && cat.network !== 'bitcoin') {
+                return 'The peer catalog is mainnet-only. Paste a pubkey for your current network.';
+            }
+            // Loaded but empty — shouldn't happen with the bundled
+            // catalog but log-friendly fallback copy keeps the dialog
+            // helpful if it ever does.
+            return 'No catalog peers are available right now. Paste a pubkey to continue.';
+        },
+
+        /** Snapshot date the catalog returned, formatted for display.
+         *  Empty string when no catalog is loaded. */
+        get onboardingCatalogSnapshotDate() {
+            return this.smallChannelPeerCatalog?.snapshot_date || '';
+        },
+
+        /** True when the amount + chosen peer form a valid open request
+         *  (so we can enable the submit button). */
         get onboardingCanOpen() {
             const sats = Number(this.onboardingAmountSats) || 0;
             if (sats <= 0) return false;
             if ((this.summary?.totals?.onchain_sats || 0) < sats) return false;
-            if (this.onboardingPeerChoice === 'megalithic') {
-                return !!this.onboardingMegalithicNode;
+            const mode = this.onboardingPeerChoiceMode;
+            if (mode === 'recommended_default') {
+                return !!this.onboardingRecommendedPeer;
             }
-            // Custom node — accept either bare pubkey or pubkey@host:port.
+            if (mode === 'pick_from_list') {
+                if (!this.onboardingPickedPubkey) return false;
+                const picked = this._lookupCatalogPeer(this.onboardingPickedPubkey);
+                if (!picked) return false;
+                return (picked.min_channel_size_sats || 0) <= sats;
+            }
+            // ``custom`` — accept either bare pubkey or pubkey@host:port.
             return !!this._parsePubkeyOrUri(this.onboardingCustomUri);
         },
 
-        /** Helper text below the Megalithic radio. Null when there's
-         *  nothing to say; a string when we want to highlight the
-         *  minimum-amount issue. */
-        get onboardingPeerError() {
+        /** Helper text below the recommended radio explaining why an
+         *  amount is too small. Null when there's nothing to say. */
+        get onboardingAmountTooSmallReason() {
             const sats = Number(this.onboardingAmountSats) || 0;
-            if (this.onboardingPeerChoice !== 'megalithic') return null;
-            if (sats > 0 && sats < MEGALITHIC_NODES.small.minSats) {
-                return 'Megalithic requires at least ' +
-                    this.formatSats(MEGALITHIC_NODES.small.minSats) +
-                    ' sats. Increase the amount or pick "A different node".';
-            }
-            return null;
+            if (sats <= 0) return null;
+            if (this.onboardingPeerChoiceMode !== 'recommended_default') return null;
+            if (this.onboardingRecommendedPeer) return null;
+            const cat = this.smallChannelPeerCatalog;
+            const peers = cat?.peers || [];
+            if (peers.length === 0) return null;
+            // The smallest min_channel_size_sats across the catalog —
+            // the floor the user needs to clear before any catalog peer
+            // becomes a viable recommended pick.
+            const floor = peers.reduce(
+                (acc, p) => Math.min(acc, p.min_channel_size_sats || Infinity),
+                Infinity,
+            );
+            if (!isFinite(floor)) return null;
+            return 'The smallest verified peer needs ' +
+                this.formatSats(floor) + ' sats. Increase the amount or pick "A different node".';
         },
 
         /** Maximum capacity the user can add right now given their
@@ -6783,11 +6973,509 @@ document.addEventListener('alpine:init', () => {
             return colon > 0 ? cp.slice(0, colon) : cp;
         },
 
-        _megalithicNodeFor(sats) {
+        // ── Channel-card catalog enrichment ────────────────────────
+        //
+        // Each channel card consults the small-channel peer catalog
+        // (lazily fetched on dashboard mount) so the user sees the
+        // catalog's perspective on their peers: a ⭐ badge for vetted
+        // recommended-default peers, a ⚠️ badge for peers the catalog
+        // flagged with a routing caveat, and a per-card info tooltip
+        // showing the peer's summary + fee tier + outbound-enabled
+        // ratio + snapshot date. The catalog itself is mainnet-only;
+        // unmatched peers render with no badge or info icon (silent
+        // miss, no judgement implied).
+
+        /** Catalog entry for a channel's remote peer, or ``null`` when
+         *  there's no match. Accepts both active channels (``remote_pubkey``)
+         *  and pending channels (``remote_node_pub``). */
+        channelPeerCatalogInfo(ch) {
+            if (!ch) return null;
+            const pk = ch.remote_pubkey || ch.remote_node_pub || '';
+            if (!pk) return null;
+            return this._lookupCatalogPeer(pk);
+        },
+
+        /** Catalog-derived badge kind for a channel — ``'star'`` (⭐),
+         *  ``'warning'`` (⚠️), or ``''`` for no badge. ``'warning'``
+         *  takes precedence over ``'star'`` when both apply (the
+         *  routing concern is the more important signal). */
+        channelPeerBadge(ch) {
+            const info = this.channelPeerCatalogInfo(ch);
+            if (!info) return '';
+            if (this._peerHasMarginalRouting(info)) return 'warning';
+            if ((info.tags || []).indexOf('recommended_default') !== -1) return 'star';
+            return '';
+        },
+
+        /** Days since the catalog last verified this peer. Returns
+         *  ``null`` when the catalog has no entry for the channel's
+         *  peer (silent miss) or when the date doesn't parse. */
+        channelPeerVerifiedDaysAgo(ch) {
+            const info = this.channelPeerCatalogInfo(ch);
+            if (!info || !info.verified_at) return null;
+            const parsed = Date.parse(info.verified_at + 'T00:00:00Z');
+            if (isNaN(parsed)) return null;
+            const days = Math.floor((Date.now() - parsed) / (24 * 60 * 60 * 1000));
+            return days >= 0 ? days : null;
+        },
+
+        /** Human-readable label for a fee tier — capitalised for display
+         *  in the tooltip. */
+        channelPeerFeeTierLabel(info) {
+            if (!info || !info.fee_tier) return '';
+            const labels = {
+                very_low: 'Very low fees',
+                low: 'Low fees',
+                moderate: 'Moderate fees',
+                high: 'High fees',
+                hybrid: 'Hybrid (base + ppm)',
+                flat_fee: 'Flat-fee model',
+            };
+            return labels[info.fee_tier] || info.fee_tier;
+        },
+
+        /** Human-readable label for a connectivity tier. */
+        channelPeerConnectivityLabel(info) {
+            if (!info || !info.connectivity_tier) return '';
+            const labels = {
+                limited: 'Limited connectivity',
+                adequate: 'Adequately connected',
+                well: 'Well connected',
+                highly: 'Highly connected',
+            };
+            return labels[info.connectivity_tier] || info.connectivity_tier;
+        },
+
+        /** Outbound-enabled ratio formatted as a percentage string, or
+         *  empty when the catalog didn't sample one for this peer. */
+        channelPeerOutboundPct(info) {
+            if (!info || info.outbound_enabled_ratio == null) return '';
+            return Math.round(info.outbound_enabled_ratio * 100) + '%';
+        },
+
+        /** Click handler for the channel card's info icon — toggles the
+         *  per-channel tooltip. The ``openChannelInfoTooltip`` field
+         *  carries the chan_id (or pending channel_point) of whichever
+         *  card is currently open, or ``''`` when none is. Clicking the
+         *  same icon a second time closes the tooltip. */
+        toggleChannelInfo(ch) {
+            const key = this._channelInfoKey(ch);
+            if (!key) return;
+            if (this.openChannelInfoTooltip === key) {
+                this.openChannelInfoTooltip = '';
+            } else {
+                this.openChannelInfoTooltip = key;
+            }
+        },
+
+        /** Close handler bound to ``@click.outside`` and
+         *  ``@keydown.escape.window`` on the tooltip surface. */
+        closeChannelInfo() {
+            this.openChannelInfoTooltip = '';
+        },
+
+        /** Stable per-card key the tooltip uses to identify "is this my
+         *  channel's tooltip?" — chan_id for active channels, the
+         *  ``channel_point`` outpoint for pending opens. */
+        _channelInfoKey(ch) {
+            if (!ch) return '';
+            return String(ch.chan_id || ch.channel_point || '');
+        },
+
+        /** Count of active + pending channels whose remote peer is in
+         *  the catalog. Drives the "X of your Y channels…" summary
+         *  line at the top of the Channels tab. */
+        get catalogMatchedChannelCount() {
+            const all = (this.channels || []).concat(this.pendingChannels || []);
+            let n = 0;
+            for (const ch of all) {
+                if (this.channelPeerCatalogInfo(ch)) n += 1;
+            }
+            return n;
+        },
+
+        /** Total active + pending channels, used as the denominator in
+         *  the summary line. */
+        get totalChannelCount() {
+            return (this.channels || []).length + (this.pendingChannels || []).length;
+        },
+
+        /** True when the Channels-tab summary line should render —
+         *  there's at least one catalog-matched channel AND the user
+         *  has at least one channel total. Hides on a no-match wallet
+         *  so we don't draw attention to the gap. */
+        get shouldShowCatalogMatchedSummary() {
+            return this.catalogMatchedChannelCount > 0 && this.totalChannelCount > 0;
+        },
+
+        // ── End channel-card catalog enrichment ───────────────────
+
+        /** Catalog peers whose ``min_channel_size_sats`` is at or below
+         *  ``sats``. Returns an empty array when the catalog hasn't
+         *  loaded yet or no peer accepts an amount this small. */
+        _peersAcceptingAmount(sats) {
             const n = Number(sats) || 0;
-            if (n >= MEGALITHIC_NODES.main.minSats) return MEGALITHIC_NODES.main;
-            if (n >= MEGALITHIC_NODES.small.minSats) return MEGALITHIC_NODES.small;
+            if (n <= 0) return [];
+            const cat = this.smallChannelPeerCatalog;
+            if (!cat || !cat.enabled) return [];
+            const peers = cat.peers || [];
+            const out = [];
+            for (const peer of peers) {
+                if ((peer.min_channel_size_sats || 0) <= n) out.push(peer);
+            }
+            return out;
+        },
+
+        /** Look up a catalog peer by pubkey (case-insensitive).
+         *  Returns the catalog entry or null when not in the catalog. */
+        _lookupCatalogPeer(pubkey) {
+            if (!pubkey) return null;
+            const needle = String(pubkey).toLowerCase();
+            const cat = this.smallChannelPeerCatalog;
+            if (!cat) return null;
+            const peers = cat.peers || [];
+            for (const peer of peers) {
+                if ((peer.node_id_hex || '').toLowerCase() === needle) return peer;
+            }
             return null;
+        },
+
+        /** True when ``peer`` carries a ``marginal_routing`` caveat —
+         *  the catalog's signal that the peer's outbound-enabled ratio
+         *  is meaningfully below the healthy threshold. The recommended
+         *  picker skips these so a fresh wallet doesn't auto-route into
+         *  a peer whose own gossip says they refuse to forward. They
+         *  remain visible (and selectable) in the Pick-from-list table,
+         *  rendered with a ⚠️ badge. */
+        _peerHasMarginalRouting(peer) {
+            const caveats = peer.caveats || [];
+            for (const c of caveats) {
+                if (c && c.kind === 'marginal_routing') return true;
+            }
+            return false;
+        },
+
+        /** Pick the cheapest ⭐ catalog peer whose
+         *  ``min_channel_size_sats`` fits ``sats``. Falls back to the
+         *  cheapest non-⭐ peer that accepts the amount when no
+         *  recommended peer fits. ``marginal_routing`` peers are
+         *  excluded from auto-picking. Returns null when nothing
+         *  accepts. */
+        _recommendedPeerForAmount(sats) {
+            const candidates = this._peersAcceptingAmount(sats).filter(
+                (p) => !this._peerHasMarginalRouting(p),
+            );
+            if (candidates.length === 0) return null;
+            const ranked = candidates.slice().sort((a, b) => {
+                const aStar = (a.tags || []).indexOf('recommended_default') !== -1 ? 0 : 1;
+                const bStar = (b.tags || []).indexOf('recommended_default') !== -1 ? 0 : 1;
+                if (aStar !== bStar) return aStar - bStar;
+                const ppmA = a.typical?.fee_rate_milli_msat || 0;
+                const ppmB = b.typical?.fee_rate_milli_msat || 0;
+                if (ppmA !== ppmB) return ppmA - ppmB;
+                return (a.typical?.fee_base_msat || 0) - (b.typical?.fee_base_msat || 0);
+            });
+            return ranked[0];
+        },
+
+        // ── Channel-mix planner helpers ────────────────────────────
+
+        /** True whenever the channel-mix planner is open — drives the
+         *  top-level mount gates for the wizard wrapper (so the
+         *  planner panels can render even after the onboarding flow
+         *  has completed) and for the main dashboard (so the planner
+         *  visually occupies the page like a modal step). */
+        get channelPlannerActive() {
+            return this.channelPlanMode !== 'wizard_choice';
+        },
+
+        /** True when the onboarding wizard should offer the
+         *  "Plan multiple channels" branch alongside the single-
+         *  channel picker. The threshold is the operator-tunable
+         *  ``CHANNEL_PLANNER_AUTOOFFER_FLOOR_SATS``; below it the
+         *  single-channel flow is the right answer anyway. */
+        get onboardingPlannerOffered() {
+            const onchain = this.onboardingOnchainSats || 0;
+            return onchain > CHANNEL_PLANNER_AUTOOFFER_FLOOR_SATS;
+        },
+
+        /** The number the wizard pre-selects for the planner's target
+         *  capacity. Same suggestion logic as the single-channel
+         *  picker — onchain balance minus a safety reserve. */
+        get channelPlanSuggestedTarget() {
+            return this.onboardingSuggestedAmount || 0;
+        },
+
+        /** Drive the planner's submit-disabled state. */
+        get channelPlanCanSubmit() {
+            const f = this.channelPlanForm || {};
+            const target = Number(f.target_capacity_sats || 0);
+            if (target <= 0) return false;
+            if (this.channelPlanLoading) return false;
+            return true;
+        },
+
+        /** True when the planner's plan-preview view should expose the
+         *  "Why the buffer?" disclosure. Disabled when minimum-mode is
+         *  active (the buffer breakdown isn't being applied). */
+        get channelPlanShowBuffer() {
+            const plan = this.channelPlanPlan;
+            if (!plan) return false;
+            const b = plan.breakdown || {};
+            return (b.close_reserve_sats || 0) > 0
+                || (b.fee_spike_cushion_sats || 0) > 0;
+        },
+
+        /** Headline funding number — recommended by default,
+         *  minimum when the user opted in. */
+        get channelPlanHeadlineSats() {
+            const plan = this.channelPlanPlan;
+            if (!plan) return 0;
+            return this.channelPlanShowMinimum
+                ? (plan.minimum_sats || 0)
+                : (plan.recommended_sats || 0);
+        },
+
+        /** True only when a plan body is available — the planner
+         *  preview surface gates on this getter rather than dotted
+         *  ``channelPlanResult && channelPlanResult.plan`` in the
+         *  template, since the Alpine CSP build does not short-circuit
+         *  the dotted access on a null left-hand side. */
+        get channelPlanHasResult() {
+            return !!(this.channelPlanResult && this.channelPlanResult.plan);
+        },
+
+        /** The Plan body; null until ``submitChannelPlan`` succeeds. */
+        get channelPlanPlan() {
+            if (!this.channelPlanResult) return null;
+            return this.channelPlanResult.plan || null;
+        },
+
+        /** Per-channel openings — always returns an array so template
+         *  iteration is safe before the plan resolves. */
+        get channelPlanPerChannel() {
+            const plan = this.channelPlanPlan;
+            if (!plan) return [];
+            return Array.isArray(plan.per_channel) ? plan.per_channel : [];
+        },
+
+        /** Buffer breakdown — flat object even when no plan yet. */
+        get channelPlanBreakdown() {
+            const plan = this.channelPlanPlan;
+            return (plan && plan.breakdown) || {};
+        },
+
+        /** Planner warnings; always an array for template iteration. */
+        get channelPlanWarnings() {
+            const plan = this.channelPlanPlan;
+            if (!plan) return [];
+            const d = plan.diagnostics || {};
+            return Array.isArray(d.warnings) ? d.warnings : [];
+        },
+
+        /** Minimum funding sats, defaulted to 0 so the template's
+         *  ``formatSats`` call never sees undefined. */
+        get channelPlanMinimumSats() {
+            const plan = this.channelPlanPlan;
+            return (plan && plan.minimum_sats) || 0;
+        },
+
+        /** Recommended funding sats, defaulted to 0. */
+        get channelPlanRecommendedSats() {
+            const plan = this.channelPlanPlan;
+            return (plan && plan.recommended_sats) || 0;
+        },
+
+        /** Future-channel-slot sats (the "leave room for one more"
+         *  contribution); 0 when the buffer wasn't requested. */
+        get channelPlanFutureChannelSlotSats() {
+            return this.channelPlanBreakdown.future_channel_slot_sats || 0;
+        },
+
+        /** Per-channel state entries for the executing screen; always
+         *  an array. */
+        get channelMixRunChannels() {
+            if (!this.channelMixRun) return [];
+            return Array.isArray(this.channelMixRun.channels)
+                ? this.channelMixRun.channels
+                : [];
+        },
+
+        /** Reset the planner state — used both when the user dismisses
+         *  the wizard and when the form needs to re-open with fresh
+         *  inputs. */
+        _resetChannelPlanState() {
+            this.channelPlanMode = 'wizard_choice';
+            this.channelPlanResult = null;
+            this.channelPlanShowMinimum = false;
+            this.channelPlanWhyOpen = false;
+            this.channelPlanLoading = false;
+            this.channelPlanError = '';
+            this.channelMixRunId = '';
+            this.channelMixRun = null;
+            this._stopChannelMixPolling();
+            this.channelPlanForm = {
+                target_capacity_sats: this.channelPlanSuggestedTarget,
+                outbound_option: 'balanced',
+                custom_inbound_pct: null,
+                peer_mix_mode: 'recommended_diverse',
+                manual_picks: [],
+                leave_room_for_one_more: false,
+                include_marginal_routing: false,
+            };
+        },
+
+        /** Open the planner — moves the wizard into ``plan_form``. */
+        openChannelPlanner() {
+            this._resetChannelPlanState();
+            this.channelPlanMode = 'plan_form';
+        },
+
+        /** Return to the wizard choice (or close the planner from the
+         *  Channels tab). */
+        closeChannelPlanner() {
+            this._resetChannelPlanState();
+            this.channelPlanMode = 'wizard_choice';
+        },
+
+        /** Submit the planner's form to ``/wallet/channel-mix/plan``. */
+        async submitChannelPlan() {
+            this.channelPlanError = '';
+            if (!this.channelPlanCanSubmit) return;
+            this.channelPlanLoading = true;
+            try {
+                const result = await this.api(
+                    'POST',
+                    '/channel-mix/plan',
+                    this.channelPlanForm,
+                );
+                this.channelPlanResult = result;
+                this.channelPlanMode = 'plan_preview';
+            } catch (e) {
+                this.channelPlanError = (e && e.message) || 'Couldn’t build the plan.';
+            } finally {
+                this.channelPlanLoading = false;
+            }
+        },
+
+        /** Execute the previously-built plan and start polling the
+         *  resulting mix run. */
+        async executeChannelPlan() {
+            if (!this.channelPlanResult || !this.channelPlanResult.plan_token) return;
+            this.channelPlanError = '';
+            this.channelPlanLoading = true;
+            try {
+                const body = Object.assign({}, this.channelPlanForm, {
+                    plan_token: this.channelPlanResult.plan_token,
+                });
+                const result = await this.api(
+                    'POST',
+                    '/channel-mix/execute',
+                    body,
+                );
+                this.channelMixRunId = result.mix_run_id;
+                this.channelMixRun = null;
+                this.channelPlanMode = 'executing';
+                this._startChannelMixPolling();
+            } catch (e) {
+                // ``409 plan_stale`` ships a fresh plan; re-render the
+                // preview with it so the user can re-confirm.
+                if (e && e.status === 409 && e.detail && e.detail.plan && e.detail.plan_token) {
+                    this.channelPlanResult = {
+                        plan: e.detail.plan,
+                        plan_token: e.detail.plan_token,
+                    };
+                    this.channelPlanError = e.detail.message || 'The plan has changed — please review and re-confirm.';
+                } else {
+                    this.channelPlanError = (e && e.message) || 'Couldn’t start the plan.';
+                }
+            } finally {
+                this.channelPlanLoading = false;
+            }
+        },
+
+        /** Begin the per-channel polling loop. The dashboard refreshes
+         *  every ``CHANNEL_MIX_RUN_POLL_MS`` ms while the run is in a
+         *  non-terminal state. */
+        _startChannelMixPolling() {
+            this._stopChannelMixPolling();
+            const poll = async () => {
+                if (!this.channelMixRunId) return;
+                try {
+                    const body = await this.api(
+                        'GET',
+                        '/channel-mix/runs/' + this.channelMixRunId,
+                    );
+                    this.channelMixRun = body;
+                    const state = body && body.state;
+                    if (state === 'complete' || state === 'partial_failure' || state === 'cancelled') {
+                        this.channelPlanMode = 'done';
+                        this._stopChannelMixPolling();
+                        // Refresh the rest of the dashboard so the new
+                        // channels appear in the channels tab.
+                        this.fetchChannels();
+                        this.fetchSummary();
+                    }
+                } catch (e) {
+                    // Transient — keep polling.
+                }
+            };
+            poll();
+            this._channelMixPollTimer = setInterval(poll, CHANNEL_MIX_RUN_POLL_MS);
+        },
+
+        _stopChannelMixPolling() {
+            if (this._channelMixPollTimer) {
+                clearInterval(this._channelMixPollTimer);
+                this._channelMixPollTimer = null;
+            }
+        },
+
+        // ── End channel-mix planner helpers ───────────────────────
+
+        /** Lazily fetch the small-channel peer catalog from the
+         *  session-authed dashboard endpoint. Idempotent: a successful
+         *  load is cached for the dashboard session; a failed load can
+         *  be retried via the user-facing retry button (call with
+         *  ``{ force: true }``). The retry-with-backoff budget is
+         *  defined by ``CATALOG_FETCH_RETRY_BACKOFFS_MS``. */
+        async _ensureSmallChannelPeerCatalog(opts) {
+            const force = !!(opts && opts.force);
+            if (!force && this.smallChannelPeerCatalogLoadState === 'loaded') return;
+            if (!force && this.smallChannelPeerCatalogLoadState === 'loading') return;
+            this.smallChannelPeerCatalogLoadState = 'loading';
+            const backoffs = [0].concat(CATALOG_FETCH_RETRY_BACKOFFS_MS);
+            for (let attempt = 0; attempt < backoffs.length; attempt++) {
+                if (backoffs[attempt] > 0) {
+                    await new Promise((r) => setTimeout(r, backoffs[attempt]));
+                }
+                try {
+                    const body = await this.api('GET', '/peer-catalog/small-channel');
+                    if (body && typeof body === 'object') {
+                        this.smallChannelPeerCatalog = body;
+                        this.smallChannelPeerCatalogLoadState = 'loaded';
+                        return;
+                    }
+                } catch (e) {
+                    // Fall through to the next backoff; the final
+                    // attempt's failure flips the load state.
+                }
+            }
+            this.smallChannelPeerCatalogLoadState = 'failed';
+            this.smallChannelPeerCatalog = null;
+        },
+
+        /** Retry-the-fetch handler bound to the "Couldn't load peer
+         *  catalog" footer's retry link. */
+        async onboardingRetryCatalog() {
+            await this._ensureSmallChannelPeerCatalog({ force: true });
+        },
+
+        /** Click handler for the catalog table — pick a peer by pubkey
+         *  and switch to ``pick_from_list`` mode if not already in it. */
+        onboardingPickCatalogPeer(pubkey) {
+            this.onboardingPickedPubkey = pubkey || '';
+            this.onboardingPeerChoiceMode = 'pick_from_list';
         },
 
         /** Pre-fill the channel-amount input the first time the user
@@ -6815,8 +7503,9 @@ document.addEventListener('alpine:init', () => {
         },
 
         /** Submit the wizard's open-channel form. Builds the peer
-         *  arguments from the user's Megalithic preset / custom URI
-         *  choice and delegates to ``_doOpenChannel``. */
+         *  arguments from the user's choice of catalog recommendation,
+         *  catalog table selection, or custom URI, and delegates to
+         *  ``_doOpenChannel``. */
         async onboardingOpenChannel() {
             this.onboardingError = '';
             const sats = Number(this.onboardingAmountSats) || 0;
@@ -6826,14 +7515,33 @@ document.addEventListener('alpine:init', () => {
             }
             let pubkey;
             let host;
-            if (this.onboardingPeerChoice === 'megalithic') {
-                const node = this._megalithicNodeFor(sats);
-                if (!node) {
-                    this.onboardingError = 'Amount is below Megalithic’s minimum.';
+            const mode = this.onboardingPeerChoiceMode;
+            if (mode === 'recommended_default') {
+                const peer = this.onboardingRecommendedPeer;
+                if (!peer) {
+                    this.onboardingError = this.onboardingAmountTooSmallReason
+                        || 'No verified peer accepts this amount. Try increasing it or pick "A different node".';
                     return;
                 }
-                pubkey = node.pubkey;
-                host = node.host;
+                pubkey = peer.node_id_hex;
+                host = peer.address;
+            } else if (mode === 'pick_from_list') {
+                if (!this.onboardingPickedPubkey) {
+                    this.onboardingError = 'Pick a peer from the catalog first.';
+                    return;
+                }
+                const peer = this._lookupCatalogPeer(this.onboardingPickedPubkey);
+                if (!peer) {
+                    this.onboardingError = 'The chosen peer is no longer in the catalog. Pick another or use "A different node".';
+                    return;
+                }
+                if ((peer.min_channel_size_sats || 0) > sats) {
+                    this.onboardingError = peer.alias + ' needs at least '
+                        + this.formatSats(peer.min_channel_size_sats) + ' sats.';
+                    return;
+                }
+                pubkey = peer.node_id_hex;
+                host = peer.address;
             } else {
                 const parsed = this._parsePubkeyOrUri(this.onboardingCustomUri);
                 if (!parsed) {

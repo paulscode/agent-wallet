@@ -148,81 +148,6 @@ class TestOnboardingStep:
         assert onboarding_step(_totals(**{field: 0})) == "welcome"
 
 
-# ── Megalithic routing parity ────────────────────────────────────────
-#
-# Mirrors ``_megalithicNodeFor()`` in
-# ``app/dashboard/static/dashboard.js``. The user specified the exact
-# thresholds (150k floor, 1M switch) and the exact pubkeys that go
-# with each tier. Keeping a parity test makes the routing decision
-# explicit and prevents an accidental swap of the two nodes — a
-# subtle regression that would silently route small channels to the
-# main node (rejected) or vice versa.
-
-
-MEGALITHIC_MAIN = {
-    "pubkey": "0322d0e43b3d92d30ed187f4e101a9a9605c3ee5fc9721e6dac3ce3d7732fbb13e",
-    "host": "164.92.106.32:9735",
-    "min_sats": 1_000_000,
-    "label": "Megalithic (main node)",
-}
-MEGALITHIC_SMALL = {
-    "pubkey": "02a98c86ef366ce226aad6e7706959456e1701058915c3cbf527b37da143bb1441",
-    "host": "146.190.169.210:9735",
-    "min_sats": 150_000,
-    "label": "Megalithic (small-channel node)",
-}
-
-
-def megalithic_node_for(sats):
-    """Python mirror of ``_megalithicNodeFor`` in dashboard.js."""
-    n = int(sats) if sats else 0
-    if n >= MEGALITHIC_MAIN["min_sats"]:
-        return MEGALITHIC_MAIN
-    if n >= MEGALITHIC_SMALL["min_sats"]:
-        return MEGALITHIC_SMALL
-    return None
-
-
-class TestMegalithicRouting:
-    def test_below_floor_returns_none(self):
-        assert megalithic_node_for(0) is None
-        assert megalithic_node_for(149_999) is None
-        assert megalithic_node_for(1) is None
-
-    def test_exact_small_floor_routes_to_small(self):
-        # 150,000 is the documented minimum — it MUST land on the
-        # small-channel node, not return None.
-        node = megalithic_node_for(150_000)
-        assert node is not None
-        assert node["pubkey"] == MEGALITHIC_SMALL["pubkey"]
-
-    def test_mid_range_routes_to_small(self):
-        node = megalithic_node_for(500_000)
-        assert node["pubkey"] == MEGALITHIC_SMALL["pubkey"]
-
-    def test_just_below_main_floor_routes_to_small(self):
-        node = megalithic_node_for(999_999)
-        assert node["pubkey"] == MEGALITHIC_SMALL["pubkey"]
-
-    def test_exact_main_floor_routes_to_main(self):
-        # 1,000,000 is the documented switch point — it MUST land on
-        # the main node, not the small one.
-        node = megalithic_node_for(1_000_000)
-        assert node["pubkey"] == MEGALITHIC_MAIN["pubkey"]
-
-    def test_large_amount_routes_to_main(self):
-        node = megalithic_node_for(10_000_000)
-        assert node["pubkey"] == MEGALITHIC_MAIN["pubkey"]
-
-    def test_pubkeys_match_user_specified_values(self):
-        # Belt-and-braces: catch any accidental edit to the wrong node
-        # ID. The user provided these exact strings in the spec.
-        assert MEGALITHIC_MAIN["pubkey"] == "0322d0e43b3d92d30ed187f4e101a9a9605c3ee5fc9721e6dac3ce3d7732fbb13e"
-        assert MEGALITHIC_SMALL["pubkey"] == "02a98c86ef366ce226aad6e7706959456e1701058915c3cbf527b37da143bb1441"
-        assert MEGALITHIC_MAIN["host"] == "164.92.106.32:9735"
-        assert MEGALITHIC_SMALL["host"] == "146.190.169.210:9735"
-
-
 # ─────────────────────────────────────────────────────────────────────
 #  Parity for the remaining wizard getters.
 #
@@ -344,15 +269,20 @@ def onboarding_pending_capacity(pending_channels):
 
 
 def onboarding_pending_peer_label(pending_channels):
-    """Mirror of ``onboardingPendingPeerLabel`` getter."""
+    """Mirror of the ``onboardingPendingPeerLabel`` getter's
+    catalog-miss fallback chain.
+
+    The live JS getter consults the small-channel catalog first to
+    return the peer's alias; that branch needs a JSON catalog at
+    hand, so this mirror only covers the no-catalog-hit branches:
+    truncated pubkey when one is present, ``"your chosen node"``
+    when not. The catalog-hit branch is covered end-to-end by
+    :mod:`tests.integration.test_dashboard_onboarding`.
+    """
     ch = onboarding_pending_channel(pending_channels)
     if not ch:
         return ""
     pk = (ch.get("remote_node_pub") or "").lower()
-    if pk == MEGALITHIC_MAIN["pubkey"]:
-        return "Megalithic"
-    if pk == MEGALITHIC_SMALL["pubkey"]:
-        return "Megalithic"
     if pk:
         return pk[:10] + "…" + pk[-4:]
     return "your chosen node"
@@ -368,29 +298,6 @@ def onboarding_suggested_amount(summary):
         int(onchain * _ONBOARDING_SAFETY_BUFFER_PCT),  # Math.floor
     )
     return max(0, onchain - buffer)
-
-
-def onboarding_peer_error(amount_sats, peer_choice):
-    """Mirror of ``onboardingPeerError`` getter."""
-    sats = int(amount_sats or 0)
-    if peer_choice != "megalithic":
-        return None
-    if 0 < sats < MEGALITHIC_SMALL["min_sats"]:
-        formatted = f"{MEGALITHIC_SMALL['min_sats']:,}"
-        return f'Megalithic requires at least {formatted} sats. Increase the amount or pick "A different node".'
-    return None
-
-
-def onboarding_can_open(amount_sats, summary, peer_choice, custom_uri):
-    """Mirror of ``onboardingCanOpen`` getter."""
-    sats = int(amount_sats or 0)
-    if sats <= 0:
-        return False
-    if onboarding_onchain_sats(summary) < sats:
-        return False
-    if peer_choice == "megalithic":
-        return megalithic_node_for(sats) is not None
-    return parse_pubkey_or_uri(custom_uri) is not None
 
 
 # Convenience fixtures used by multiple test classes below.
@@ -615,14 +522,6 @@ class TestPendingChannelExtraction:
         # mirror coerces with ``int()``.
         assert onboarding_pending_capacity([_pending_open(capacity="500000")]) == 500_000
 
-    def test_peer_label_recognises_megalithic_main(self):
-        result = onboarding_pending_peer_label([_pending_open(remote_node_pub=MEGALITHIC_MAIN["pubkey"].upper())])
-        assert result == "Megalithic"
-
-    def test_peer_label_recognises_megalithic_small(self):
-        result = onboarding_pending_peer_label([_pending_open(remote_node_pub=MEGALITHIC_SMALL["pubkey"])])
-        assert result == "Megalithic"
-
     def test_peer_label_truncates_unknown_pubkey(self):
         # 66-char pubkey → first 10 chars + ellipsis + last 4.
         pk = "1234567890" + ("a" * 52) + "abcd"
@@ -663,74 +562,9 @@ class TestProgressStyle:
         assert onboarding_progress_style(10) == "width: 100%"
 
 
-class TestPeerError:
-    """The minimum-amount warning shown beneath the Megalithic radio."""
-
-    def test_no_error_for_custom_choice(self):
-        # The error is Megalithic-specific (the custom path lets the
-        # user pick a node with its own minimum).
-        assert onboarding_peer_error(1_000, "custom") is None
-
-    def test_no_error_when_amount_above_floor(self):
-        assert onboarding_peer_error(150_000, "megalithic") is None
-        assert onboarding_peer_error(2_000_000, "megalithic") is None
-
-    def test_no_error_when_amount_zero(self):
-        # Empty input shouldn't yell at the user — they haven't
-        # finished typing yet.
-        assert onboarding_peer_error(0, "megalithic") is None
-
-    def test_error_for_below_minimum(self):
-        msg = onboarding_peer_error(100_000, "megalithic")
-        assert msg is not None
-        # The user-visible number must be formatted with thousand
-        # separators (toLocaleString in JS → ``f"{:,}"`` in Python).
-        assert "150,000" in msg
-        # The remediation copy is part of the contract — changing it
-        # casually would change what users see in production.
-        assert "A different node" in msg
-
-
-class TestCanOpen:
-    """Submit-button gate for the open-channel form."""
-
-    _SUMMARY = {"totals": {"onchain_sats": 500_000}}
-
-    def test_zero_amount_disabled(self):
-        assert onboarding_can_open(0, self._SUMMARY, "megalithic", "") is False
-        assert onboarding_can_open(None, self._SUMMARY, "megalithic", "") is False
-
-    def test_amount_exceeds_balance_disabled(self):
-        # Channel amount must be at most the available on-chain
-        # balance (fees + reserve are slack the wizard suggests, but
-        # the user can override; we still block overdraft).
-        assert onboarding_can_open(1_000_000, self._SUMMARY, "megalithic", "") is False
-
-    def test_megalithic_below_minimum_disabled(self):
-        # 100k is below the 150k Megalithic floor even though it's
-        # within the on-chain balance.
-        assert onboarding_can_open(100_000, self._SUMMARY, "megalithic", "") is False
-
-    def test_megalithic_above_minimum_enabled(self):
-        assert onboarding_can_open(200_000, self._SUMMARY, "megalithic", "") is True
-
-    def test_custom_with_invalid_uri_disabled(self):
-        assert onboarding_can_open(200_000, self._SUMMARY, "custom", "") is False
-        assert onboarding_can_open(200_000, self._SUMMARY, "custom", "not a uri") is False
-
-    def test_custom_with_valid_uri_enabled(self):
-        assert onboarding_can_open(200_000, self._SUMMARY, "custom", _VALID_URI) is True
-
-    def test_custom_with_bare_pubkey_enabled(self):
-        # Bare pubkey (no @host) is acceptable to the parser. The
-        # wizard's submit handler enforces host:port separately, so
-        # canOpen returns true here — the failure surfaces at submit.
-        assert onboarding_can_open(200_000, self._SUMMARY, "custom", _VALID_PUBKEY) is True
-
-
 class TestParsePubkeyOrUri:
-    """Existing helper, exercised here because ``onboarding_can_open``
-    delegates to it for the custom-node branch."""
+    """``parse_pubkey_or_uri`` is the gate the wizard's "A different
+    node" mode uses to decide whether the submit button enables."""
 
     def test_empty(self):
         assert parse_pubkey_or_uri("") is None
