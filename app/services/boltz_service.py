@@ -866,8 +866,17 @@ class BoltzSwapService:
             "invoiceAmount": invoice_amount_sats,
             "claimAddress": destination_address,
         }
-        if pair_info.get("hash"):
-            swap_request["pairHash"] = pair_info["hash"]
+        # NOTE: ``pairHash`` is intentionally omitted — same rationale as the
+        # submarine path (see ``create_submarine_swap``). Boltz treats
+        # ``pairHash`` as an opt-in freshness assertion; if the echoed hash
+        # doesn't match Boltz's current reverse-pair config the request is
+        # rejected with "invalid pair hash". The pair info is cached for 60s
+        # on our side and Boltz rotates its fee/limit config frequently, so
+        # any cache-vs-live (or even fetch-vs-create) drift turned a
+        # legitimate withdrawal/Braiins-deposit into a hard failure with no
+        # recovery. Omitting ``pairHash`` makes Boltz price the swap at
+        # current rates. Safety is unaffected: the returned hold-invoice is
+        # still bound to OUR preimage hash and amount below before we pay it.
 
         data, error = await self._request(
             "POST",
