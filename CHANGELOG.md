@@ -71,11 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Braiins deposit fee breakdown
 
-- **Clarified the "Lightning routing headroom" line with an info tooltip.**
-  This figure is a safety reserve (capped at 3%), not a fee that is paid out —
-  the actual routing fee is typically a small fraction of it and any unused
-  amount stays in the wallet's Lightning balance. An info icon now explains
-  this so the reserved amount isn't mistaken for a charge.
+- **Clarified the "Lightning routing headroom" line with a click-to-open info
+  popover.** This figure is a safety reserve (capped at 3%), not a fee that is
+  paid out — the actual routing fee is typically a small fraction of it and any
+  unused amount stays in the wallet's Lightning balance. A tappable info icon
+  (matching the wizard's other glossary popovers) now explains this so the
+  reserved amount isn't mistaken for a charge.
 
 ## [0.1.1] - 2026-06-28
 

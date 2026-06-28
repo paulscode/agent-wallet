@@ -131,6 +131,10 @@ const BRAIINS_DEPOSIT_GLOSSARY = {
         title: 'Channel reserve',
         body: 'Every Lightning channel keeps ~1% of its size unspendable on each side (a Lightning safety rule). On a channel-open deposit that ~1% stays in the new channel rather than reaching Braiins — but it becomes receive (inbound) capacity you keep, and is recoverable later by closing the channel.',
     },
+    'routing-headroom': {
+        title: 'Lightning routing headroom',
+        body: 'A safety reserve for the Lightning leg — capped at 3% — not a fee you pay. The actual routing fee is usually a small fraction of this (often well under 0.5%). It is reserved so the payment has enough fee budget to find a route and won\'t fail; whatever isn\'t used stays in your wallet\'s Lightning balance. It is not paid to the wallet operator or to Braiins.',
+    },
     'btc-tx-prepared': {
         title: 'Bitcoin transaction prepared',
         body: 'Boltz Exchange has produced a Bitcoin transaction that pays the sats you converted into your wallet. The transaction has been broadcast to the network and is waiting to be confirmed by miners.',

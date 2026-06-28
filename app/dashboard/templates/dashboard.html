@@ -8763,8 +8763,22 @@
                                     <span class="font-mono text-gray-300"><span x-text="formatSats(braiinsDepositBoltzServiceFeeSats)"></span> sats</span>
                                 </div>
                                 <div class="flex items-center justify-between text-[11px]">
-                                    <span class="text-gray-500">Lightning routing headroom
-                                        <span class="cursor-help text-gray-500/70" title="A safety reserve for the Lightning leg — capped at 3% — not a fee you pay. The actual routing fee is usually a small fraction of this (often well under 0.5%). It is reserved so the payment has enough fee budget to find a route and won't fail; whatever isn't used stays in your wallet's Lightning balance. It is not paid to the wallet operator or to Braiins.">&#9432;</span>
+                                    <span class="inline-flex items-center gap-1 relative text-gray-500">
+                                        Lightning routing headroom
+                                        <button type="button"
+                                                class="text-gray-500 hover:text-emerald-400 focus:text-emerald-400 focus:outline-none"
+                                                x-on:click.stop="braiinsDepositToggleInfoTip('routing-headroom')"
+                                                aria-label="What is the Lightning routing headroom?">
+                                            <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                            </svg>
+                                        </button>
+                                        <div x-show="braiinsDepositInfoTipOpen === 'routing-headroom'" x-cloak
+                                             x-on:click.stop="braiinsDepositInfoTipOpen"
+                                             class="absolute bottom-full left-0 mb-2 w-64 z-30 p-3 rounded-lg bg-navy-700 border border-navy-500 shadow-xl text-xs text-gray-200 leading-relaxed normal-case">
+                                            <p class="font-semibold text-white mb-1" x-text="braiinsDepositGlossaryTitle('routing-headroom')"></p>
+                                            <p x-text="braiinsDepositGlossaryBody('routing-headroom')"></p>
+                                        </div>
                                     </span>
                                     <span class="font-mono text-gray-300"><span x-text="formatSats(braiinsDepositRoutingFeeSats)"></span> sats</span>
                                 </div>
