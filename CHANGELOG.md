@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-06-28
+
+### Fixed
+
+- **Reverse swaps no longer fail with Boltz "invalid pair hash".** Reverse
+  swap creation echoed a `pairHash` back to Boltz; Boltz rejects the request
+  (HTTP 400 "invalid pair hash") whenever that hash doesn't match its current
+  reverse-pair config, which rotates frequently — so any drift between
+  fetching the pair info and creating the swap turned a legitimate swap into a
+  hard failure. The submarine-swap path already omitted `pairHash` for this
+  exact reason; the reverse path now does the same and lets Boltz price at
+  current rates. This had been breaking cold-storage Lightning withdrawals,
+  the dashboard's "Open Inbound → To my wallet" flow, channel-mix rebalances,
+  and Braiins on-chain deposits funded by opening a channel. Safety is
+  unchanged: the returned hold-invoice is still bound to our preimage hash and
+  amount before it is paid.
+
+### Changed
+
+#### Braiins deposit channel-open peer selection
+
+- **Small channels now try the small-channel catalog, cheapest first, with
+  automatic fallback.** When a Braiins on-chain deposit opens a channel to
+  fund the swap, the small band previously used a single hardcoded preset.
+  It now attempts the vetted small-channel **catalog** peers ordered most
+  economic first (by fee-rate ppm, then base fee, with routing health as a
+  tiebreaker; marginal-routing peers are excluded from the auto-list). If a
+  peer can't be reached or rejects the open — before any funding transaction
+  is broadcast — the deposit falls back to the next candidate, and so on. The
+  operator-configured preset (Megalithic small-channel node) remains the final
+  fallback, so non-mainnet and catalog-disabled deployments are unchanged.
+- **Large channels are unchanged** — capacities at or above the proper node's
+  minimum still open to the operator-configured main node (Megalithic).
+
 ## [0.1.1] - 2026-06-28
 
 ### Added
