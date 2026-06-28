@@ -485,13 +485,13 @@ class TestPeersAcceptingAmountContract:
 
     def test_150k_sat_amount_returns_full_catalog(self) -> None:
         # Every bundled peer's floor is 150k sats — at exactly that
-        # amount, all 15 peers must be eligible. The JS picker pivots
-        # on this: the "Pick from list" mode renders one row per
+        # amount, every catalog peer must be eligible. The JS picker
+        # pivots on this: the "Pick from list" mode renders one row per
         # eligible peer.
-        from app.services.small_channel_peers import for_amount
+        from app.services.small_channel_peers import all_peers, for_amount
 
         peers = for_amount(150_000, network="bitcoin")
-        assert len(peers) == 15
+        assert len(peers) == len(all_peers(network="bitcoin"))
 
     def test_below_smallest_floor_returns_empty(self) -> None:
         # 100k sats is below every bundled peer's floor — the picker

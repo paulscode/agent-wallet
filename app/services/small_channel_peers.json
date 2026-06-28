@@ -224,7 +224,34 @@
       "caveats": []
     },
     {
-      "alias": "Large routing operator (hex alias)",
+      "alias": "Large routing operator A (hex alias)",
+      "node_id_hex": "02a98e8c590a1b5602049d6b21d8f4c8861970aa310762f42eae1b2be88372e924",
+      "address": "54.201.244.204:10016",
+      "tor_address": null,
+      "network": "bitcoin",
+      "min_channel_size_sats": 150000,
+      "channels_count": 214,
+      "capacity_btc": 90.77,
+      "top_20_hub_connections": 15,
+      "outbound_enabled_ratio": null,
+      "typical": {
+        "fee_base_msat": 0,
+        "fee_rate_milli_msat": 500,
+        "min_htlc_msat": 1000,
+        "time_lock_delta": 80,
+        "max_htlc_msat": 5940000000
+      },
+      "fee_tier": "low",
+      "connectivity_tier": "adequate",
+      "location": "AWS us-west-2 (non-standard port)",
+      "tags": [],
+      "summary": "Big-capacity routing operator (~91 BTC) with a uniform 0+500 ppm policy on every channel. Sibling of \"Large routing operator B\" (same operator class, same fee fingerprint, adjacent ports). For most users either entry works equally well; the size + uniform policy suggest a serious, professionally-managed operation.",
+      "verified_at": "2026-06-26",
+      "funding_txid": "5b509eeaf66bbd695aabfaa30bcfdf0cec28f7753dac56e6701e77854b376ba5",
+      "caveats": []
+    },
+    {
+      "alias": "Large routing operator B (hex alias)",
       "node_id_hex": "039174f846626c6053ba80f5443d0db33da384f1dde135bf7080ba1eec465019c3",
       "address": "34.219.38.168:10015",
       "tor_address": null,
@@ -245,7 +272,7 @@
       "connectivity_tier": "adequate",
       "location": "AWS us-west-2 (non-standard port)",
       "tags": [],
-      "summary": "Big-capacity routing operator (97 BTC) with a uniform 0+500 ppm policy on every channel. ~25× the per-sat fee of Babylon-4a, but the size + uniform policy suggest a serious, professionally-managed operation.",
+      "summary": "Big-capacity routing operator (97 BTC) with a uniform 0+500 ppm policy on every channel. Sibling of \"Large routing operator A\" (same operator class, same fee fingerprint, adjacent ports). For most users either entry works equally well; ~25× the per-sat fee of Babylon-4a, but the size + uniform policy suggest a serious, professionally-managed operation.",
       "verified_at": "2026-06-26",
       "funding_txid": "4f0b59cbcc1121f73dfb009c13877f2a56b723e011451bcbcc27290cdc62a70e",
       "caveats": []

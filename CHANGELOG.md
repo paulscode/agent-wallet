@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Small-channel peer discovery
 - Public guide [`docs/small-channel-peers.md`](docs/small-channel-peers.md):
-  a vetted list of 15 Lightning routing peers confirmed (by empirical
+  a vetted list of 16 Lightning routing peers confirmed (by empirical
   channel open) to accept ~150,000 sat opens. For each peer: pubkey,
   socket, channel count, capacity, fee structure (median + min/max
   base/ppm), outbound-enable ratio, `min_htlc` / `time_lock_delta` /

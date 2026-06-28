@@ -32,7 +32,7 @@ channel opens below 400,000 - 1,000,000 sats. That's a real barrier for:
 - **Existing operators** building out peer diversity (geographic, AS,
   software) with a smaller-than-headline-capacity budget.
 
-The 15 peers documented here all accepted a 150k sat open. Most are
+The 16 peers documented here all accepted a 150k sat open. Most are
 mid-sized routing nodes that **actively maintain channels with popular
 large hubs**, so a channel with one of them gives you incoming-routing
 access into the broader network without requiring you to open directly

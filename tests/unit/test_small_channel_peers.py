@@ -320,7 +320,7 @@ class TestRecommendedOverride:
         assert scp_module.recommended_defaults(network="bitcoin") == ()
         # Sanity: the rest of the catalog is still loaded (the override
         # only affects the ⭐ tag).
-        assert len(scp_module.all_peers(network="bitcoin")) == 15
+        assert len(scp_module.all_peers(network="bitcoin")) == 16
 
 
 class TestOverridesPath:

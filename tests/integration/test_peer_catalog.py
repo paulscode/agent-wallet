@@ -134,7 +134,7 @@ class TestV1Endpoint:
         body = resp.json()
         assert body["enabled"] is True
         assert body["network"] == "bitcoin"
-        assert len(body["peers"]) == 15
+        assert len(body["peers"]) == 16
         assert body["snapshot_date"]
 
     @pytest.mark.asyncio
@@ -219,7 +219,7 @@ class TestDashboardWrapper:
         assert set(body) == {"enabled", "snapshot_date", "network", "peers"}
         assert body["enabled"] is True
         assert body["network"] == "bitcoin"
-        assert len(body["peers"]) == 15
+        assert len(body["peers"]) == 16
 
     @pytest.mark.asyncio
     async def test_rejects_request_without_session(self, dashboard_app_client):

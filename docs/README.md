@@ -19,4 +19,4 @@ for an overview, and see the [DISCLAIMER](../DISCLAIMER.md) before use.
 | [lnurl.md](lnurl.md) | LNURL-pay and Lightning Address send flow (dashboard-only) |
 | [operator_tor_runbook.md](operator_tor_runbook.md) | Operating the bundled Tor SOCKS5 proxy: monitoring, data-directory growth, and troubleshooting |
 | [secret_key_backup.md](secret_key_backup.md) | Backing up and protecting `SECRET_KEY` and related at-rest encryption material |
-| [small-channel-peers.md](small-channel-peers.md) | Vetted list of 15 Lightning peers confirmed to accept ~150k sat channel opens (with fees, connectivity, and capacity data) |
+| [small-channel-peers.md](small-channel-peers.md) | Vetted list of 16 Lightning peers confirmed to accept ~150k sat channel opens (with fees, connectivity, and capacity data) |
