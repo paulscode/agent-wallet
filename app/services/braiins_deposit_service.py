@@ -668,8 +668,20 @@ class BraiinsDepositService:
                         0,
                         channel_capacity_sats - invoice_amount_sats - channel_reserve_sats,
                     )
-                    channel_peer_pubkey = peer.pubkey
-                    channel_peer_label = peer.label
+                    # Display the peer we'll actually try FIRST: the small
+                    # band attempts the cheapest small-channel-catalog peer
+                    # (then falls back through the list at open time), while
+                    # the large band stays on the proper node. Sizing above
+                    # is unchanged (keyed off the configured presets), so this
+                    # only changes the quoted peer label/pubkey shown to the
+                    # user. Falls back to the sizing peer if the catalog is
+                    # empty (non-mainnet / kill-switch).
+                    _open_cands = _peers.channel_open_candidates(
+                        channel_capacity_sats, network=settings.bitcoin_network
+                    )
+                    _display_peer = _open_cands[0] if _open_cands else peer
+                    channel_peer_pubkey = _display_peer.pubkey
+                    channel_peer_label = _display_peer.label
                     channel_eligible = True
                     # The channel funds the LN leg, so no LN balance is
                     # required; the on-chain spend / intake becomes the
@@ -2305,18 +2317,16 @@ class BraiinsDepositService:
                 f"spend limit of {dash_limit:,} sats."
             )
 
-        peer = _peers.select_peer_for_capacity(capacity)
-        if peer is None:
+        # Ordered channel-open candidates. The large band is the single
+        # proper node (Megalithic main); the small band is the small-channel
+        # catalog peers cheapest-first, then the configured small preset as a
+        # fallback. We try each in turn until one channel opens.
+        candidates = _peers.channel_open_candidates(capacity, network=settings.bitcoin_network)
+        if not candidates:
             raise BraiinsDepositError("No channel peer accepts a channel this size")
 
-        # Connect to the peer. A failure here is TRANSIENT (peer briefly
-        # offline) — raise a plain Exception so the advance() wrapper
-        # records it and retries next tick rather than hard-failing.
-        _conn, conn_err = await self._lnd.connect_peer(peer.pubkey, peer.host)
-        if conn_err:
-            raise RuntimeError(f"Could not connect to channel peer {peer.label}: {conn_err}")
-
-        # Funding-tx fee rate (channel fee priority).
+        # Funding-tx fee rate (channel fee priority). Peer-independent, so
+        # compute it once before iterating candidates.
         priority = settings.braiins_deposit_channel_fee_priority
         sat_per_vbyte = _FALLBACK_FEE_VBYTES.get(priority, 6)
         try:
@@ -2333,18 +2343,47 @@ class BraiinsDepositService:
             if isinstance(v, (int, float)) and v > 0:
                 sat_per_vbyte = max(1, int(v))
 
-        open_result, open_err = await self._lnd.open_channel(
-            peer.pubkey,
-            capacity,
-            sat_per_vbyte=sat_per_vbyte,
-            private=False,
-        )
-        if open_err or not open_result or not open_result.get("funding_txid"):
-            # Error before/at broadcast → no channel exists; hard-fail
-            # cleanly (funds untouched for self-OC).
-            raise BraiinsDepositError(f"Could not open channel: {open_err or 'no funding_txid'}")
+        # Attempt each candidate, cheapest first. A connect failure is
+        # TRANSIENT (peer briefly offline) → move to the next candidate. An
+        # open failure happens BEFORE the funding tx is broadcast (no funds
+        # moved) → also move on. The first channel that opens wins, and we
+        # commit immediately so the broadcast guard at the top of this method
+        # short-circuits any later tick (no double funding).
+        connect_errors: list[str] = []
+        open_errors: list[str] = []
+        opened_peer: Optional[_peers.ChannelPeer] = None
+        open_result: Optional[dict] = None
+        for peer in candidates:
+            _conn, conn_err = await self._lnd.connect_peer(peer.pubkey, peer.host)
+            if conn_err:
+                connect_errors.append(f"{peer.label}: {conn_err}")
+                continue
+            result, open_err = await self._lnd.open_channel(
+                peer.pubkey,
+                capacity,
+                sat_per_vbyte=sat_per_vbyte,
+                private=False,
+            )
+            if open_err or not result or not result.get("funding_txid"):
+                open_errors.append(f"{peer.label}: {open_err or 'no funding_txid'}")
+                continue
+            opened_peer = peer
+            open_result = result
+            break
 
-        session.channel_peer_pubkey = peer.pubkey
+        if opened_peer is None or open_result is None:
+            # No channel opened and no funds moved. If at least one peer was
+            # reachable but rejected the open, that's a hard failure (the
+            # parameters won't work anywhere). If NONE were reachable (all
+            # connects failed), it's transient — raise a plain Exception so
+            # advance() retries next tick rather than hard-failing.
+            if open_errors:
+                raise BraiinsDepositError(
+                    "Could not open channel with any peer: " + "; ".join(open_errors + connect_errors)
+                )
+            raise RuntimeError("Could not connect to any channel peer: " + "; ".join(connect_errors))
+
+        session.channel_peer_pubkey = opened_peer.pubkey
         session.channel_open_txid = open_result["funding_txid"]
         session.channel_open_output_index = int(open_result.get("output_index", 0))
         session.channel_capacity_sats = capacity
@@ -2352,7 +2391,7 @@ class BraiinsDepositService:
         session.record_transition(
             BraiinsDepositStatus.OPENING_CHANNEL,
             detail=(
-                f"peer={peer.label} "
+                f"peer={opened_peer.label} "
                 f"channel_point={session.channel_open_txid}:"
                 f"{session.channel_open_output_index} capacity={capacity}"
             ),
@@ -2363,7 +2402,8 @@ class BraiinsDepositService:
             action="braiins_deposit_session_opening_channel",
             session=session,
             details={
-                "channel_peer_pubkey": peer.pubkey,
+                "channel_peer_pubkey": opened_peer.pubkey,
+                "channel_peer_label": opened_peer.label,
                 "channel_open_txid": session.channel_open_txid,
                 "channel_capacity_sats": capacity,
             },

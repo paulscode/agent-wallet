@@ -6316,6 +6316,80 @@ class TestChannelStateMachine:
         svc._mocks["lnd"].open_channel.assert_awaited_once()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
+    async def test_small_channel_open_falls_back_to_next_peer(self, db_session, monkeypatch):
+        """Small band: the cheapest candidate's open is rejected (before any
+        broadcast), so the service moves on and opens with the next peer.
+        No funds move on the failed attempt."""
+        _enable_channel(monkeypatch)
+        # Mainnet so the small-channel catalog is populated (it is
+        # mainnet-only); otherwise the only candidate is the small preset.
+        monkeypatch.setattr("app.core.config.settings.bitcoin_network", "bitcoin")
+        svc = _make_service()
+        # First candidate's open is rejected; the second succeeds.
+        svc._mocks["lnd"].open_channel.side_effect = [  # type: ignore[attr-defined]
+            (None, "peer rejected channel size"),
+            ({"funding_txid": "cc" * 32, "output_index": 0}, None),
+        ]
+        session, _ = await svc.create_session(
+            db_session,
+            api_key_id=uuid4(),
+            amount_sats=200_000,  # small band (< proper-node 1,000,000 min)
+            destination_address="bc1q" + "x" * 38,
+            source_kind="onchain",
+            funding_strategy="channel",
+        )
+        result = await svc.advance(db_session, session.id)
+        assert result is not None
+        assert result.status == BraiinsDepositStatus.OPENING_CHANNEL
+        assert result.channel_open_txid == "cc" * 32
+        assert result.channel_peer_pubkey
+        assert svc._mocks["lnd"].open_channel.await_count == 2  # type: ignore[attr-defined]
+        assert svc._mocks["lnd"].connect_peer.await_count == 2  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    async def test_channel_open_all_peers_reject_fails_hard(self, db_session, monkeypatch):
+        """When every reachable candidate rejects the open, the session
+        hard-fails (no peer can take the channel)."""
+        _enable_channel(monkeypatch)
+        monkeypatch.setattr("app.core.config.settings.bitcoin_network", "bitcoin")
+        svc = _make_service()
+        svc._mocks["lnd"].open_channel.side_effect = lambda *a, **k: (None, "peer rejected")  # type: ignore[attr-defined]
+        session, _ = await svc.create_session(
+            db_session,
+            api_key_id=uuid4(),
+            amount_sats=200_000,
+            destination_address="bc1q" + "x" * 38,
+            source_kind="onchain",
+            funding_strategy="channel",
+        )
+        result = await svc.advance(db_session, session.id)
+        assert result is not None
+        assert result.status == BraiinsDepositStatus.FAILED
+        assert not result.channel_open_txid
+
+    @pytest.mark.asyncio
+    async def test_channel_open_all_connects_fail_is_transient(self, db_session, monkeypatch):
+        """When no candidate is reachable (all connects fail), the session
+        stays CREATED (transient — retried next tick) and never broadcasts."""
+        _enable_channel(monkeypatch)
+        monkeypatch.setattr("app.core.config.settings.bitcoin_network", "bitcoin")
+        svc = _make_service()
+        svc._mocks["lnd"].connect_peer.side_effect = lambda *a, **k: (None, "peer offline")  # type: ignore[attr-defined]
+        session, _ = await svc.create_session(
+            db_session,
+            api_key_id=uuid4(),
+            amount_sats=200_000,
+            destination_address="bc1q" + "x" * 38,
+            source_kind="onchain",
+            funding_strategy="channel",
+        )
+        result = await svc.advance(db_session, session.id)
+        assert result is not None
+        assert result.status == BraiinsDepositStatus.CREATED
+        assert not result.channel_open_txid
+        svc._mocks["lnd"].open_channel.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_channel_capacity_over_dashboard_limit_fails(self, db_session, monkeypatch):
         """a configured dashboard spend limit applies to the sized-up
         channel CAPACITY, not just the bin. A capacity above the limit

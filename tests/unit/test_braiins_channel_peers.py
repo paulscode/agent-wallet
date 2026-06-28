@@ -80,3 +80,55 @@ class TestCapacitySizing:
         assert cap5 > cap0
 
 
+
+
+class TestChannelOpenCandidates:
+    """Ordered channel-open candidates: large band → proper node only;
+    small band → cheapest catalog peers first, then the small preset."""
+
+    def test_large_band_uses_proper_node_only(self):
+        cands = peers.channel_open_candidates(1_500_000, network="bitcoin")
+        assert [c.key for c in cands] == ["main"]
+        assert "main node" in cands[0].label
+
+    def test_small_band_catalog_cheapest_first_then_preset_fallback(self):
+        from app.services import small_channel_peers as catalog
+
+        cands = peers.channel_open_candidates(210_000, network="bitcoin")
+        # All but the last are catalog peers; the last is the small preset.
+        assert len(cands) >= 2
+        assert all(c.key == "catalog" for c in cands[:-1])
+        assert cands[-1].key == "small"
+
+        all_cat = catalog.all_peers(network="bitcoin")
+        # Marginal-routing peers are excluded from the auto-fallback list.
+        marginal = {
+            p.node_id_hex.lower()
+            for p in all_cat
+            if any(cav.kind == "marginal_routing" for cav in p.caveats)
+        }
+        assert marginal.isdisjoint({c.pubkey.lower() for c in cands})
+
+        # Catalog candidates are ordered by (ppm, base fee) ascending.
+        lut = {p.node_id_hex.lower(): p for p in all_cat}
+        fees = [
+            (lut[c.pubkey.lower()].typical.fee_rate_milli_msat, lut[c.pubkey.lower()].typical.fee_base_msat)
+            for c in cands
+            if c.key == "catalog"
+        ]
+        assert fees == sorted(fees)
+
+    def test_small_band_falls_back_to_preset_when_catalog_disabled(self, monkeypatch):
+        monkeypatch.setattr("app.core.config.settings.small_channel_peer_catalog_enabled", False)
+        cands = peers.channel_open_candidates(210_000, network="bitcoin")
+        assert [c.key for c in cands] == ["small"]
+
+    def test_non_mainnet_has_no_catalog_uses_preset_only(self):
+        cands = peers.channel_open_candidates(210_000, network="testnet")
+        assert [c.key for c in cands] == ["small"]
+
+    def test_empty_when_nothing_configured_and_catalog_off(self, monkeypatch):
+        monkeypatch.setattr("app.core.config.settings.small_channel_peer_catalog_enabled", False)
+        monkeypatch.setattr("app.core.config.settings.braiins_deposit_channel_peer_pubkey", "")
+        monkeypatch.setattr("app.core.config.settings.braiins_deposit_channel_peer_small_pubkey", "")
+        assert peers.channel_open_candidates(210_000, network="bitcoin") == []
