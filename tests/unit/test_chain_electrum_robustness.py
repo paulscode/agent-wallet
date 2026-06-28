@@ -291,6 +291,10 @@ async def test_write_drain_timeout_surfaces_disconnect():
         def close(self) -> None:
             self.closed = True
 
+    # Bind to the current loop so the injected "connected" state isn't
+    # reset by the loop-change guard in ``request()`` (a real live
+    # connection has ``_loop`` set to the loop it was established on).
+    client._loop = asyncio.get_running_loop()
     client._writer = _StallWriter()  # type: ignore[assignment]
     client._connected.set()  # pretend we passed the wait
 
@@ -332,3 +336,28 @@ async def test_teardown_timeout_does_not_block_reconnect(monkeypatch):
         client._teardown_connection(reason="test"),
         timeout=5.0,
     )
+
+
+def test_rebind_loop_if_changed_rebuilds_state_across_loops():
+    """The client is a process-wide singleton, but Celery runs each task
+    on its own throwaway event loop. ``_rebind_loop_if_changed`` must
+    rebuild the loop-bound asyncio state (Events/Locks) when the running
+    loop changes — and be a no-op within a single loop.
+    """
+    client = ElectrumClient("tcp://electrs.test:50001")
+
+    async def snapshot():
+        client._rebind_loop_if_changed()
+        # A second call on the SAME loop must not rebuild anything.
+        before = client._connected
+        client._rebind_loop_if_changed()
+        assert client._connected is before
+        return client._connected, client._write_lock, client._tip_lock, client._loop
+
+    ev1, wl1, tl1, loop1 = asyncio.run(snapshot())
+    ev2, wl2, tl2, loop2 = asyncio.run(snapshot())
+
+    assert loop1 is not loop2  # genuinely different loops
+    assert ev1 is not ev2  # _connected Event rebuilt on the new loop
+    assert wl1 is not wl2  # _write_lock rebuilt
+    assert tl1 is not tl2  # _tip_lock rebuilt

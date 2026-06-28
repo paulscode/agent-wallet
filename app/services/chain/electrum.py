@@ -141,6 +141,13 @@ class ElectrumClient:
         self._handshake_done = asyncio.Event()
         self._stop = False
         self._write_lock = asyncio.Lock()
+        # The event loop this client's asyncio state (Events, Locks,
+        # Futures, supervisor/transport) is bound to. The client is a
+        # process-wide singleton, but Celery runs each task on a fresh,
+        # throwaway loop — reusing loop-bound state across loops raises
+        # "bound to a different event loop". ``_rebind_loop_if_changed``
+        # rebuilds the state on the current loop when this differs.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Subscription state.
         self._scripthash_subs: dict[str, list[Callable[[str, str | None], Awaitable[None]]]] = {}
@@ -164,6 +171,11 @@ class ElectrumClient:
     # ── Public lifecycle ────────────────────────────────────────────
 
     async def start(self, *, wait_for_connect: bool = True) -> None:
+        # Record the loop we're building state on so the connection's own
+        # internal ``request()`` calls (handshake, ping) don't see a loop
+        # change and tear themselves down. ``_rebind_loop_if_changed``
+        # only acts when the running loop actually differs from this.
+        self._rebind_loop_if_changed()
         if self._supervisor_task is not None:
             return
         self._stop = False
@@ -215,6 +227,10 @@ class ElectrumClient:
         timeout: Optional[float] = None,
     ) -> Any:
         """Issue a JSON-RPC request; return the parsed ``result``."""
+        # Rebuild loop-bound state if we're running on a different event
+        # loop than last time (e.g. a fresh Celery per-task loop), so we
+        # never touch an Event/Future bound to a dead loop.
+        self._rebind_loop_if_changed()
         if not self.is_connected:
             # If the supervisor task has died silently (e.g. an
             # unhandled exception during reconnect), respawn it before
@@ -271,6 +287,46 @@ class ElectrumClient:
             return await asyncio.wait_for(fut, timeout=timeout or self._request_timeout_s)
         finally:
             self._pending.pop(rid, None)
+
+    def _rebind_loop_if_changed(self) -> None:
+        """Rebuild loop-bound state when the running loop has changed.
+
+        Must be called from a running loop, before touching any asyncio
+        state. The client is a process-wide singleton; under Celery each
+        task runs on its own throwaway event loop (created then closed
+        per task), so the ``asyncio.Event``/``Lock``/``Future`` objects
+        and the supervisor/transport — all bound to the loop that made
+        them — cannot be reused from another loop ("bound to a different
+        event loop" / "Event loop is closed").
+
+        On a loop change we abandon the old (now-dead-loop) state and
+        recreate a fresh, disconnected state on the current loop. We do
+        NOT cancel the old supervisor/ping tasks: their loop is already
+        closed, so the references are simply dropped. The normal
+        ``request()`` → ``_ensure_supervisor_alive`` → connect path then
+        re-establishes the connection on the current loop.
+
+        On the long-lived main loop (uvicorn) this is a no-op after the
+        first call, so the persistent connection is preserved there.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._loop is loop:
+            return
+        self._loop = loop
+        self._reader = None
+        self._writer = None
+        self._supervisor_task = None
+        self._ping_task = None
+        self._pending = {}
+        self._connected = asyncio.Event()
+        self._handshake_done = asyncio.Event()
+        self._write_lock = asyncio.Lock()
+        self._tip_lock = asyncio.Lock()
+        self._consecutive_failures = 0
+        self._last_failure_sig = None
 
     def _ensure_supervisor_alive(self) -> None:
         """Respawn the supervisor if it died silently.

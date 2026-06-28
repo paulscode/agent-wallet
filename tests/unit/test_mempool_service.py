@@ -15,6 +15,7 @@ auto-applied ``_force_mempool_only`` fixture below pins
 exercise the pure HTTP surface they were authored against.
 """
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -97,6 +98,23 @@ class TestMempoolFeeService:
         assert error == "not found"
         assert _MEMPOOL_BREAKER.consecutive_failures == 0
         assert _MEMPOOL_BREAKER.state == "closed"
+
+    def test_http_client_rebinds_on_loop_change(self):
+        """The singleton's httpx client must be recreated when the running
+        event loop changes (Celery runs each task on its own throwaway
+        loop); reusing a client bound to a closed loop raises 'Event loop
+        is closed'."""
+        from app.services.mempool_fee_service import MempoolFeeService
+
+        svc = MempoolFeeService()
+
+        async def getc():
+            return await svc._get_client()
+
+        c1 = asyncio.run(getc())
+        c2 = asyncio.run(getc())
+        assert c1 is not c2  # recreated on the second (different) loop
+        assert svc._client is c2
 
     @pytest.mark.asyncio
     async def test_get_fee_for_priority_high(self):

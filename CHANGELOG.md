@@ -37,6 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A Mempool **404** (a not-yet-indexed txid) is treated as a clean
     "not found" rather than a backend failure, so a lagging indexer no longer
     trips the circuit breaker and cascades into the fee endpoints.
+- **Chain backends (Electrum + Mempool HTTP) now work from background
+  tasks.** Both are process-wide singletons holding event-loop-bound state
+  (asyncio `Event`/`Lock`/`Future`s for Electrum; the httpx client for
+  Mempool), but Celery runs each task on its own short-lived event loop.
+  Reusing the singletons across loops raised `RuntimeError: <Event> is bound
+  to a different event loop` (Electrum, every call) and `Event loop is closed`
+  (Mempool), which tripped both circuit breakers and made *all* chain reads
+  from periodic tasks fail — the underlying cause of the stuck-confirmation
+  symptom above. The clients now detect a loop change and rebuild their
+  loop-bound state on the current loop (the long-lived web-server loop is
+  unaffected, so its persistent Electrum connection is preserved).
 
 ### Changed
 

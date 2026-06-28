@@ -23,6 +23,7 @@ auto-configured for ``.onion`` and ``.local`` URLs via
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import ssl
@@ -107,6 +108,12 @@ class MempoolHttpBackend:
 
     def __init__(self) -> None:
         self._client: Optional[httpx.AsyncClient] = None
+        # The event loop ``self._client`` was created on. This backend is
+        # a process-wide singleton, but Celery runs each task on its own
+        # throwaway loop; an httpx client bound to a now-closed loop
+        # raises "Event loop is closed" when reused, so we recreate it
+        # when the running loop changes.
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
         self._fee_cache: Optional[dict[str, Any]] = None
         self._fee_cache_time: float = 0
         self._mempool_stats_cache: Optional[dict[str, Any]] = None
@@ -239,8 +246,17 @@ class MempoolHttpBackend:
         return pinned_base, {"Host": host_header}, host
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the persistent HTTP client."""
-        if self._client is None or self._client.is_closed:
+        """Get or create the persistent HTTP client (rebound per loop)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if self._client is None or self._client.is_closed or self._client_loop is not loop:
+            # Recreate on the current loop. A client bound to a closed
+            # loop (Celery's per-task loops) raises "Event loop is closed"
+            # when reused. The stale reference is dropped without awaiting
+            # ``aclose()`` (its loop is gone); its sockets were closed
+            # when that loop shut down.
             self._assert_base_url_routable()
             proxy = self._get_proxy()
             needs_proxy = self._needs_proxy()
@@ -256,6 +272,7 @@ class MempoolHttpBackend:
                 # 30x must not be able to bounce a chain query elsewhere.
                 follow_redirects=False,
             )
+            self._client_loop = loop
         return self._client
 
     async def _client_get(self, client: httpx.AsyncClient, path: str) -> httpx.Response:
