@@ -71,6 +71,14 @@ _MEMPOOL_RETRYABLE_EXC: tuple[type[BaseException], ...] = (
     httpx.ProxyError,
 )
 
+# Sentinel for an HTTP 404. A "not found" is a CLEAN answer from a
+# healthy server (the resource — e.g. a not-yet-indexed txid — simply
+# isn't there), so it must NOT count as a circuit-breaker failure: a
+# string of 404s (an indexer lagging behind a recently-confirmed tx)
+# would otherwise trip the breaker and cascade into the fee endpoints.
+# ``_request`` maps this to a plain ``(None, "not found")`` result.
+_MEMPOOL_NOT_FOUND = object()
+
 
 class _MempoolRetryable5xxError(Exception):
     def __init__(self, status_code: int, body: str) -> None:
@@ -275,13 +283,18 @@ class MempoolHttpBackend:
         The breaker is exposed on ``/v1/status/services``.
         """
 
-        async def _attempt() -> dict[str, Any]:
+        async def _attempt() -> Any:
             client = await self._get_client()
             response = await self._client_get(client, path)
+            if response.status_code == 404:
+                # Clean "not found" — server is healthy. Return a
+                # sentinel so it records as a breaker SUCCESS rather than
+                # raising (which would count against the breaker).
+                return _MEMPOOL_NOT_FOUND
             if 500 <= response.status_code < 600:
                 raise _MempoolRetryable5xxError(response.status_code, response.text)
             response.raise_for_status()
-            return response.json()  # type: ignore[no-any-return]
+            return response.json()
 
         try:
             data = await with_retry(
@@ -292,6 +305,8 @@ class MempoolHttpBackend:
                 op_name=f"mempool GET {path}",
             )
             _MEMPOOL_HEALTH.record_success()
+            if data is _MEMPOOL_NOT_FOUND:
+                return None, "not found"
             return data, None
         except BreakerOpenError as e:
             _MEMPOOL_HEALTH.record_failure(str(e))

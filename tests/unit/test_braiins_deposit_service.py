@@ -1240,6 +1240,51 @@ class TestAdvanceBroadcast:
         assert result.status == BraiinsDepositStatus.BROADCAST
         assert result.send_confirmations == 0
 
+    @pytest.mark.asyncio
+    async def test_broadcast_completes_via_lnd_when_indexer_down(self, db_session):
+        """Indexer unreachable (optional_confirmations None) but LND —
+        which broadcast the tx — reports it confirmed → COMPLETED."""
+        svc = _make_service(mempool_confs=None)  # indexer returns nothing
+        svc._mocks["lnd"].get_transactions = AsyncMock(  # type: ignore[attr-defined]
+            return_value=([{"tx_hash": "c" * 64, "num_confirmations": 2}], None)
+        )
+        session = BraiinsDepositSession(
+            api_key_id=uuid4(),
+            deposit_amount_sats=1_000_000,
+            destination_address="bc1q" + "x" * 38,
+            send_txid="c" * 64,
+            status=BraiinsDepositStatus.BROADCAST,
+            status_history=[],
+        )
+        db_session.add(session)
+        await db_session.commit()
+        result = await svc.advance(db_session, session.id)
+        assert result is not None
+        assert result.status == BraiinsDepositStatus.COMPLETED
+        assert result.send_confirmations == 2
+
+    @pytest.mark.asyncio
+    async def test_broadcast_indexer_and_lnd_both_unavailable_sets_message(self, db_session):
+        """Neither the indexer nor LND can report on the tx → stays
+        BROADCAST with an informative indexer-unavailable message (never
+        auto-FAILs)."""
+        svc = _make_service(mempool_confs=None)
+        svc._mocks["lnd"].get_transactions = AsyncMock(return_value=([], None))  # type: ignore[attr-defined]
+        session = BraiinsDepositSession(
+            api_key_id=uuid4(),
+            deposit_amount_sats=1_000_000,
+            destination_address="bc1q" + "x" * 38,
+            send_txid="c" * 64,
+            status=BraiinsDepositStatus.BROADCAST,
+            status_history=[],
+        )
+        db_session.add(session)
+        await db_session.commit()
+        result = await svc.advance(db_session, session.id)
+        assert result is not None
+        assert result.status == BraiinsDepositStatus.BROADCAST
+        assert result.error_message and "indexer" in result.error_message.lower()
+
 
 # ── Crash recovery ───────────────────────────────────────────────────
 

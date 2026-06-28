@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and Braiins on-chain deposits funded by opening a channel. Safety is
   unchanged: the returned hold-invoice is still bound to our preimage hash and
   amount before it is paid.
+- **Braiins deposits no longer get stuck at "awaiting 1st confirmation" when
+  the chain indexer is unavailable.** The send-tx confirmation watch read the
+  count only from the Electrum/Mempool indexer; if that was down or lagging
+  (e.g. returning 404 for a not-yet-indexed txid), a deposit whose tx had
+  actually confirmed would never complete. It now falls back to **LND** (which
+  broadcast the tx and tracks its own confirmation count), so completion no
+  longer depends on the external indexer. Related hardening:
+  - When neither the indexer nor LND can report on the tx, the dialog shows a
+    clear "can't reach your chain indexer — funds are safe, will finish
+    automatically" message instead of the misleading "awaiting 1st
+    confirmation".
+  - `broadcast_block_height` falls back to LND's height when the indexer tip is
+    unavailable, so the stuck-after-N-blocks warning still works.
+  - A Mempool **404** (a not-yet-indexed txid) is treated as a clean
+    "not found" rather than a backend failure, so a lagging indexer no longer
+    trips the circuit breaker and cascades into the fee endpoints.
 
 ### Changed
 

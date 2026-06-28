@@ -3600,6 +3600,10 @@ class BraiinsDepositService:
             actual_sent = int(session.deposit_amount_sats)
         session.actual_sent_sats = actual_sent
         tip = self._mempool.cached_tip_height
+        if not isinstance(tip, int):
+            # Indexer tip unavailable — fall back to LND's height so the
+            # stuck-warning heuristic still has a broadcast baseline.
+            tip = await self._lnd_block_height()
         if isinstance(tip, int):
             session.broadcast_block_height = tip
         session.record_transition(
@@ -3767,6 +3771,8 @@ class BraiinsDepositService:
         if sent_txid:
             session.send_txid = sent_txid
             tip = self._mempool.cached_tip_height
+            if not isinstance(tip, int):
+                tip = await self._lnd_block_height()
             if isinstance(tip, int):
                 session.broadcast_block_height = tip
             session.record_transition(
@@ -3848,28 +3854,100 @@ class BraiinsDepositService:
                     return str(txid)
         return None
 
+    async def _lnd_tx_confirmations(self, txid: str) -> Optional[int]:
+        """Confirmation count for ``txid`` from LND's own wallet tx list.
+
+        LND broadcast the send tx, so it tracks the confirmation count
+        independently of the external chain indexer — this is the
+        fallback used when the indexer is unreachable / lagging. Returns
+        ``None`` if LND can't answer or doesn't know the tx.
+        """
+        get_txns = getattr(self._lnd, "get_transactions", None)
+        if not callable(get_txns):
+            return None
+        try:
+            txns, err = await get_txns()
+        except Exception:  # noqa: BLE001
+            return None
+        if err or not txns:
+            return None
+        needle = txid.lower()
+        for tx in txns:
+            h = str(tx.get("tx_hash") or tx.get("txid") or "").lower()
+            if h == needle:
+                try:
+                    return max(0, int(tx.get("num_confirmations", 0) or 0))
+                except (TypeError, ValueError):
+                    return 0
+        return None
+
+    async def _lnd_block_height(self) -> Optional[int]:
+        """Current chain tip per LND — a fallback when the indexer's
+        cached tip is unavailable. Only trusted when LND reports it is
+        synced to chain. Returns ``None`` otherwise.
+        """
+        get_info = getattr(self._lnd, "get_info", None)
+        if not callable(get_info):
+            return None
+        try:
+            info, err = await get_info()
+        except Exception:  # noqa: BLE001
+            return None
+        if err or not info or not info.get("synced_to_chain"):
+            return None
+        try:
+            h = int(info.get("block_height", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return h if h > 0 else None
+
     async def _advance_broadcast(self, db: AsyncSession, session: BraiinsDepositSession) -> None:
-        """BROADCAST → COMPLETED when confirmations cross the
-        threshold. Otherwise just refresh ``send_confirmations`` and
-        flag the stuck-warning when applicable.
+        """BROADCAST → COMPLETED when confirmations cross the threshold.
+
+        Reads the send-tx confirmation count from the chain indexer and
+        falls back to LND (which broadcast the tx and tracks it) when the
+        indexer is unreachable — so a flaky / lagging indexer can't
+        strand a deposit whose tx has actually confirmed. Otherwise just
+        refreshes ``send_confirmations`` and flags the stuck-warning.
         """
         if not session.send_txid:
             raise BraiinsDepositError("BROADCAST but send_txid missing")
+
+        confs: Optional[int] = None
+        via = "indexer"
         confs_data = await self._mempool.optional_confirmations(session.send_txid)
-        if confs_data is None:
-            # Chain backend unavailable — never auto-FAIL on this
-            # . Just bump the warning if we're stuck.
-            self._maybe_flag_stuck(session)
+        if confs_data is not None:
+            confs = int(confs_data.get("confirmations", 0) or 0)
+        else:
+            # Indexer down / lagging / tx not indexed — ask LND, which
+            # broadcast this tx and tracks its own confirmation count.
+            lnd_confs = await self._lnd_tx_confirmations(session.send_txid)
+            if lnd_confs is not None:
+                confs, via = lnd_confs, "lnd"
+
+        if confs is None:
+            # Neither backend could report on the tx. Never auto-FAIL —
+            # surface an informative note (the tx is broadcast and the
+            # funds are safe; this finishes once a backend answers) and
+            # retry next tick. We deliberately do NOT run the stuck-warning
+            # heuristic here: with no confirmation reading we can't claim
+            # the tx is "stuck on low fees" — the accurate signal is that
+            # the chain backend is unreachable.
+            session.error_message = (
+                "Can't reach your chain indexer to read confirmations — "
+                "the transaction was broadcast and your funds are safe; "
+                "this will finish automatically once the indexer is "
+                "reachable again."
+            )
             await db.commit()
             return
-        confs = int(confs_data.get("confirmations", 0) or 0)
-        session.send_confirmations = confs
 
+        session.send_confirmations = confs
         threshold = max(1, int(settings.braiins_deposit_confirmations_for_completion))
         if confs >= threshold:
             session.record_transition(
                 BraiinsDepositStatus.COMPLETED,
-                detail=f"confs={confs}",
+                detail=f"confs={confs} via={via}",
             )
             session.error_message = None
             await db.commit()
@@ -3877,9 +3955,14 @@ class BraiinsDepositService:
                 db,
                 action="braiins_deposit_session_completed",
                 session=session,
-                details={"send_confirmations": confs},
+                details={"send_confirmations": confs, "confirmation_source": via},
             )
             return
+
+        # A real reading, but below threshold (or still 0-conf in the
+        # mempool). Clear any stale indexer-unavailable note and apply
+        # the stuck-warning heuristic.
+        session.error_message = None
         self._maybe_flag_stuck(session)
         await db.commit()
 
@@ -3895,9 +3978,14 @@ class BraiinsDepositService:
         if (session.send_confirmations or 0) >= 6:
             return
         confs_data = await self._mempool.optional_confirmations(session.send_txid)
-        if confs_data is None:
-            return
-        confs = int(confs_data.get("confirmations", 0) or 0)
+        if confs_data is not None:
+            confs = int(confs_data.get("confirmations", 0) or 0)
+        else:
+            # Same indexer fallback as the BROADCAST watch.
+            lnd_confs = await self._lnd_tx_confirmations(session.send_txid)
+            if lnd_confs is None:
+                return
+            confs = lnd_confs
         if confs != (session.send_confirmations or 0):
             session.send_confirmations = confs
             await db.commit()

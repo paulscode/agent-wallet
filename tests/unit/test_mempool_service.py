@@ -78,6 +78,27 @@ class TestMempoolFeeService:
         assert result["hourFee"] == 15
 
     @pytest.mark.asyncio
+    async def test_tx_404_is_not_found_and_does_not_trip_breaker(self):
+        """A 404 (tx not indexed yet) is a clean answer from a healthy
+        server: it maps to a 'not found' error and must NOT count as a
+        circuit-breaker failure (otherwise a lagging indexer cascades
+        into the fee endpoints)."""
+        from app.services.chain.mempool_http import _MEMPOOL_BREAKER
+        from app.services.mempool_fee_service import MempoolFeeService
+
+        _MEMPOOL_BREAKER.reset()
+        svc = MempoolFeeService()
+        resp = _make_response(404, {"error": "not found"})
+
+        with patch("app.services.chain.mempool_http.request_capped", new_callable=AsyncMock, return_value=resp):
+            data, error = await svc.get_transaction("ab" * 32)
+
+        assert data is None
+        assert error == "not found"
+        assert _MEMPOOL_BREAKER.consecutive_failures == 0
+        assert _MEMPOOL_BREAKER.state == "closed"
+
+    @pytest.mark.asyncio
     async def test_get_fee_for_priority_high(self):
         """get_fee_for_priority('high') maps to fastestFee."""
         from app.services.mempool_fee_service import MempoolFeeService
