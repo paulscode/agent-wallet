@@ -47,7 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from periodic tasks fail — the underlying cause of the stuck-confirmation
   symptom above. The clients now detect a loop change and rebuild their
   loop-bound state on the current loop (the long-lived web-server loop is
-  unaffected, so its persistent Electrum connection is preserved).
+  unaffected, so its persistent Electrum connection is preserved). The
+  circuit breaker's half-open probe lock (an `asyncio.Lock`, also a shared
+  singleton) is rebound the same way, so a recovery probe from a fresh task
+  loop can't wedge the breaker.
 
 ### Changed
 

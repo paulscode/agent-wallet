@@ -21,6 +21,7 @@ deterministic under ``pytest -n auto``.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -345,3 +346,52 @@ async def test_with_retry_no_breaker_succeeds() -> None:
         return 42
 
     assert await with_retry(op, retryable=(ValueError,)) == 42
+
+
+def test_breaker_lock_rebinds_on_loop_change() -> None:
+    """The half-open probe lock must be rebuilt when the running event
+    loop changes. A breaker is a process-wide singleton, but Celery runs
+    each task on its own throwaway loop, and an ``asyncio.Lock`` bound to
+    a now-dead loop raises "bound to a different event loop" when reused.
+    """
+    cb = CircuitBreaker(name="svc")
+
+    async def grab() -> tuple[asyncio.Lock, asyncio.AbstractEventLoop | None]:
+        cb._rebind_lock_if_needed()
+        before = cb._lock
+        cb._rebind_lock_if_needed()  # same loop → no-op
+        assert cb._lock is before
+        return cb._lock, cb._lock_loop
+
+    lock1, loop1 = asyncio.run(grab())
+    lock2, loop2 = asyncio.run(grab())
+    assert loop1 is not loop2
+    assert lock1 is not lock2  # recreated on the new loop
+
+
+def test_breaker_half_open_probe_survives_loop_change() -> None:
+    """End-to-end: a half-open probe acquired (and bound) on one loop must
+    not wedge the breaker for a probe on a later loop. Without the rebind
+    this raises "bound to a different event loop"."""
+    cb = CircuitBreaker(name="svc", failure_threshold=1, open_duration_s=0.0)
+
+    async def bind_and_hold_on_this_loop() -> None:
+        cb.state = "half_open"
+        await cb.before_call()  # probe 1 holds the lock
+        cb.state = "half_open"
+        waiter = asyncio.create_task(cb.before_call())  # probe 2 contends → binds lock to this loop
+        for _ in range(5):
+            await asyncio.sleep(0)
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(bind_and_hold_on_this_loop())  # loop now closed; lock bound+held on it
+
+    async def probe_on_new_loop() -> None:
+        cb.state = "half_open"
+        await asyncio.wait_for(cb.before_call(), timeout=1.0)  # must not raise
+
+    asyncio.run(probe_on_new_loop())

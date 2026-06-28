@@ -83,9 +83,32 @@ class CircuitBreaker:
     last_success_at: datetime | None = None
     last_failure_at: datetime | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # The loop ``_lock`` is bound to. A breaker is a process-wide
+    # singleton, but Celery runs each task on its own throwaway loop;
+    # an ``asyncio.Lock`` binds to the loop it first contends on, and
+    # reusing it from another loop raises "bound to a different event
+    # loop". We recreate the lock when the running loop changes.
+    _lock_loop: "asyncio.AbstractEventLoop | None" = field(default=None, repr=False)
 
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
+
+    def _rebind_lock_if_needed(self) -> None:
+        """Recreate ``_lock`` if the running event loop has changed.
+
+        A loop change means the previous loop is gone (e.g. a finished
+        Celery task), so any prior lock state is moot — a fresh lock on
+        the current loop is correct and avoids "bound to a different
+        event loop". On the long-lived web-server loop this is a no-op
+        after the first call. Must be called from within a running loop.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
 
     def _maybe_half_open(self) -> None:
         """Transition open → half_open once ``open_duration_s`` has elapsed."""
@@ -112,7 +135,10 @@ class CircuitBreaker:
         if self.state == "half_open":
             # Block any other coroutine from also slipping through during
             # the probe attempt. The lock is released in
-            # record_success / record_failure.
+            # record_success / record_failure. Rebind to the current loop
+            # first so a probe from a fresh Celery task loop doesn't hit a
+            # lock bound to a now-dead loop.
+            self._rebind_lock_if_needed()
             await self._lock.acquire()
 
     def record_success(self) -> None:
@@ -139,8 +165,12 @@ class CircuitBreaker:
         breaker's protection. Restricted to the lnd_keepalive active
         recovery path (see 2026-06-02 wedge postmortem).
         """
-        if self._lock.locked():
-            self._lock.release()
+        # Drop any half-open probe lock by replacing it outright. This is
+        # loop-safe (no cross-loop ``release()`` on a lock bound to a
+        # now-dead loop) and clears the holder unconditionally, which is
+        # exactly reset's intent. The next half-open probe rebinds it.
+        self._lock = asyncio.Lock()
+        self._lock_loop = None
         if self.state != "closed":
             logger.info(
                 "Circuit breaker [%s] force-reset after %d consecutive failure(s)",
