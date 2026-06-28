@@ -1107,7 +1107,7 @@
                                                      an entry for the channel's peer. -->
                                                 <template x-if="channelPeerCatalogInfo(ch)">
                                                     <div class="relative shrink-0"
-                                                         @click.outside="if (openChannelInfoTooltip === (ch.chan_id || ch.channel_point || '')) closeChannelInfo()"
+                                                         @click.outside="closeChannelInfoIfOwned(ch)"
                                                          @keydown.escape.window="closeChannelInfo()">
                                                         <button type="button"
                                                                 class="inline-flex items-center justify-center w-4 h-4 rounded-full text-gray-500 hover:text-neon-cyan transition-colors"
@@ -1280,7 +1280,7 @@
                                                     </template>
                                                     <template x-if="channelPeerCatalogInfo(pc)">
                                                         <div class="relative shrink-0"
-                                                             @click.outside="if (openChannelInfoTooltip === (pc.channel_point || '')) closeChannelInfo()"
+                                                             @click.outside="closeChannelInfoIfOwned(pc)"
                                                              @keydown.escape.window="closeChannelInfo()">
                                                             <button type="button"
                                                                     class="inline-flex items-center justify-center w-4 h-4 rounded-full text-gray-500 hover:text-neon-cyan transition-colors"

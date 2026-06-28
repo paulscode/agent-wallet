@@ -7074,6 +7074,20 @@ document.addEventListener('alpine:init', () => {
             this.openChannelInfoTooltip = '';
         },
 
+        /** Outside-click handler bound to each channel card's tooltip
+         *  wrapper. Closes the open tooltip only when the outside click
+         *  happens against the card whose tooltip is currently open;
+         *  clicks against another card's wrapper would otherwise leave
+         *  the open tooltip stuck. Extracted because Alpine's CSP
+         *  expression parser can't compile an ``if (cond) call()``
+         *  statement form inline in a directive. */
+        closeChannelInfoIfOwned(ch) {
+            const key = this._channelInfoKey(ch);
+            if (key && this.openChannelInfoTooltip === key) {
+                this.closeChannelInfo();
+            }
+        },
+
         /** Stable per-card key the tooltip uses to identify "is this my
          *  channel's tooltip?" — chan_id for active channels, the
          *  ``channel_point`` outpoint for pending opens. */

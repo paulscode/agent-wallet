@@ -142,12 +142,33 @@ class TestChannelCardTemplate:
         assert "@keydown.escape.window=\"closeChannelInfo()\"" in dashboard_html_text
 
     def test_tooltip_closes_on_outside_click(self, dashboard_html_text: str) -> None:
-        # Outside-click handler is bound; the conditional inside makes
-        # the close fire only when this card's tooltip is the one
-        # currently open (so clicking outside another card doesn't
-        # close this one).
-        assert "@click.outside" in dashboard_html_text
-        assert "openChannelInfoTooltip === (ch.chan_id" in dashboard_html_text
+        # Outside-click handler is bound; the close fires only when
+        # this card's tooltip is the one currently open (so clicking
+        # outside another card doesn't close this one). The ownership
+        # check lives in a JS getter (``closeChannelInfoIfOwned``)
+        # because Alpine's CSP expression parser can't compile an
+        # ``if (cond) call()`` statement form inline in a directive.
+        assert '@click.outside="closeChannelInfoIfOwned(ch)"' in dashboard_html_text
+        assert '@click.outside="closeChannelInfoIfOwned(pc)"' in dashboard_html_text
+
+    def test_no_inline_if_statement_directives(self, dashboard_html_text: str) -> None:
+        # Alpine's CSP build accepts expressions, not statements —
+        # ``if (...) call()`` inline in a directive trips the parser
+        # and shows up at runtime as ``Unexpected token: <call name>``.
+        # Sweep every event-handler / x-* directive body and flag any
+        # that opens with ``if (``.
+        import re
+
+        for match in re.finditer(
+            r"(?:@[a-zA-Z.]+|x-[a-z]+)\s*=\s*\"(if\s*\([^\"]*)\"",
+            dashboard_html_text,
+        ):
+            raise AssertionError(
+                "inline 'if (...)' directive found — Alpine CSP can't "
+                "parse statement forms in directive bodies. Extract "
+                "to a JS getter / method instead. Offending fragment: "
+                f"{match.group(1)!r}"
+            )
 
     def test_channels_tab_summary_line_present(self, dashboard_html_text: str) -> None:
         # "X of your Y channels are with peers in our vetted catalog."
