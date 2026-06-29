@@ -5903,14 +5903,22 @@ document.addEventListener('alpine:init', () => {
             this.showSendPayment = true;
             await this.$nextTick();
             await this.resolveLnurl();
-            // After the recipient card resolves, prefill the
-            // amount/comment so the user can hit Continue immediately.
+            // The tip dialog already collected the amount + comment, so
+            // prefill them and skip the redundant LNURL recipient-card
+            // review — go straight to the final confirmation (fee tweak +
+            // send). ``requestLnurlInvoice`` re-validates the amount
+            // against the recipient's min/max; if it's out of range it
+            // leaves us on the recipient card with an error so the user
+            // can adjust. For a fixed-amount recipient we keep the card
+            // (the chosen tip amount can't apply), which is vanishingly
+            // rare for a Lightning Address.
             if (this.lnurlState === 'resolved') {
-                if (!this.lnurlAmountFixed) {
-                    this.lnurlAmountStr = String(amt);
-                }
                 if (this.lnurlCommentMax > 0 && comment) {
                     this.lnurlComment = comment.slice(0, this.lnurlCommentMax);
+                }
+                if (!this.lnurlAmountFixed) {
+                    this.lnurlAmountStr = String(amt);
+                    await this.requestLnurlInvoice();
                 }
             }
             this.$nextTick(() => this.initIcons());

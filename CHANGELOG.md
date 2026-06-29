@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (matching the wizard's other glossary popovers) now explains this so the
   reserved amount isn't mistaken for a charge.
 
+#### Tip-the-developer flow
+
+- **Removed a redundant step.** The "Buy the developer a coffee" flow collected
+  the amount and comment, then showed a second screen repeating the same amount
+  and comment before the final confirm-and-send screen. The amount/comment are
+  now carried straight through to the final confirmation (fee tweak + send). If
+  the amount falls outside the recipient's min/max (or the recipient pins a
+  fixed amount), the recipient card is still shown so it can be adjusted.
+
 ## [0.1.1] - 2026-06-28
 
 ### Added
