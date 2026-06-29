@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-06-29
+
+### Fixed
+
+- **Copy buttons work when the dashboard is served over plain HTTP.** The
+  clipboard helpers used `navigator.clipboard`, which the browser only exposes
+  in a secure context (HTTPS or localhost). When the dashboard is reached over
+  HTTP on a LAN (e.g. an Umbrel install at `http://<device>.local`), it is
+  undefined, so every Copy button threw `Cannot read properties of undefined
+  (reading 'writeText')` — including "Copy Address" in the fund-wallet wizard.
+  Copying now falls back to a hidden-textarea `document.execCommand('copy')`
+  when the Clipboard API isn't available, so all copy actions work over HTTP.
+
 ## [0.1.2] - 2026-06-28
 
 ### Fixed
