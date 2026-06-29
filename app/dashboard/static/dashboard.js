@@ -3377,7 +3377,7 @@ document.addEventListener('alpine:init', () => {
             else if (kind === 'onchain_amount') value = d.amount_sat ? String(d.amount_sat) : '';
             if (!value) return;
             try {
-                await navigator.clipboard.writeText(value);
+                this._copyToClipboard(value);
                 this.anonymizeDepositCopied = kind;
                 window.setTimeout(() => {
                     if (this.anonymizeDepositCopied === kind) {
@@ -5599,8 +5599,45 @@ document.addEventListener('alpine:init', () => {
         },
 
         // ── Clipboard ──
+        // Copy text to the clipboard with a fallback for non-secure contexts.
+        // ``navigator.clipboard`` only exists in a secure context (HTTPS or
+        // localhost); when the dashboard is served over plain HTTP on the LAN
+        // (e.g. Umbrel at http://<device>.local) it is undefined, so we fall
+        // back to a hidden-textarea + ``document.execCommand('copy')``. Returns
+        // true on (attempted) success, false if copying isn't possible.
+        _copyToClipboard(text) {
+            const value = String(text == null ? '' : text);
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    // Async; fall back if the browser rejects (permissions, etc.).
+                    navigator.clipboard.writeText(value).catch(() => this._execCopyFallback(value));
+                    return true;
+                }
+            } catch (_e) {
+                // Fall through to the execCommand path.
+            }
+            return this._execCopyFallback(value);
+        },
+        _execCopyFallback(value) {
+            try {
+                const ta = document.createElement('textarea');
+                ta.value = value;
+                ta.setAttribute('readonly', '');
+                ta.style.position = 'fixed';
+                ta.style.top = '-9999px';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                ta.setSelectionRange(0, value.length);
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                return ok;
+            } catch (_e) {
+                return false;
+            }
+        },
         copyText(text) {
-            navigator.clipboard.writeText(text);
+            this._copyToClipboard(text);
             this.toast = 'Copied!';
             setTimeout(() => this.toast = '', 2000);
             this.initIcons();
@@ -5674,7 +5711,7 @@ document.addEventListener('alpine:init', () => {
         },
         fundCopyAddress() {
             if (!this.fundAddress) return;
-            navigator.clipboard.writeText(this.fundAddress);
+            this._copyToClipboard(this.fundAddress);
             this.fundCopied = true;
             setTimeout(() => this.fundCopied = false, 2500);
             this.initIcons();
@@ -6228,7 +6265,7 @@ document.addEventListener('alpine:init', () => {
 
         recvCopyInvoice() {
             if (!this.createdInvoice) return;
-            navigator.clipboard.writeText(this.createdInvoice.payment_request);
+            this._copyToClipboard(this.createdInvoice.payment_request);
             this.recvCopied = true;
             setTimeout(() => this.recvCopied = false, 2500);
             this.initIcons();
@@ -11870,7 +11907,7 @@ document.addEventListener('alpine:init', () => {
         copySignedExport() {
             const txt = this.signedExport();
             if (!txt) return;
-            navigator.clipboard.writeText(txt);
+            this._copyToClipboard(txt);
             this.signCopiedFlag = true;
             this.toast = 'Signature copied';
             setTimeout(() => { this.signCopiedFlag = false; this.toast = ''; }, 1800);
@@ -12361,9 +12398,7 @@ document.addEventListener('alpine:init', () => {
         // countdown so the operator knows the secret won't linger
         // in the OS clipboard if they walk away.
         _copyApiKeyPlaintext(text) {
-            try {
-                navigator.clipboard.writeText(text);
-            } catch (_e) {
+            if (!this._copyToClipboard(text)) {
                 this.apiKeysError = 'Copy failed — select the key and copy manually.';
                 return;
             }
