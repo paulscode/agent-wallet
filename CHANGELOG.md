@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-30
+
+### Fixed
+
+- **Form inputs now work under the dashboard's Content-Security-Policy.** A number
+  of forms — the channel-mix planner, the Send-payment source picker, the
+  Rebalance destination picker, BOLT 12 issue/pay, API-key creation, and the
+  audit-log filter — used an input-binding pattern the CSP build of the frontend
+  framework rejects, so typing into or toggling those fields silently failed
+  (with a console error) on CSP deployments. All of these fields update correctly
+  now.
+- **Onboarding carries your earlier choices into the channel step.** After your
+  deposit confirms, the "build inbound efficiently" path now pre-fills the
+  receive target you picked in the welcome wizard instead of presenting a blank
+  field — no re-entering what you already told it (the parallel/open-channels
+  path likewise remembers your chosen capacity).
+- The Fund Wallet dialog **closes automatically once your deposit is detected**,
+  advancing to the next step instead of leaving you waiting on a now-stale
+  address and QR.
+
+### Changed
+
+- The Fund Wallet dialog gained a **"Copy amount (sats)"** control next to the
+  suggested deposit, copying the raw number (no separators) so it pastes cleanly
+  into a sending wallet's amount field. The suggested-deposit hint now appears
+  only once an address (and its QR) has been generated, and hides again on "New
+  Address" until the next QR appears.
+- The welcome message now notes that Agent Wallet works **on-chain as well as
+  over Lightning**, rather than implying Lightning only.
+
 ## [0.4.0] - 2026-06-30
 
 ### Added

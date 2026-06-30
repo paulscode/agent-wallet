@@ -148,8 +148,9 @@
                         </div>
                         <h2 class="text-2xl font-semibold text-white mb-2">Welcome to Agent Wallet</h2>
                         <p class="text-sm text-gray-400 max-w-md mx-auto">
-                            Agent Wallet lets you and your AI agents send and receive Bitcoin over
-                            Lightning. Tell us how you'll use it and we'll suggest how much to deposit.
+                            Agent Wallet lets you and your AI agents send and receive Bitcoin —
+                            on-chain and over Lightning. Tell us how you'll use it and we'll
+                            suggest how much to deposit.
                         </p>
                     </div>
 
@@ -621,7 +622,7 @@
                     <template x-if="onboardingCatalogAvailable && !onboardingHasSavedBootstrap">
                         <p class="text-xs text-gray-500 text-center mt-2">
                             Want to receive more than you deposited?
-                            <button @click="openInboundBootstrap()" class="text-neon-cyan hover:underline">Build inbound efficiently</button>
+                            <button @click="openInboundBootstrap(onboardingSavedTargetInbound)" class="text-neon-cyan hover:underline">Build inbound efficiently</button>
                         </p>
                     </template>
 
@@ -646,12 +647,12 @@
                             <div class="space-y-1.5">
                                 <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.mode === 'parallel' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.mode" value="parallel" class="mt-0.5 accent-neon-cyan">
+                                    <input type="radio" :checked="channelPlanForm.mode === 'parallel'" @change="setPlanField('mode', 'parallel')" value="parallel" class="mt-0.5 accent-neon-cyan">
                                     <span><span class="text-white">Open channels now</span> — fund and open a few channels at once. Fast; needs the full amount up front.</span>
                                 </label>
                                 <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.mode === 'bootstrap' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.mode" value="bootstrap" class="mt-0.5 accent-neon-cyan">
+                                    <input type="radio" :checked="channelPlanForm.mode === 'bootstrap'" @change="setPlanField('mode', 'bootstrap')" value="bootstrap" class="mt-0.5 accent-neon-cyan">
                                     <span class="flex-1">
                                         <span class="text-white">Build inbound efficiently</span> — open one channel at a time and recycle the funds via swaps. Needs much less to start, but takes hours.
                                         <button type="button" class="text-gray-500 hover:text-emerald-400 ml-1 align-middle"
@@ -671,7 +672,7 @@
                                 Roughly how much to commit?
                             </label>
                             <div class="relative">
-                                <input type="number" min="1" x-model.number="channelPlanForm.target_capacity_sats"
+                                <input type="number" min="1" :value="channelPlanForm.target_capacity_sats" @input="setPlanNum('target_capacity_sats', $event.target.value)"
                                        class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40 focus:ring-1 focus:ring-neon-green/20 transition-all">
                                 <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
                             </div>
@@ -685,23 +686,23 @@
                             <div class="grid grid-cols-2 gap-1.5 mb-3">
                                 <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.bootstrap_input_kind === 'target' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.bootstrap_input_kind" value="target" class="sr-only">
+                                    <input type="radio" :checked="channelPlanForm.bootstrap_input_kind === 'target'" @change="setPlanField('bootstrap_input_kind', 'target')" value="target" class="sr-only">
                                     I want to receive…
                                 </label>
                                 <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.bootstrap_input_kind === 'deposit' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.bootstrap_input_kind" value="deposit" class="sr-only">
+                                    <input type="radio" :checked="channelPlanForm.bootstrap_input_kind === 'deposit'" @change="setPlanField('bootstrap_input_kind', 'deposit')" value="deposit" class="sr-only">
                                     I have to start…
                                 </label>
                             </div>
                             <div class="relative" x-show="channelPlanForm.bootstrap_input_kind === 'target'">
-                                <input type="number" min="1" x-model.number="channelPlanForm.bootstrap_target_inbound_sats"
+                                <input type="number" min="1" :value="channelPlanForm.bootstrap_target_inbound_sats" @input="setPlanNum('bootstrap_target_inbound_sats', $event.target.value)"
                                        placeholder="Target inbound"
                                        class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40 focus:ring-1 focus:ring-neon-green/20 transition-all">
                                 <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
                             </div>
                             <div class="relative" x-show="channelPlanForm.bootstrap_input_kind === 'deposit'">
-                                <input type="number" min="1" x-model.number="channelPlanForm.bootstrap_deposit_sats"
+                                <input type="number" min="1" :value="channelPlanForm.bootstrap_deposit_sats" @input="setPlanNum('bootstrap_deposit_sats', $event.target.value)"
                                        placeholder="Amount to start with"
                                        class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40 focus:ring-1 focus:ring-neon-green/20 transition-all">
                                 <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
@@ -710,7 +711,7 @@
                                 Available: <span x-text="formatSats(onboardingOnchainSats)"></span> sats. We open one channel at a time and recycle the funds.
                             </p>
                             <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer mt-2">
-                                <input type="checkbox" x-model="channelPlanForm.bootstrap_final_push_round" class="accent-neon-cyan">
+                                <input type="checkbox" :checked="channelPlanForm.bootstrap_final_push_round" @change="setPlanField('bootstrap_final_push_round', $event.target.checked)" class="accent-neon-cyan">
                                 Convert the leftover to inbound at the end (spends it; off by default)
                             </label>
                         </div>
@@ -720,17 +721,17 @@
                             <div class="grid grid-cols-3 gap-1.5">
                                 <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.outbound_option === 'send_heavy' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.outbound_option" value="send_heavy" class="sr-only">
+                                    <input type="radio" :checked="channelPlanForm.outbound_option === 'send_heavy'" @change="setPlanField('outbound_option', 'send_heavy')" value="send_heavy" class="sr-only">
                                     Send-heavy
                                 </label>
                                 <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.outbound_option === 'balanced' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.outbound_option" value="balanced" class="sr-only">
+                                    <input type="radio" :checked="channelPlanForm.outbound_option === 'balanced'" @change="setPlanField('outbound_option', 'balanced')" value="balanced" class="sr-only">
                                     Balanced
                                 </label>
                                 <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.outbound_option === 'receive_heavy' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.outbound_option" value="receive_heavy" class="sr-only">
+                                    <input type="radio" :checked="channelPlanForm.outbound_option === 'receive_heavy'" @change="setPlanField('outbound_option', 'receive_heavy')" value="receive_heavy" class="sr-only">
                                     Receive-heavy
                                 </label>
                             </div>
@@ -741,12 +742,12 @@
                             <div class="space-y-1.5">
                                 <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.peer_mix_mode === 'recommended_diverse' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.peer_mix_mode" value="recommended_diverse" class="mt-0.5 accent-neon-cyan">
+                                    <input type="radio" :checked="channelPlanForm.peer_mix_mode === 'recommended_diverse'" @change="setPlanField('peer_mix_mode', 'recommended_diverse')" value="recommended_diverse" class="mt-0.5 accent-neon-cyan">
                                     <span><span class="text-white">Recommended (diverse)</span> — mix of vetted peers; spread across regions.</span>
                                 </label>
                                 <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
                                        :class="channelPlanForm.peer_mix_mode === 'cheapest_only' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
-                                    <input type="radio" x-model="channelPlanForm.peer_mix_mode" value="cheapest_only" class="mt-0.5 accent-neon-cyan">
+                                    <input type="radio" :checked="channelPlanForm.peer_mix_mode === 'cheapest_only'" @change="setPlanField('peer_mix_mode', 'cheapest_only')" value="cheapest_only" class="mt-0.5 accent-neon-cyan">
                                     <span><span class="text-white">Cheapest fees</span> — minimise routing cost; less diverse.</span>
                                 </label>
                             </div>
@@ -754,7 +755,7 @@
 
                         <div x-show="channelPlanForm.mode === 'parallel'">
                             <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
-                                <input type="checkbox" x-model="channelPlanForm.leave_room_for_one_more" class="accent-neon-cyan">
+                                <input type="checkbox" :checked="channelPlanForm.leave_room_for_one_more" @change="setPlanField('leave_room_for_one_more', $event.target.checked)" class="accent-neon-cyan">
                                 Leave room for one more channel later
                             </label>
                         </div>
@@ -2531,25 +2532,25 @@
                                             <div x-show="bolt12IssueAdvancedOpen" x-cloak class="grid grid-cols-2 gap-3 mt-3">
                                                 <div>
                                                     <label class="text-xs text-gray-500 block mb-1">Currency</label>
-                                                    <input type="text" x-model="bolt12IssueForm.currency" maxlength="8"
+                                                    <input type="text" :value="bolt12IssueForm.currency" @input="setField('bolt12IssueForm','currency', $event.target.value)" maxlength="8"
                                                         class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                         placeholder="e.g. USD">
                                                 </div>
                                                 <div>
                                                     <label class="text-xs text-gray-500 block mb-1">Issuer name</label>
-                                                    <input type="text" x-model="bolt12IssueForm.issuer" maxlength="256"
+                                                    <input type="text" :value="bolt12IssueForm.issuer" @input="setField('bolt12IssueForm','issuer', $event.target.value)" maxlength="256"
                                                         class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                         placeholder="optional">
                                                 </div>
                                                 <div>
                                                     <label class="text-xs text-gray-500 block mb-1">Max quantity</label>
-                                                    <input type="number" x-model="bolt12IssueForm.quantity_max" min="1"
+                                                    <input type="number" :value="bolt12IssueForm.quantity_max" @input="setFieldNum('bolt12IssueForm','quantity_max', $event.target.value)" min="1"
                                                         class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                         placeholder="optional">
                                                 </div>
                                                 <div>
                                                     <label class="text-xs text-gray-500 block mb-1">Absolute expiry (unix-seconds)</label>
-                                                    <input type="number" x-model="bolt12IssueForm.absolute_expiry" min="1"
+                                                    <input type="number" :value="bolt12IssueForm.absolute_expiry" @input="setFieldNum('bolt12IssueForm','absolute_expiry', $event.target.value)" min="1"
                                                         class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                         placeholder="optional">
                                                 </div>
@@ -2705,8 +2706,8 @@
                                         </div>
                                         <div>
                                             <label class="text-xs text-gray-500 block mb-1">Offer string (lno1…) <span class="text-neon-pink">*</span></label>
-                                            <textarea rows="3" x-model="bolt12PayForm.offer"
-                                                @input="scheduleBolt12PayDecode()"
+                                            <textarea rows="3" :value="bolt12PayForm.offer"
+                                                @input="setBolt12Offer($event.target.value)"
                                                 class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-2 text-xs font-mono text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                 placeholder="lno1..."></textarea>
                                             <!-- Inline decode preview -->
@@ -2735,19 +2736,19 @@
                                         <div class="grid grid-cols-2 gap-3">
                                             <div>
                                                 <label class="text-xs text-gray-500 block mb-1">Amount (msat)</label>
-                                                <input type="number" x-model="bolt12PayForm.amount_msat" min="1"
+                                                <input type="number" :value="bolt12PayForm.amount_msat" @input="setFieldNum('bolt12PayForm','amount_msat', $event.target.value)" min="1"
                                                     class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                     placeholder="required if offer is variable-amount">
                                             </div>
                                             <div>
                                                 <label class="text-xs text-gray-500 block mb-1">Quantity</label>
-                                                <input type="number" x-model="bolt12PayForm.quantity" min="1"
+                                                <input type="number" :value="bolt12PayForm.quantity" @input="setFieldNum('bolt12PayForm','quantity', $event.target.value)" min="1"
                                                     class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                     placeholder="optional">
                                             </div>
                                             <div class="col-span-2">
                                                 <label class="text-xs text-gray-500 block mb-1">Payer note</label>
-                                                <input type="text" x-model="bolt12PayForm.payer_note" maxlength="512"
+                                                <input type="text" :value="bolt12PayForm.payer_note" @input="setField('bolt12PayForm','payer_note', $event.target.value)" maxlength="512"
                                                     class="w-full bg-navy-800 border border-navy-700 rounded px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-neon-cyan"
                                                     placeholder="optional">
                                             </div>
@@ -5087,7 +5088,7 @@
                         <div class="flex items-center justify-between mb-2 gap-2">
                             <span class="text-[10px] uppercase tracking-wider text-gray-500">Destination — pick one</span>
                             <div class="flex items-center gap-1">
-                                <select x-model="rebalance.sortBy"
+                                <select :value="rebalance.sortBy" @change="setField('rebalance','sortBy', $event.target.value)"
                                         class="bg-navy-800 border border-navy-700 rounded px-2 py-1 text-[11px] text-gray-300 focus:outline-none focus:border-neon-cyan">
                                     <option value="best">Best fit</option>
                                     <option value="ratio">Most inbound</option>
@@ -5095,14 +5096,14 @@
                                     <option value="alias">Alias A→Z</option>
                                 </select>
                                 <label class="flex items-center gap-1 text-[11px] text-gray-500 cursor-pointer">
-                                    <input type="checkbox" x-model="rebalance.showAllDests" class="accent-neon-cyan">
+                                    <input type="checkbox" :checked="rebalance.showAllDests" @change="setField('rebalance','showAllDests', $event.target.checked)" class="accent-neon-cyan">
                                     show all
                                 </label>
                             </div>
                         </div>
                         <div class="relative mb-2">
                             <i data-lucide="search" class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-500"></i>
-                            <input type="text" x-model="rebalance.search"
+                            <input type="text" :value="rebalance.search" @input="setField('rebalance','search', $event.target.value)"
                                    placeholder="Search by alias or pubkey..."
                                    class="w-full bg-navy-800 border border-navy-700 rounded pl-7 pr-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-neon-cyan">
                         </div>
@@ -5399,15 +5400,30 @@
 
                 <!-- Suggested amount from the onboarding wizard (informational;
                      also encoded into the BIP21 QR so the sending wallet
-                     pre-fills it). Absent on plain opens. -->
-                <template x-if="fundSuggestedSats">
+                     pre-fills it). Absent on plain opens. Only shown once an
+                     address (and its QR) exists — the copy refers to the
+                     generated QR, and "New Address" clears fundAddress so this
+                     hides again until the next QR appears. -->
+                <template x-if="fundSuggestedSats && fundAddress">
                     <div class="flex items-start gap-2 p-3 mb-5 rounded-lg bg-neon-green/10 border border-neon-green/20">
                         <i data-lucide="lightbulb" class="w-4 h-4 text-neon-green shrink-0 mt-0.5"></i>
-                        <p class="text-xs text-gray-200 leading-relaxed">
-                            Suggested deposit:
-                            <span class="font-mono text-neon-green" x-text="formatSats(fundSuggestedSats) + ' sats'"></span>.
-                            The QR includes this amount so your sending wallet can pre-fill it.
-                        </p>
+                        <div class="flex-1 min-w-0">
+                            <p class="text-xs text-gray-200 leading-relaxed">
+                                Suggested deposit:
+                                <span class="font-mono text-neon-green" x-text="formatSats(fundSuggestedSats) + ' sats'"></span>.
+                                The QR includes this amount so your sending wallet can pre-fill it.
+                            </p>
+                            <button @click="fundCopyAmount()"
+                                class="mt-2 inline-flex items-center gap-1.5 text-[11px] transition-colors"
+                                :class="fundAmountCopied ? 'text-neon-green' : 'text-gray-400 hover:text-neon-green'">
+                                <template x-if="fundAmountCopied">
+                                    <span class="inline-flex items-center gap-1.5"><i data-lucide="check" class="w-3.5 h-3.5"></i> Amount copied</span>
+                                </template>
+                                <template x-if="!fundAmountCopied">
+                                    <span class="inline-flex items-center gap-1.5"><i data-lucide="copy" class="w-3.5 h-3.5"></i> Copy amount (sats)</span>
+                                </template>
+                            </button>
+                        </div>
                     </div>
                 </template>
 
@@ -5948,16 +5964,16 @@
                                             </div>
                                         </template>
                                         <div class="flex gap-1.5">
-                                            <input type="text" x-model="pay.sourceSearch" placeholder="Search alias or pubkey…"
+                                            <input type="text" :value="pay.sourceSearch" @input="setField('pay','sourceSearch', $event.target.value)" placeholder="Search alias or pubkey…"
                                                    class="flex-1 bg-navy-800 border border-navy-700 rounded px-2 py-1 text-[11px] text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-cyan" />
-                                            <select x-model="pay.sourceSortBy"
+                                            <select :value="pay.sourceSortBy" @change="setField('pay','sourceSortBy', $event.target.value)"
                                                     class="bg-navy-800 border border-navy-700 rounded px-1 py-1 text-[11px] text-gray-200 focus:outline-none focus:border-neon-cyan">
                                                 <option value="local_desc">Local ↓</option>
                                                 <option value="local_asc">Local ↑</option>
                                                 <option value="alias">Alias</option>
                                             </select>
                                             <label class="flex items-center gap-1 text-[10px] text-gray-500 px-1">
-                                                <input type="checkbox" x-model="pay.sourceShowAll"
+                                                <input type="checkbox" :checked="pay.sourceShowAll" @change="setField('pay','sourceShowAll', $event.target.checked)"
                                                        class="accent-neon-cyan w-3 h-3" />
                                                 <span>show all</span>
                                             </label>
@@ -5976,7 +5992,7 @@
                                             <template x-if="paySourceCandidates().length === 0">
                                                 <p class="text-[11px] text-gray-500 text-center py-3">
                                                     No channels with enough local balance —
-                                                    <button type="button" @click="pay.sourceShowAll = true"
+                                                    <button type="button" @click="setField('pay','sourceShowAll', true)"
                                                             class="text-neon-cyan hover:underline">show all</button>
                                                 </p>
                                             </template>
@@ -10173,27 +10189,27 @@
                             <div class="space-y-2">
                                 <label class="block text-xs text-gray-400">
                                     Name
-                                    <input type="text" x-model="apiKeyDraft.name" maxlength="128"
+                                    <input type="text" :value="apiKeyDraft.name" @input="setField('apiKeyDraft','name', $event.target.value)" maxlength="128"
                                         class="mt-1 w-full px-2.5 py-1.5 rounded bg-navy-900 border border-navy-600 text-sm text-white focus:outline-none focus:border-neon-cyan"
                                         placeholder="ai-agent-readonly">
                                 </label>
                                 <div class="space-y-1.5 text-xs text-gray-300">
                                     <label class="flex items-start gap-1.5 cursor-pointer">
-                                        <input type="radio" name="apikey-scope" value="monitor" x-model="apiKeyDraft.scope" class="mt-0.5">
+                                        <input type="radio" name="apikey-scope" value="monitor" :checked="apiKeyDraft.scope === 'monitor'" @change="setField('apiKeyDraft','scope', 'monitor')" class="mt-0.5">
                                         <span><span class="text-blue-300">Monitor + receive</span> — view balances, channels, and history, and receive funds (generate addresses, create invoices). Cannot send or withdraw.</span>
                                     </label>
                                     <label class="flex items-start gap-1.5 cursor-pointer">
-                                        <input type="radio" name="apikey-scope" value="spend" x-model="apiKeyDraft.scope" class="mt-0.5">
+                                        <input type="radio" name="apikey-scope" value="spend" :checked="apiKeyDraft.scope === 'spend'" @change="setField('apiKeyDraft','scope', 'spend')" class="mt-0.5">
                                         <span><span class="text-amber-300">Spend (agent)</span> — read access plus pay invoices, keysend, and withdraw to cold storage. The recommended choice for an autonomous agent. No channel, signing, or key management.</span>
                                     </label>
                                     <label class="flex items-start gap-1.5 cursor-pointer">
-                                        <input type="radio" name="apikey-scope" value="admin" x-model="apiKeyDraft.scope" class="mt-0.5">
+                                        <input type="radio" name="apikey-scope" value="admin" :checked="apiKeyDraft.scope === 'admin'" @change="setField('apiKeyDraft','scope', 'admin')" class="mt-0.5">
                                         <span><span class="text-neon-pink">Admin</span> — full control, including channels and signing. Reserve for break-glass operator use.</span>
                                     </label>
                                 </div>
                                 <label class="block text-xs text-gray-400">
                                     Expires in (days)
-                                    <input type="number" x-model.number="apiKeyDraft.expires_in_days" min="1" max="3650"
+                                    <input type="number" :value="apiKeyDraft.expires_in_days" @input="setFieldNum('apiKeyDraft','expires_in_days', $event.target.value)" min="1" max="3650"
                                         class="mt-1 w-32 px-2.5 py-1.5 rounded bg-navy-900 border border-navy-600 text-sm text-white focus:outline-none focus:border-neon-cyan">
                                 </label>
                             </div>
@@ -10430,7 +10446,7 @@
                 <div class="p-4 border-b border-navy-700 shrink-0 flex flex-wrap items-end gap-2">
                     <label class="text-xs text-gray-400">
                         Action
-                        <select x-model="auditFilter.action" @change="reloadAuditLog()"
+                        <select :value="auditFilter.action" @change="setAuditFilter('action', $event.target.value)"
                             class="block mt-0.5 px-2 py-1 rounded bg-navy-900 border border-navy-600 text-sm text-gray-300 focus:outline-none focus:border-neon-yellow w-48">
                             <option value="">All actions</option>
                             <template x-for="a in auditActions" :key="a">
@@ -10440,13 +10456,13 @@
                     </label>
                     <label class="text-xs text-gray-400">
                         Key name
-                        <input type="text" x-model="auditFilter.api_key_name" @keydown.enter="reloadAuditLog()"
+                        <input type="text" :value="auditFilter.api_key_name" @input="setField('auditFilter','api_key_name', $event.target.value)" @keydown.enter="reloadAuditLog()"
                             placeholder="substring…" maxlength="128"
                             class="block mt-0.5 px-2 py-1 rounded bg-navy-900 border border-navy-600 text-sm text-gray-300 focus:outline-none focus:border-neon-yellow w-44">
                     </label>
                     <label class="text-xs text-gray-400">
                         Range
-                        <select x-model="auditFilter.range" @change="reloadAuditLog()"
+                        <select :value="auditFilter.range" @change="setAuditFilter('range', $event.target.value)"
                             class="block mt-0.5 px-2 py-1 rounded bg-navy-900 border border-navy-600 text-sm text-gray-300 focus:outline-none focus:border-neon-yellow w-32">
                             <option value="1h">Last 1h</option>
                             <option value="24h">Last 24h</option>

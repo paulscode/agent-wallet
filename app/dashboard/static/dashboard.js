@@ -829,7 +829,13 @@ document.addEventListener('alpine:init', () => {
         fundLoading: false,
         fundError: '',
         fundCopied: false,
+        fundAmountCopied: false,
         fundPurpose: '',
+        // On-chain total (sats) captured when an address is generated, so a
+        // later increase means a deposit landed on that address → the Fund
+        // Wallet dialog auto-closes (revealing the onboarding progress /
+        // dashboard) instead of leaving the user staring at a stale QR.
+        fundBaselineSats: null,
 
         // Send payment
         payInvoice: '',
@@ -1870,7 +1876,9 @@ document.addEventListener('alpine:init', () => {
         resetFundAddress() {
             this.fundAddress = '';
             this.fundCopied = false;
+            this.fundAmountCopied = false;
             this.fundError = '';
+            this.fundBaselineSats = null;
         },
 
         /** Switch cold storage dialog to on-chain tab. */
@@ -1929,6 +1937,8 @@ document.addEventListener('alpine:init', () => {
             this.fundError = '';
             this.fundLoading = false;
             this.fundCopied = false;
+            this.fundAmountCopied = false;
+            this.fundBaselineSats = null;
             this.fundAddrType = 'p2wkh';
             // Optional funding guidance: the onboarding wizard passes the
             // recommended amount so the dialog can show it and encode it in
@@ -2214,6 +2224,22 @@ document.addEventListener('alpine:init', () => {
             this.$watch('coldAmount', () => this.debounceColdEstimate());
             // Re-render icons whenever cold step changes
             this.$watch('coldStep', () => this.$nextTick(() => this.initIcons()));
+            // Auto-close the Fund Wallet dialog once a deposit lands on the
+            // generated address. The summary poller refreshes
+            // ``onchainTotalBalance``; an increase above the snapshot taken
+            // when the address was generated means the deposit was detected,
+            // so the dialog closes — revealing the onboarding progress screen
+            // (which advances to "deposit on the way") or the dashboard — and
+            // the user isn't left waiting on a now-stale QR.
+            this.$watch('onchainTotalBalance', (newTotal) => {
+                if (!this.showFundWallet || !this.fundAddress) return;
+                if (this.fundBaselineSats === null) return;
+                if (newTotal > this.fundBaselineSats) {
+                    this.fundBaselineSats = null;
+                    this.showFundWallet = false;
+                }
+            });
+
             // Re-render icons when dialogs open
             this.$watch('showFundWallet', () => this.$nextTick(() => this.initIcons()));
             this.$watch('showSendOnchain', () => this.$nextTick(() => this.initIcons()));
@@ -5755,9 +5781,13 @@ document.addEventListener('alpine:init', () => {
             this.fundError = '';
             this.fundAddress = '';
             this.fundCopied = false;
+            this.fundAmountCopied = false;
             try {
                 const data = await this.api('POST', '/address', { address_type: this.fundAddrType, purpose: this.fundPurpose || '' });
                 this.fundAddress = data.address;
+                // Snapshot the current on-chain total so the watcher can
+                // detect the deposit landing on this fresh address.
+                this.fundBaselineSats = this.onchainTotalBalance;
                 this.$nextTick(() => {
                     this.renderQr(this.$refs.fundQr, this._fundBip21());
                     this.initIcons();
@@ -5772,6 +5802,17 @@ document.addEventListener('alpine:init', () => {
             this._copyToClipboard(this.fundAddress);
             this.fundCopied = true;
             setTimeout(() => this.fundCopied = false, 2500);
+            this.initIcons();
+        },
+
+        /** Copy the suggested deposit amount as a raw sat integer (no
+         *  commas/units) so it can be pasted straight into a sending
+         *  wallet's amount field. */
+        fundCopyAmount() {
+            if (!this.fundSuggestedSats) return;
+            this._copyToClipboard(String(this.fundSuggestedSats));
+            this.fundAmountCopied = true;
+            setTimeout(() => this.fundAmountCopied = false, 2500);
             this.initIcons();
         },
 
@@ -7556,7 +7597,12 @@ document.addEventListener('alpine:init', () => {
             this._resetChannelPlanState();
             this.channelPlanForm.mode = 'bootstrap';
             this.channelPlanForm.bootstrap_input_kind = 'target';
-            const t = Number(targetInboundSats) || 0;
+            // Follow the target the user stated in the welcome wizard rather
+            // than asking again: the explicit arg wins, but if a caller
+            // omits it (or it's missing on the saved card) fall back to the
+            // remembered onboarding inbound target / scale.
+            let t = Number(targetInboundSats) || 0;
+            if (t <= 0) t = Number(this.onboardingSavedTargetInbound) || 0;
             if (t > 0) this.channelPlanForm.bootstrap_target_inbound_sats = t;
             this.channelPlanMode = 'plan_form';
         },
@@ -7575,7 +7621,9 @@ document.addEventListener('alpine:init', () => {
             if (p.outbound_option === 'custom') {
                 this.channelPlanForm.custom_inbound_pct = 0;
             }
-            const t = Number(p.target_capacity_sats) || 0;
+            // Follow the remembered capacity (the card's, else the scale the
+            // user entered in the wizard) so the planner pre-fills it.
+            const t = Number(p.target_capacity_sats) || Number(p.scale_sats) || 0;
             if (t > 0) this.channelPlanForm.target_capacity_sats = t;
             this.channelPlanMode = 'plan_form';
         },
@@ -7585,6 +7633,51 @@ document.addEventListener('alpine:init', () => {
         closeChannelPlanner() {
             this._resetChannelPlanState();
             this.channelPlanMode = 'wizard_choice';
+        },
+
+        /** CSP-safe setters for the channel-mix planner form. Alpine's CSP
+         *  build forbids member-expression assignment in template
+         *  expressions (so ``x-model="channelPlanForm.x"`` throws), so the
+         *  form's inputs bind via :value/:checked + @input/@change and route
+         *  the assignment through these methods (the assignment happens here
+         *  in JS, not in a template expression). */
+        setPlanField(key, value) {
+            this.channelPlanForm[key] = value;
+        },
+        setPlanNum(key, value) {
+            this.channelPlanForm[key] =
+                (value === '' || value === null || value === undefined)
+                    ? null
+                    : Number(value);
+        },
+
+        /** Generic CSP-safe setters for nested-object form fields. Alpine's
+         *  CSP build forbids member-expression assignment in template
+         *  expressions (``x-model="obj.key"`` throws "Property assignments
+         *  are prohibited"), so every nested-object input binds via
+         *  :value/:checked + @input/@change and routes the assignment
+         *  through these methods (which run in JS, not a template). */
+        setField(objName, key, value) {
+            this[objName][key] = value;
+        },
+        setFieldNum(objName, key, value) {
+            this[objName][key] =
+                (value === '' || value === null || value === undefined)
+                    ? null
+                    : Number(value);
+        },
+        /** Audit-log filter setter that also re-runs the query (the selects
+         *  previously combined ``x-model`` with ``@change="reloadAuditLog()"``). */
+        setAuditFilter(key, value) {
+            this.auditFilter[key] = value;
+            this.reloadAuditLog();
+        },
+        /** BOLT 12 offer setter that also re-runs the inline decode (the
+         *  textarea previously combined ``x-model`` with
+         *  ``@input="scheduleBolt12PayDecode()"``). */
+        setBolt12Offer(value) {
+            this.bolt12PayForm.offer = value;
+            this.scheduleBolt12PayDecode();
         },
 
         /** Submit the planner's form to ``/wallet/channel-mix/plan``. */
@@ -8009,7 +8102,12 @@ document.addEventListener('alpine:init', () => {
 
         get onboardingSavedTargetInbound() {
             const p = this._loadOnboardingPlan();
-            return (p && p.target_inbound_sats) || 0;
+            if (!p) return 0;
+            // The bootstrap card carries an explicit inbound target; fall
+            // back to the scale the user entered in the wizard (which, for a
+            // receive intent, *is* the inbound they asked for) so the target
+            // is never lost between steps.
+            return Number(p.target_inbound_sats) || Number(p.scale_sats) || 0;
         },
 
         get onboardingSavedDepositSats() {
