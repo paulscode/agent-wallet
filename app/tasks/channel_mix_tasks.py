@@ -34,12 +34,25 @@ from sqlalchemy import select
 
 from app.core.database import get_db_context
 from app.models.channel_mix_run import (
+    BOOTSTRAP_ROUND_TERMINAL_STATES,
+    TERMINAL_RUN_STATES,
     ChannelMixRun,
     ChannelMixRunState,
+    make_bootstrap_round_entry,
 )
 from app.tasks.boltz_tasks import celery_app, track_task
 
 logger = logging.getLogger(__name__)
+
+# Bootstrap executor tunables. A round's drain may fail to route out the
+# brand-new channel until gossip/pathfinding settles (plan §7.1); retry a
+# bounded number of times before giving up on the round.
+BOOTSTRAP_MAX_SWAP_ATTEMPTS = 4
+# A round's assigned peer may be briefly unreachable (connect failure =
+# transient — plan §7.5). Retry the connect this many ticks before
+# escalating to the next eligible peer, so a permanently-down peer can't
+# wedge the round forever (the §7 "stop cleanly, never retry forever" rule).
+BOOTSTRAP_MAX_CONNECT_ATTEMPTS = 3
 
 
 def _run_async(coro: Any) -> Any:
@@ -111,8 +124,8 @@ async def _open_one_channel(db, run: ChannelMixRun, channel_idx: int) -> None:
         return
 
     result, error = await lnd_service.open_channel(
-        node_pubkey=pubkey,
-        local_funding_amount=capacity_sats,
+        pubkey,
+        capacity_sats,
         push_sat=push_sat,
     )
     if error or not isinstance(result, dict):
@@ -132,7 +145,7 @@ async def _open_one_channel(db, run: ChannelMixRun, channel_idx: int) -> None:
         return
 
     entry["open_state"] = "open_pending"
-    txid = result.get("funding_txid_str") or result.get("funding_txid_bytes_hex")
+    txid = result.get("funding_txid")
     if txid:
         entry["open_txid"] = str(txid)
     run.channels[channel_idx] = entry
@@ -363,6 +376,641 @@ async def _audit_channel_open(
         )
 
 
+# ─── Bootstrap (capital-efficient inbound) executor ───────────────
+#
+# The bootstrap loop opens one channel, drains its outbound back on-chain
+# via a Boltz reverse swap, waits for the claim to CONFIRM, then recycles
+# the returned capital into the next open. Unlike the parallel path it is
+# strictly sequential and settle-aware. See
+# ``internal_docs/inbound_bootstrap_plan.md`` and
+# ``braiins_deposit_service`` (whose open→swap→settle state machine this
+# mirrors).
+
+
+def _set_bootstrap_param(run: ChannelMixRun, key: str, value: Any) -> None:
+    """Mutate one key of the plain-JSON ``bootstrap_params`` column.
+
+    ``bootstrap_params`` is a plain ``JSON`` column (not a ``MutableDict``),
+    so an in-place key set wouldn't be flushed — reassign the whole dict to
+    flag the attribute dirty."""
+    params = dict(run.bootstrap_params or {})
+    if value is None:
+        params.pop(key, None)
+    else:
+        params[key] = value
+    run.bootstrap_params = params
+
+
+def _bootstrap_flag_stuck_if_waiting(
+    run: ChannelMixRun, entry: dict[str, Any], idx: int, what: str
+) -> None:
+    """Surface a non-fatal "taking longer than expected" note when a round
+    has waited on a single confirmation past ``BOOTSTRAP_STUCK_MINUTES``.
+
+    Lazily stamps ``waiting_since`` on first entry to a waiting state and
+    never auto-fails or moves funds (plan §7.2). The note lives on
+    ``run.error_message`` (cleared when the round advances)."""
+    from app.services.channel_mix_planner import BOOTSTRAP_STUCK_MINUTES
+
+    now = _utc_now()
+    since_iso = entry.get("waiting_since")
+    if not since_iso:
+        entry["waiting_since"] = now.isoformat()
+        run.channels[idx] = entry
+        return
+    try:
+        since = datetime.fromisoformat(since_iso)
+    except (TypeError, ValueError):
+        return
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if (now - since).total_seconds() >= BOOTSTRAP_STUCK_MINUTES * 60:
+        run.error_message = (
+            f"Round {entry.get('round_index')}: {what} is taking longer than "
+            "expected to confirm — this can happen when fees are low. It will "
+            "continue on its own; no action needed."
+        )
+
+
+def _bootstrap_clear_waiting(run: ChannelMixRun, entry: dict[str, Any]) -> None:
+    """Reset the stuck timer + clear any stuck note when a round advances
+    out of a waiting state."""
+    if entry.get("waiting_since"):
+        entry["waiting_since"] = None
+    if run.error_message:
+        run.error_message = None
+
+
+def _bootstrap_switch_to_next_peer(run: ChannelMixRun, entry: dict[str, Any], reason: str) -> bool:
+    """Mark the current peer tried and move the round to the next eligible
+    peer (plan §7.5). Returns False when the catalog is exhausted (the
+    caller then fails the round). Resets the per-peer connect counter."""
+    tried = set(entry.get("tried_pubkeys") or [])
+    tried.add(entry["peer_pubkey"])
+    nxt = next(
+        (p for p in _bootstrap_eligible_peers(run) if p.node_id_hex not in tried),
+        None,
+    )
+    if nxt is None:
+        return False
+    entry["peer_pubkey"] = nxt.node_id_hex
+    entry["peer_host"] = nxt.address
+    entry["peer_alias"] = nxt.alias
+    entry["tried_pubkeys"] = list(tried)
+    entry["connect_attempts"] = 0
+    entry["open_error"] = f"{reason}, trying {nxt.alias}"[:512]
+    return True
+
+
+def _bootstrap_inflight_index(run: ChannelMixRun) -> int | None:
+    """Index of the single non-terminal round, or None if every round is
+    terminal (settled / failed). The loop is sequential so there is at
+    most one in-flight round."""
+    for i, entry in enumerate(run.channels):
+        if entry.get("state") not in BOOTSTRAP_ROUND_TERMINAL_STATES:
+            return i
+    return None
+
+
+def _bootstrap_settled_count(run: ChannelMixRun) -> int:
+    return sum(1 for e in run.channels if e.get("state") == "settled")
+
+
+def _bootstrap_target_reached(run: ChannelMixRun) -> bool:
+    target = run.target_inbound_sats
+    return target is not None and int(run.realized_inbound_sats or 0) >= int(target)
+
+
+def _bootstrap_duration_exceeded(run: ChannelMixRun, now: datetime) -> bool:
+    from app.services.channel_mix_planner import BOOTSTRAP_MAX_DURATION_MINUTES
+
+    started = run.started_at
+    if started is None:
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return (now - started).total_seconds() >= BOOTSTRAP_MAX_DURATION_MINUTES * 60
+
+
+def _bootstrap_awaiting_timed_out(run: ChannelMixRun, now: datetime) -> bool:
+    """True once the wallet has sat in AWAITING_FUNDS past the tolerance
+    window (the recyclable balance never recovered)."""
+    from app.services.channel_mix_planner import (
+        BOOTSTRAP_AWAITING_FUNDS_TIMEOUT_MINUTES,
+    )
+
+    since_iso = (run.bootstrap_params or {}).get("awaiting_since")
+    if not since_iso:
+        return False
+    try:
+        since = datetime.fromisoformat(since_iso)
+    except (TypeError, ValueError):
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return (now - since).total_seconds() >= BOOTSTRAP_AWAITING_FUNDS_TIMEOUT_MINUTES * 60
+
+
+async def _bootstrap_feerate_sat_vb() -> float:
+    """Medium-priority feerate for sizing the open fee, with a
+    conservative fallback when the mempool oracle is unreachable."""
+    from app.services.channel_mix_planner import FALLBACK_SAT_PER_VB
+
+    try:
+        from app.services.mempool_fee_service import mempool_fee_service
+
+        fees, err = await mempool_fee_service.get_recommended_fees()
+        if fees and not err:
+            v = fees.get("halfHourFee") or fees.get("hourFee")
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return float(FALLBACK_SAT_PER_VB)
+
+
+def _bootstrap_eligible_peers(run: ChannelMixRun):
+    """Re-derive the ordered eligible peer pool from the stored
+    selection inputs (the schedule isn't pre-materialized)."""
+    from app.services.channel_mix_planner import select_peers
+
+    params = run.bootstrap_params or {}
+    peers, _axes = select_peers(
+        network=params.get("network", "mainnet"),
+        channel_count=64,  # large: we want the full ordered pool, not a cap
+        mode=params.get("peer_mix_mode", "recommended_diverse"),
+        manual_picks=tuple(params.get("manual_picks") or ()),
+        include_marginal_routing=bool(params.get("include_marginal_routing")),
+    )
+    return peers
+
+
+def _bootstrap_next_peer(run: ChannelMixRun, round_index: int):
+    """Round-robin pick across the eligible pool (spread first, then
+    repeat — plan §11.2). Returns None when no peer is eligible."""
+    peers = _bootstrap_eligible_peers(run)
+    if not peers:
+        return None
+    return peers[round_index % len(peers)]
+
+
+async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
+    """Advance one bootstrap round by a single chain-observable step.
+
+    Mutates ``run.channels[idx]`` in place + re-assigns it (to flag the
+    MutableList dirty); the caller commits. Run-level finalization
+    (start next round / stop) is the caller's job — this only drives the
+    per-round state machine and updates the run's running totals on
+    settle."""
+    from app.services.boltz_service import boltz_service
+    from app.services.channel_mix_planner import (
+        BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS,
+        BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS,
+        BOOTSTRAP_ROUTING_FEE_PCT,
+        bootstrap_reserve_for_capacity,
+    )
+    from app.services.lnd_service import lnd_service
+
+    entry = run.channels[idx]
+    state = entry.get("state")
+
+    # ── opening: connect + open (idempotent on open_txid) ──
+    if state == "opening":
+        if entry.get("open_txid"):
+            entry["state"] = "open_pending"
+            run.channels[idx] = entry
+            return
+
+        push_only = bool(entry.get("push_only"))
+        sat_per_vb = await _bootstrap_feerate_sat_vb()
+
+        _ok, conn_err = await lnd_service.connect_peer(
+            entry["peer_pubkey"], entry["peer_host"]
+        )
+        if conn_err and "already connected" not in str(conn_err).lower():
+            # Connect failure = transient (peer briefly offline) — retry a
+            # bounded number of ticks, then escalate to the next peer so a
+            # permanently-down peer can't wedge the round (plan §7.5 + §7).
+            attempts = int(entry.get("connect_attempts", 0)) + 1
+            entry["connect_attempts"] = attempts
+            if attempts < BOOTSTRAP_MAX_CONNECT_ATTEMPTS:
+                entry["open_error"] = f"connect (retry {attempts}): {conn_err}"[:512]
+                run.channels[idx] = entry
+                return
+            if not _bootstrap_switch_to_next_peer(run, entry, f"peer unreachable ({conn_err})"):
+                entry["state"] = "open_failed"
+                entry["open_error"] = f"connect: {conn_err}"[:512]
+                run.channels[idx] = entry
+                await _audit_channel_open(
+                    db, run, _bootstrap_audit_entry(entry), idx,
+                    success=False, error_message=f"connect: {conn_err}",
+                )
+                return
+            run.channels[idx] = entry
+            return
+
+        push_sat = 0
+        if push_only:
+            reserve = bootstrap_reserve_for_capacity(int(entry["capacity_sats"]))
+            push_sat = max(0, int(entry["capacity_sats"]) - reserve - 1_000)
+
+        result, open_err = await lnd_service.open_channel(
+            entry["peer_pubkey"],
+            int(entry["capacity_sats"]),
+            sat_per_vbyte=max(1, int(sat_per_vb)),
+            push_sat=push_sat,
+        )
+        if open_err or not result or not result.get("funding_txid"):
+            # Hard, pre-broadcast (no funds moved): try the next eligible
+            # peer for this round (plan §7.5), else fail the round.
+            if not _bootstrap_switch_to_next_peer(
+                run, entry, f"open rejected ({open_err or 'no funding_txid'})"
+            ):
+                entry["state"] = "open_failed"
+                entry["open_error"] = f"open: {open_err or 'no funding_txid'}"[:512]
+                run.channels[idx] = entry
+                await _audit_channel_open(
+                    db, run, _bootstrap_audit_entry(entry), idx,
+                    success=False, error_message=f"open: {open_err}",
+                )
+                return
+            run.channels[idx] = entry
+            return
+
+        entry["open_txid"] = result["funding_txid"]
+        entry["open_output_index"] = int(result.get("output_index", 0) or 0)
+        entry["state"] = "open_pending"
+        entry["open_error"] = None
+        run.channels[idx] = entry
+        # Persist the funding txid immediately — the open-idempotency guard
+        # (top of this branch) is only durable once committed, so a crash
+        # before the tick's final commit must not lose it and re-broadcast
+        # a second funding tx (mirrors Braiins ``channel_open_txid``;
+        # double-opening would double-spend the recyclable capital). Safe
+        # to commit mid-tick: sessions are ``expire_on_commit=False`` and a
+        # concurrent tick that grabs the row now just sees ``open_pending``.
+        await db.commit()
+        await _audit_channel_open(
+            db, run, _bootstrap_audit_entry(entry), idx, success=True
+        )
+        return
+
+    # ── open_pending: poll until the channel is active ──
+    if state == "open_pending":
+        channel_point = f"{entry.get('open_txid')}:{int(entry.get('open_output_index') or 0)}"
+        is_active, _ch, err = await lnd_service.channel_is_active(channel_point)
+        if err is not None:
+            return  # transient LND error — retry next tick
+        if not is_active:
+            _bootstrap_flag_stuck_if_waiting(run, entry, idx, "the channel open")
+            return  # still confirming
+        _bootstrap_clear_waiting(run, entry)
+        entry["state"] = "open_active"
+        run.channels[idx] = entry
+        return
+
+    # ── open_active: size the drain from the LIVE channel + create swap ──
+    if state == "open_active":
+        # A push_only round needs no swap: the inbound was created at open
+        # via push_sat. Settle immediately.
+        if bool(entry.get("push_only")):
+            reserve = bootstrap_reserve_for_capacity(int(entry["capacity_sats"]))
+            push = max(0, int(entry["capacity_sats"]) - reserve - 1_000)
+            entry["expected_inbound_sats"] = push
+            entry["recycled_sats"] = 0
+            entry["state"] = "settled"
+            run.channels[idx] = entry
+            run.realized_inbound_sats = int(run.realized_inbound_sats or 0) + push
+            run.total_fees_sats = int(run.total_fees_sats or 0) + int(
+                entry.get("open_fee_sats") or 0
+            )
+            return
+
+        channels, err = await lnd_service.get_channels()
+        if err or not isinstance(channels, list):
+            return  # transient
+        match = None
+        for ch in channels:
+            if (ch.get("remote_pubkey") or "").lower() == (
+                entry["peer_pubkey"] or ""
+            ).lower() and ch.get("active"):
+                match = ch
+                break
+        if match is None:
+            return  # not active yet (race) — retry
+
+        local = int(match.get("local_balance", 0) or 0)
+        reserve = int(match.get("local_chan_reserve_sat", 0) or 0)
+        commit = int(match.get("commit_fee", 0) or 0)
+        unsettled = int(match.get("unsettled_balance", 0) or 0)
+        chan_id = str(match.get("chan_id") or "")
+        drainable = max(0, local - reserve - commit - unsettled)
+        drain = int(drainable / (1.0 + BOOTSTRAP_ROUTING_FEE_PCT))
+        drain = min(drain, BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS)
+
+        if drain < BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS:
+            # The live channel can't be drained by swap (below Boltz min).
+            # The channel is fine (100% outbound, usable) but this round
+            # builds no inbound. Settle it as a no-op and let the run-level
+            # logic stop cleanly.
+            entry["expected_inbound_sats"] = 0
+            entry["recycled_sats"] = 0
+            entry["swap_error"] = "drainable below Boltz minimum — channel kept as outbound"
+            entry["state"] = "settled"
+            run.channels[idx] = entry
+            run.warnings.append(
+                f"Round {entry.get('round_index')}: channel opened but its drainable "
+                "amount fell below the Boltz minimum — kept as outbound."
+            )
+            run.total_fees_sats = int(run.total_fees_sats or 0) + int(
+                entry.get("open_fee_sats") or 0
+            )
+            return
+
+        addr_result, addr_err = await lnd_service.new_address(address_type="p2wkh")
+        if addr_err or not isinstance(addr_result, dict) or not addr_result.get("address"):
+            return  # transient — retry next tick
+        destination = addr_result["address"]
+
+        swap_row, swap_err = await boltz_service.create_reverse_swap(
+            db=db,
+            api_key_id=run.api_key_id,
+            invoice_amount_sats=drain,
+            destination_address=destination,
+            outgoing_chan_id=chan_id,  # pin the drain to the new channel
+        )
+        if swap_err or swap_row is None:
+            attempts = int(entry.get("swap_attempts", 0)) + 1
+            entry["swap_attempts"] = attempts
+            if attempts >= BOOTSTRAP_MAX_SWAP_ATTEMPTS:
+                entry["state"] = "swap_failed"
+                entry["swap_error"] = f"create swap: {swap_err or 'no swap'}"[:512]
+            else:
+                entry["swap_error"] = f"create swap (retry {attempts}): {swap_err}"[:512]
+            run.channels[idx] = entry
+            return
+
+        entry["swap_id"] = str(swap_row.id)
+        entry["drain_target_sats"] = drain
+        entry["expected_inbound_sats"] = drain
+        entry["state"] = "swap_pending"
+        entry["swap_error"] = None
+        entry["waiting_since"] = None  # fresh stuck-timer for the swap wait
+        run.channels[idx] = entry
+        # Persist the swap link immediately — the swap-idempotency guard
+        # (never create a second reverse swap for a round that has a
+        # ``swap_id``, plan §8) is only durable once committed. A crash
+        # before the tick's final commit must not lose it and re-create a
+        # second swap on resume (which would drain the channel twice).
+        await db.commit()
+
+        # Drive the LN payment + claim via the existing Boltz task.
+        try:
+            from app.tasks.boltz_tasks import process_boltz_swap
+
+            process_boltz_swap.delay(str(swap_row.id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "bootstrap: couldn't enqueue process_boltz_swap for %s: %s "
+                "(boltz recovery beat will pick it up)",
+                swap_row.id,
+                exc,
+            )
+        return
+
+    # ── swap_pending: wait for the claim to CONFIRM (the recycle gate) ──
+    if state == "swap_pending":
+        from app.models.boltz_swap import BoltzSwap, SwapStatus
+
+        swap_id = entry.get("swap_id")
+        if not swap_id:
+            entry["state"] = "open_active"  # lost the link — re-create swap
+            run.channels[idx] = entry
+            return
+        swap = (
+            await db.execute(select(BoltzSwap).where(BoltzSwap.id == UUID(swap_id)))
+        ).scalar_one_or_none()
+        if swap is None:
+            entry["state"] = "open_active"
+            entry["swap_id"] = None
+            run.channels[idx] = entry
+            return
+
+        if swap.status == SwapStatus.COMPLETED and swap.claim_txid:
+            # Claim confirmed on-chain (COMPLETED already requires the
+            # claim tx to have its confirmations — see boltz advance_swap).
+            recycled = int(swap.onchain_amount_sats or 0)
+            drain = int(entry.get("expected_inbound_sats") or 0)
+            swap_fee = max(0, drain - recycled)
+            entry["swap_claim_txid"] = swap.claim_txid
+            entry["recycled_sats"] = recycled
+            entry["swap_error"] = None
+            _bootstrap_clear_waiting(run, entry)
+            entry["state"] = "settled"
+            run.channels[idx] = entry
+            run.realized_inbound_sats = int(run.realized_inbound_sats or 0) + drain
+            run.total_fees_sats = (
+                int(run.total_fees_sats or 0)
+                + int(entry.get("open_fee_sats") or 0)
+                + swap_fee
+            )
+            return
+
+        if swap.status in (
+            SwapStatus.FAILED,
+            SwapStatus.CANCELLED,
+            SwapStatus.REFUNDED,
+        ):
+            # The LN payment couldn't route out the new channel, or Boltz
+            # refunded its lockup — no funds moved for us, no inbound this
+            # round. Bounded retry (a fresh channel often needs a moment
+            # for gossip/pathfinding), then give up on the round.
+            attempts = int(entry.get("swap_attempts", 0)) + 1
+            entry["swap_attempts"] = attempts
+            _bootstrap_clear_waiting(run, entry)
+            if attempts >= BOOTSTRAP_MAX_SWAP_ATTEMPTS:
+                entry["state"] = "swap_failed"
+                entry["swap_error"] = f"drain failed ({swap.status.value})"[:512]
+            else:
+                # Re-create a swap on the next tick.
+                entry["state"] = "open_active"
+                entry["swap_id"] = None
+                entry["swap_error"] = (
+                    f"drain attempt {attempts} failed ({swap.status.value}); retrying"
+                )[:512]
+            run.channels[idx] = entry
+            return
+
+        # Still in flight (paying / claiming) — stay, flag if slow, poll.
+        _bootstrap_flag_stuck_if_waiting(run, entry, idx, "the swap claim")
+        return
+
+
+def _bootstrap_audit_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Project a bootstrap round onto the flat shape ``_audit_channel_open``
+    expects (it reads ``capacity_sats``, ``push_sat``, ``peer_*``,
+    ``open_txid``)."""
+    return {
+        "peer_alias": entry.get("peer_alias"),
+        "peer_pubkey": entry.get("peer_pubkey"),
+        "peer_host": entry.get("peer_host"),
+        "capacity_sats": int(entry.get("capacity_sats") or 0),
+        "push_sat": 0,
+        "open_txid": entry.get("open_txid"),
+    }
+
+
+async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
+    """No round is in flight — decide whether to start a new one or
+    finalize the run. Applies all the stop conditions + the chain-truth
+    balance re-check (plan §6) before opening."""
+    from app.services.channel_mix_planner import (
+        BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS,
+        BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS,
+        BOOTSTRAP_HEADROOM_SATS,
+        BOOTSTRAP_MAX_ROUNDS,
+        PER_CHANNEL_FLOOR_SATS,
+        bootstrap_capacity_cap,
+        bootstrap_drain_for_capacity,
+    )
+    from app.services.channel_mix_planner import _open_fee_sats
+    from app.services.lnd_service import lnd_service
+
+    now = _utc_now()
+    settled = _bootstrap_settled_count(run)
+
+    # ── Stop conditions ──
+    if run.stop_requested:
+        # Cooperative cancel (plan §7.10): the in-flight round was allowed
+        # to settle (this branch only runs when no round is in flight); we
+        # finalize CANCELLED rather than COMPLETE so the run records that
+        # the user stopped it early, not that it ran to its natural end.
+        run.state = ChannelMixRunState.CANCELLED
+        run.completed_at = now
+        run.warnings.append("Stopped after the current round at your request.")
+        return
+    if _bootstrap_target_reached(run):
+        run.state = ChannelMixRunState.COMPLETE
+        run.completed_at = now
+        return
+    if settled >= BOOTSTRAP_MAX_ROUNDS:
+        run.state = ChannelMixRunState.COMPLETE
+        run.completed_at = now
+        run.warnings.append(f"Reached the {BOOTSTRAP_MAX_ROUNDS}-round cap.")
+        return
+    if _bootstrap_duration_exceeded(run, now):
+        run.state = ChannelMixRunState.COMPLETE
+        run.completed_at = now
+        run.warnings.append("Reached the maximum run duration.")
+        return
+
+    # ── Capital re-check from chain truth (plan §6) ──
+    bal, err = await lnd_service.get_wallet_balance()
+    if err or bal is None:
+        run.state = ChannelMixRunState.IN_PROGRESS  # transient — retry
+        return
+    confirmed = int(bal.get("confirmed_balance", 0) or 0)
+    sat_per_vb = await _bootstrap_feerate_sat_vb()
+    open_fee = _open_fee_sats(1, sat_per_vb)
+    capacity = confirmed - open_fee - BOOTSTRAP_HEADROOM_SATS
+    # Cap so this round's drainable doesn't exceed the Boltz max — the
+    # excess would strand as un-recyclable outbound. Leftover confirmed
+    # balance stays on-chain and funds the next round (matches the
+    # planner's estimate; plan §2).
+    capacity = min(capacity, bootstrap_capacity_cap(BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS))
+
+    if capacity < PER_CHANNEL_FLOOR_SATS:
+        if settled == 0:
+            run.state = ChannelMixRunState.STOPPED_INSUFFICIENT
+            run.completed_at = now
+            run.warnings.append(
+                "Not enough confirmed on-chain balance to open the first channel "
+                f"(need ~{PER_CHANNEL_FLOOR_SATS + open_fee:,} sats)."
+            )
+            return
+        # Transient: the prior swap's claim may still be confirming, or
+        # the user may top up. Enter / stay AWAITING_FUNDS until timeout.
+        if _bootstrap_awaiting_timed_out(run, now):
+            run.state = ChannelMixRunState.STOPPED_INSUFFICIENT
+            run.completed_at = now
+            run.warnings.append(
+                "Stopped — recyclable balance stayed below the next channel for too long."
+            )
+            return
+        if run.state != ChannelMixRunState.AWAITING_FUNDS:
+            _set_bootstrap_param(run, "awaiting_since", now.isoformat())
+        run.state = ChannelMixRunState.AWAITING_FUNDS
+        return
+
+    # Left AWAITING_FUNDS behind — clear the timer.
+    if (run.bootstrap_params or {}).get("awaiting_since"):
+        _set_bootstrap_param(run, "awaiting_since", None)
+
+    drain_est = bootstrap_drain_for_capacity(
+        capacity, boltz_max=BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS
+    )
+    final_push = bool((run.bootstrap_params or {}).get("final_push_round"))
+    push_only = False
+    if drain_est < BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS:
+        if not (final_push and capacity >= PER_CHANNEL_FLOOR_SATS):
+            run.state = ChannelMixRunState.COMPLETE
+            run.completed_at = now
+            run.warnings.append(
+                "Reached the practical limit — the remaining balance can't be "
+                "drained by swap."
+            )
+            return
+        push_only = True  # one final round: convert residual to inbound via push
+
+    peer = _bootstrap_next_peer(run, settled)
+    if peer is None:
+        run.state = ChannelMixRunState.COMPLETE
+        run.completed_at = now
+        run.warnings.append("No eligible peer available to open another channel.")
+        return
+
+    entry = make_bootstrap_round_entry(
+        round_index=settled,
+        peer_alias=peer.alias,
+        peer_pubkey=peer.node_id_hex,
+        peer_host=peer.address,
+        capacity_sats=capacity,
+        drain_target_sats=drain_est,
+        spendable_before_sats=confirmed,
+        state="opening",
+    )
+    entry["open_fee_sats"] = open_fee
+    if push_only:
+        entry["push_only"] = True
+    run.channels.append(entry)
+    run.state = ChannelMixRunState.IN_PROGRESS
+
+    # Do the open now (idempotent) so a tick makes real progress.
+    await _advance_bootstrap_round(db, run, len(run.channels) - 1)
+    if run.channels[-1].get("state") == "open_failed":
+        run.state = ChannelMixRunState.PARTIAL_FAILURE
+        run.completed_at = _utc_now()
+
+
+async def _advance_bootstrap(db, run: ChannelMixRun) -> None:
+    """One tick of the bootstrap loop: advance the in-flight round one
+    step, or (if none) start the next round / finalize the run."""
+    idx = _bootstrap_inflight_index(run)
+    if idx is not None:
+        await _advance_bootstrap_round(db, run, idx)
+        if _bootstrap_inflight_index(run) is not None:
+            run.state = ChannelMixRunState.IN_PROGRESS
+            return
+        # The round finished this tick.
+        last = run.channels[-1]
+        if last.get("state") in ("open_failed", "swap_failed"):
+            run.state = ChannelMixRunState.PARTIAL_FAILURE
+            run.completed_at = _utc_now()
+            return
+        # Settled — fall through and try to start the next round.
+    await _bootstrap_maybe_start_round(db, run)
+
+
 async def _run_one_mix(run_id: UUID) -> dict[str, Any]:
     """One tick of the executor — drives ``run_id`` forward as far as
     it can go right now.
@@ -387,13 +1035,21 @@ async def _run_one_mix(run_id: UUID) -> dict[str, Any]:
         run = row_result.scalar_one_or_none()
         if run is None:
             return {"status": "missing"}
-        if run.state in (ChannelMixRunState.COMPLETE, ChannelMixRunState.CANCELLED):
-            return {"status": str(run.state.value)}
+        if run.state in TERMINAL_RUN_STATES:
+            return {"status": str(run.state.value), "mode": run.mode}
+
+        run.updated_at = _utc_now()
+
+        # Bootstrap runs use the sequential settle-aware driver; the
+        # parallel path below is untouched.
+        if run.mode == "bootstrap":
+            await _advance_bootstrap(db, run)
+            await db.commit()
+            return {"status": str(run.state.value), "mode": "bootstrap"}
 
         # In-memory state transition; commit happens once at the end so
         # the row lock stays held through the per-channel work.
         run.state = ChannelMixRunState.IN_PROGRESS
-        run.updated_at = _utc_now()
 
         # 1) Open queued channels.
         for idx in range(len(run.channels)):
@@ -423,7 +1079,7 @@ async def _run_one_mix(run_id: UUID) -> dict[str, Any]:
         # Single commit at the end — releases the row lock and flushes
         # every per-channel transition the tick made.
         await db.commit()
-        return {"status": str(run.state.value)}
+        return {"status": str(run.state.value), "mode": run.mode}
 
 
 @celery_app.task(
@@ -435,18 +1091,30 @@ async def _run_one_mix(run_id: UUID) -> dict[str, Any]:
 def process_channel_mix_run(self, run_id: str) -> dict[str, Any]:
     """Drive one channel-mix run forward.
 
-    Retries with a constant backoff until the run reaches a terminal
-    state; the per-channel state machine ensures each retry only
-    advances the work that hasn't completed yet.
+    Parallel runs retry with a constant backoff until terminal; the
+    per-channel state machine ensures each retry only advances work that
+    hasn't completed yet.
+
+    Bootstrap runs do NOT self-retry. A bootstrap run can span hours
+    (each round ≈ open confirmations + claim confirmation), which exceeds
+    any sane self-retry budget, so a tick advances the run as far as
+    chain state allows and then exits; the periodic
+    ``recover_channel_mix_runs`` beat re-enqueues it each cycle (plan §4).
     """
     try:
         result: dict[str, Any] = _run_async(_run_one_mix(UUID(run_id)))
     except Exception:  # noqa: BLE001
         logger.exception("channel-mix executor: tick failed for %s", run_id)
         raise self.retry(countdown=30)
-    if result.get("status") in ("complete", "partial_failure", "cancelled"):
+    terminal = ("complete", "partial_failure", "cancelled", "stopped_insufficient")
+    if result.get("status") in terminal:
         return result
-    # Still in progress — re-queue.
+    if result.get("mode") == "bootstrap":
+        # Non-terminal bootstrap tick — the recover beat drives the long
+        # haul (open/claim confirmations take minutes), so we exit rather
+        # than burning the retry budget on a multi-hour run.
+        return result
+    # Parallel run still in progress — re-queue.
     raise self.retry(countdown=30)
 
 
@@ -461,6 +1129,9 @@ async def _run_recover_mix_runs() -> dict[str, Any]:
                     [
                         ChannelMixRunState.QUEUED,
                         ChannelMixRunState.IN_PROGRESS,
+                        # Bootstrap runs waiting for the recyclable balance
+                        # to recover (e.g. a swap claim still confirming).
+                        ChannelMixRunState.AWAITING_FUNDS,
                     ]
                 )
             )

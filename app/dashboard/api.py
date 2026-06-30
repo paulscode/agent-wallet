@@ -23,7 +23,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -2109,13 +2109,26 @@ class _DashChannelMixPlanRequest(BaseModel):
     branch.
     """
 
-    target_capacity_sats: int = Field(gt=0, le=1_000_000_000)
+    target_capacity_sats: Optional[int] = Field(default=None, gt=0, le=1_000_000_000)
     outbound_option: OutboundOption = Field(default="balanced")
     custom_inbound_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     peer_mix_mode: PeerMixMode = Field(default="recommended_diverse")
     manual_picks: list[str] = Field(default_factory=list)
     leave_room_for_one_more: bool = False
     include_marginal_routing: bool = False
+
+    # Bootstrap (capital-efficient inbound) inputs — mirror the v1
+    # ``ChannelMixPlanRequest`` so the dashboard handlers can delegate to
+    # the shared planner/executor helpers.
+    mode: Literal["parallel", "bootstrap"] = "parallel"
+    bootstrap_input_kind: Literal["target", "deposit"] = "target"
+    bootstrap_target_inbound_sats: Optional[int] = Field(
+        default=None, ge=0, le=1_000_000_000
+    )
+    bootstrap_deposit_sats: Optional[int] = Field(
+        default=None, ge=0, le=1_000_000_000
+    )
+    bootstrap_final_push_round: bool = False
 
 
 class _DashChannelMixExecuteRequest(_DashChannelMixPlanRequest):
@@ -2138,7 +2151,7 @@ async def _dash_build_plan(request: _DashChannelMixPlanRequest):
 
     boltz_available = bool(settings.boltz_api_url)
     return await plan_channel_mix(
-        target_capacity_sats=int(request.target_capacity_sats),
+        target_capacity_sats=int(request.target_capacity_sats or 0),
         outbound_option=request.outbound_option,
         peer_mix_mode=request.peer_mix_mode,
         network=settings.bitcoin_network,
@@ -2165,8 +2178,18 @@ async def channel_mix_plan(request: Request, body: _DashChannelMixPlanRequest) -
 
     from app.services.channel_mix_plan_token import sign_plan
 
+    if body.mode == "bootstrap":
+        from app.api.channel_mix import _build_bootstrap_plan
+
+        bootstrap = await _build_bootstrap_plan(body)
+        return {
+            "mode": "bootstrap",
+            "plan": _asdict(bootstrap),
+            "plan_token": sign_plan(bootstrap),
+        }
     plan = await _dash_build_plan(body)
     return {
+        "mode": "parallel",
         "plan": _asdict(plan),
         "plan_token": sign_plan(plan),
     }
@@ -2197,6 +2220,10 @@ async def channel_mix_execute(
     """
     from dataclasses import asdict as _asdict
 
+    from app.api.channel_mix import (
+        _active_run,
+        _build_bootstrap_plan,
+    )
     from app.models.channel_mix_run import (
         ChannelMixRun,
         ChannelMixRunState,
@@ -2207,7 +2234,14 @@ async def channel_mix_execute(
     plan_inputs = _DashChannelMixPlanRequest(
         **body.model_dump(exclude={"plan_token"})
     )
-    plan = await _dash_build_plan(plan_inputs)
+    is_bootstrap = body.mode == "bootstrap"
+    if is_bootstrap:
+        plan = await _build_bootstrap_plan(plan_inputs)
+        has_work = bool(plan.rounds)
+    else:
+        plan = await _dash_build_plan(plan_inputs)
+        has_work = bool(plan.per_channel)
+
     if not verify_plan_token(plan, body.plan_token):
         return JSONResponse(
             status_code=409,
@@ -2215,18 +2249,24 @@ async def channel_mix_execute(
                 "detail": {
                     "code": "plan_stale",
                     "message": "The plan has changed — review and re-confirm.",
+                    "mode": body.mode,
                     "plan": _asdict(plan),
                     "plan_token": sign_plan(plan),
                 },
             },
         )
-    if not plan.per_channel:
+    if not has_work:
         return JSONResponse(
             status_code=400,
             content={
                 "detail": {
                     "code": "empty_plan",
-                    "message": "The planner produced no channels for these inputs.",
+                    "message": (
+                        "The planner produced no rounds for these inputs."
+                        if is_bootstrap
+                        else "The planner produced no channels for these inputs."
+                    ),
+                    "mode": body.mode,
                     "plan": _asdict(plan),
                 },
             },
@@ -2249,29 +2289,72 @@ async def channel_mix_execute(
     if existing is not None:
         # Idempotent replay: return 200 OK (the default for this route),
         # not 201 Created, since no new row was created.
-        return {"mix_run_id": str(existing.id), "state": existing.state.value}
+        return {
+            "mix_run_id": str(existing.id),
+            "state": existing.state.value,
+            "mode": existing.mode,
+        }
 
-    channels = [
-        make_channel_entry(
-            peer_alias=ch.peer.alias,
-            peer_pubkey=ch.peer.node_id_hex,
-            peer_host=ch.peer.address,
-            capacity_sats=ch.capacity,
-            push_sat=ch.push_sat,
-            expected_inbound_seed_sats=ch.expected_inbound_seed_sats,
-            inbound_seed_strategy=ch.inbound_seed_strategy,
+    # One-active-run guard (plan §6a): never start a second capital-
+    # consuming loop while one is in flight. Return the in-flight run so
+    # the UI resumes its progress view.
+    active = await _active_run(db)
+    if active is not None:
+        return {
+            "mix_run_id": str(active.id),
+            "state": active.state.value,
+            "mode": active.mode,
+            "resumed": True,
+        }
+
+    if is_bootstrap:
+        run = ChannelMixRun(
+            api_key_id=DASHBOARD_KEY_ID,
+            plan_token_digest=token_digest,
+            state=ChannelMixRunState.QUEUED,
+            mode="bootstrap",
+            minimum_sats=plan.initial_deposit_sats,
+            recommended_sats=plan.initial_deposit_sats,
+            target_inbound_sats=plan.target_inbound_sats,
+            channels=[],
+            warnings=list(plan.diagnostics.warnings),
+            bootstrap_params={
+                "peer_mix_mode": plan_inputs.peer_mix_mode,
+                "manual_picks": list(plan_inputs.manual_picks),
+                "include_marginal_routing": bool(
+                    plan_inputs.include_marginal_routing
+                ),
+                "network": settings.bitcoin_network,
+                "final_push_round": bool(plan_inputs.bootstrap_final_push_round),
+                "deposit_sats": plan.initial_deposit_sats,
+                "expected_total_inbound_sats": plan.expected_total_inbound_sats,
+                "expected_rounds": plan.expected_rounds,
+                "expected_total_fees_sats": plan.expected_total_fees_sats,
+                "est_duration_minutes": plan.est_duration_minutes,
+            },
         )
-        for ch in plan.per_channel
-    ]
-    run = ChannelMixRun(
-        api_key_id=DASHBOARD_KEY_ID,
-        plan_token_digest=token_digest,
-        state=ChannelMixRunState.QUEUED,
-        minimum_sats=plan.minimum_sats,
-        recommended_sats=plan.recommended_sats,
-        channels=channels,
-        warnings=list(plan.diagnostics.warnings),
-    )
+    else:
+        channels = [
+            make_channel_entry(
+                peer_alias=ch.peer.alias,
+                peer_pubkey=ch.peer.node_id_hex,
+                peer_host=ch.peer.address,
+                capacity_sats=ch.capacity,
+                push_sat=ch.push_sat,
+                expected_inbound_seed_sats=ch.expected_inbound_seed_sats,
+                inbound_seed_strategy=ch.inbound_seed_strategy,
+            )
+            for ch in plan.per_channel
+        ]
+        run = ChannelMixRun(
+            api_key_id=DASHBOARD_KEY_ID,
+            plan_token_digest=token_digest,
+            state=ChannelMixRunState.QUEUED,
+            minimum_sats=plan.minimum_sats,
+            recommended_sats=plan.recommended_sats,
+            channels=channels,
+            warnings=list(plan.diagnostics.warnings),
+        )
     db.add(run)
     try:
         await db.commit()
@@ -2283,7 +2366,11 @@ async def channel_mix_execute(
             )
         ).scalar_one_or_none()
         if existing is not None:
-            return {"mix_run_id": str(existing.id), "state": existing.state.value}
+            return {
+                "mix_run_id": str(existing.id),
+                "state": existing.state.value,
+                "mode": existing.mode,
+            }
         return JSONResponse(
             status_code=409,
             content={
@@ -2300,7 +2387,7 @@ async def channel_mix_execute(
     process_channel_mix_run.delay(str(run.id))
     # Fresh run actually created on this call — signal "201 Created".
     response.status_code = 201
-    return {"mix_run_id": str(run.id), "state": run.state.value}
+    return {"mix_run_id": str(run.id), "state": run.state.value, "mode": run.mode}
 
 
 @router.get(
@@ -2311,7 +2398,8 @@ async def channel_mix_run_status(
     mix_run_id: UUID,
     db: AsyncSession = Depends(get_db),
 ) -> Any:
-    """Return the current per-channel state of one mix run."""
+    """Return the current per-channel / per-round state of one mix run."""
+    from app.api.channel_mix import _channels_summary
     from app.models.channel_mix_run import ChannelMixRun
 
     result = await db.execute(
@@ -2320,30 +2408,52 @@ async def channel_mix_run_status(
     run = result.scalar_one_or_none()
     if run is None:
         return JSONResponse(status_code=404, content={"detail": "Channel-mix run not found"})
-    channels = list(run.channels or [])
-    total = len(channels)
-    active = sum(1 for c in channels if c.get("open_state") == "open_active")
-    failed = sum(
-        1 for c in channels
-        if c.get("open_state") == "open_failed" or c.get("seed_state") == "seed_failed"
-    )
     return {
         "mix_run_id": str(run.id),
         "state": run.state.value,
+        "mode": run.mode,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "updated_at": run.updated_at.isoformat() if run.updated_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "minimum_sats": run.minimum_sats,
         "recommended_sats": run.recommended_sats,
-        "channels": channels,
+        "target_inbound_sats": run.target_inbound_sats,
+        "realized_inbound_sats": int(run.realized_inbound_sats or 0),
+        "total_fees_sats": int(run.total_fees_sats or 0),
+        "stop_requested": bool(run.stop_requested),
+        "bootstrap_params": run.bootstrap_params,
+        "channels": list(run.channels or []),
         "warnings": list(run.warnings),
         "error_message": run.error_message,
-        "summary": {
-            "channels_total": total,
-            "channels_active": active,
-            "channels_failed": failed,
-            "overall_state": run.state.value,
-        },
+        "summary": _channels_summary(run),
+    }
+
+
+@router.post(
+    "/channel-mix/runs/{mix_run_id}/stop",
+    dependencies=[Depends(_require_auth_csrf)],
+)
+async def channel_mix_run_stop(
+    mix_run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Cooperatively stop a run after its current round (bootstrap's
+    "Stop after this round" control)."""
+    from app.models.channel_mix_run import TERMINAL_RUN_STATES, ChannelMixRun
+
+    run = (
+        await db.execute(select(ChannelMixRun).where(ChannelMixRun.id == mix_run_id))
+    ).scalar_one_or_none()
+    if run is None:
+        return JSONResponse(status_code=404, content={"detail": "Channel-mix run not found"})
+    if run.state not in TERMINAL_RUN_STATES and not run.stop_requested:
+        run.stop_requested = True
+        await db.commit()
+    return {
+        "mix_run_id": str(run.id),
+        "state": run.state.value,
+        "mode": run.mode,
+        "stop_requested": bool(run.stop_requested),
     }
 
 

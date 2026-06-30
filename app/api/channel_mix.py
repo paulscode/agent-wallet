@@ -18,7 +18,7 @@ Three endpoints, all admin-gated:
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -33,6 +33,8 @@ from app.core.limiter import limiter
 from app.core.security import get_admin_key
 from app.models.api_key import APIKey
 from app.models.channel_mix_run import (
+    BOOTSTRAP_ROUND_TERMINAL_STATES,
+    TERMINAL_RUN_STATES,
     ChannelMixRun,
     ChannelMixRunState,
     make_channel_entry,
@@ -43,12 +45,22 @@ from app.services.channel_mix_plan_token import (
     verify_plan_token,
 )
 from app.services.channel_mix_planner import (
+    BootstrapPlan,
     OutboundOption,
     PeerMixMode,
     Plan,
     plan_channel_mix,
 )
 from app.services.small_channel_peers import SNAPSHOT_DATE
+
+# Run states that mean "a capital-consuming loop is in flight" — the
+# one-active-run guard (plan §6a) refuses to start a second run while any
+# of these exist, so two loops can't race the same UTXO set.
+_NON_TERMINAL_RUN_STATES = (
+    ChannelMixRunState.QUEUED,
+    ChannelMixRunState.IN_PROGRESS,
+    ChannelMixRunState.AWAITING_FUNDS,
+)
 
 router = APIRouter(prefix=f"{API_V1_PREFIX}/wallet/channel-mix", tags=["channel-mix"])
 
@@ -61,13 +73,32 @@ class ChannelMixPlanRequest(BaseModel):
     ``execute`` so the planner can re-run and the token can be
     verified."""
 
-    target_capacity_sats: int = Field(gt=0, le=1_000_000_000)
+    # ``target_capacity_sats`` is required for the parallel planner and
+    # ignored for bootstrap (which sizes from deposit / target inbound).
+    target_capacity_sats: Optional[int] = Field(default=None, gt=0, le=1_000_000_000)
     outbound_option: OutboundOption = Field(default="balanced")
     custom_inbound_pct: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     peer_mix_mode: PeerMixMode = Field(default="recommended_diverse")
     manual_picks: Sequence[str] = Field(default=())
     leave_room_for_one_more: bool = False
     include_marginal_routing: bool = False
+
+    # ── Bootstrap (capital-efficient inbound) inputs ──
+    # ``mode="bootstrap"`` selects the sequential open→drain→recycle
+    # planner/executor. ``bootstrap_input_kind`` picks the framing:
+    # ``target`` (default — "I want ~X receivable") or ``deposit``
+    # ("I have X to start").
+    mode: Literal["parallel", "bootstrap"] = "parallel"
+    bootstrap_input_kind: Literal["target", "deposit"] = "target"
+    bootstrap_target_inbound_sats: Optional[int] = Field(
+        default=None, ge=0, le=1_000_000_000
+    )
+    bootstrap_deposit_sats: Optional[int] = Field(
+        default=None, ge=0, le=1_000_000_000
+    )
+    # Off by default: one final round that converts the un-drainable
+    # residual to inbound via push_sat (permanently spent — plan §11.5).
+    bootstrap_final_push_round: bool = False
 
 
 class ChannelMixExecuteRequest(ChannelMixPlanRequest):
@@ -81,10 +112,11 @@ class ChannelMixExecuteRequest(ChannelMixPlanRequest):
 # ─── Helpers ──────────────────────────────────────────────────────
 
 
-def _plan_to_dict(plan: Plan) -> dict[str, Any]:
-    """Project a :class:`Plan` to a plain JSON dict for the response
-    body. Tuples become lists; ``SmallChannelPeer`` collapses to its
-    catalog shape so the dashboard JS can share the catalog renderer.
+def _plan_to_dict(plan: "Plan | BootstrapPlan") -> dict[str, Any]:
+    """Project a :class:`Plan` or :class:`BootstrapPlan` to a plain JSON
+    dict for the response body. Tuples become lists; ``SmallChannelPeer``
+    collapses to its catalog shape so the dashboard JS can share the
+    catalog renderer.
     """
     payload = asdict(plan)
     return payload
@@ -119,7 +151,7 @@ async def _build_plan(
 
     boltz_available = await _resolve_boltz_available()
     return await plan_channel_mix(
-        target_capacity_sats=int(request.target_capacity_sats),
+        target_capacity_sats=int(request.target_capacity_sats or 0),
         outbound_option=request.outbound_option,
         peer_mix_mode=request.peer_mix_mode,
         network=settings.bitcoin_network,
@@ -131,6 +163,73 @@ async def _build_plan(
         manual_picks=tuple(request.manual_picks),
         include_marginal_routing=request.include_marginal_routing,
     )
+
+
+async def _build_bootstrap_plan(request: ChannelMixPlanRequest) -> BootstrapPlan:
+    """Run the bootstrap (capital-efficient inbound) planner.
+
+    Resolves the live fee rates + eligible peer pool here (the pure
+    :func:`derive_bootstrap_schedule` takes them as inputs), then
+    simulates the open→drain→recycle loop for the chosen framing."""
+    from app.services.boltz_service import (
+        BOLTZ_MAX_AMOUNT_SATS,
+        BOLTZ_MIN_AMOUNT_SATS,
+    )
+    from app.services.channel_mix_planner import (
+        _resolve_fee_rates,
+        derive_bootstrap_schedule,
+        select_peers,
+    )
+    from app.services.mempool_fee_service import mempool_fee_service
+
+    async def _oracle():
+        return await mempool_fee_service.get_recommended_fees()
+
+    medium, high, fee_warnings = await _resolve_fee_rates(_oracle)
+    peers, axes = select_peers(
+        network=settings.bitcoin_network,
+        channel_count=64,  # full ordered eligible pool, not a cap
+        mode=request.peer_mix_mode,
+        manual_picks=tuple(request.manual_picks),
+        include_marginal_routing=request.include_marginal_routing,
+    )
+
+    deposit = None
+    target = None
+    if request.bootstrap_input_kind == "deposit":
+        deposit = int(request.bootstrap_deposit_sats or 0)
+    else:
+        target = int(request.bootstrap_target_inbound_sats or 0)
+
+    return derive_bootstrap_schedule(
+        deposit_sats=deposit,
+        target_inbound_sats=target,
+        fee_rate_sat_vb_medium=medium,
+        fee_rate_sat_vb_high=high,
+        peers=peers,
+        catalog_snapshot_date=SNAPSHOT_DATE,
+        diversity_axes=axes,
+        # Don't offer bootstrap when Boltz is unreachable (plan §7.1) —
+        # the planner returns an empty schedule with an explanatory warning.
+        boltz_available=await _resolve_boltz_available(),
+        boltz_min=BOLTZ_MIN_AMOUNT_SATS,
+        boltz_max=BOLTZ_MAX_AMOUNT_SATS,
+        extra_warnings=list(fee_warnings),
+    )
+
+
+async def _active_run(db: AsyncSession) -> Optional[ChannelMixRun]:
+    """Return any non-terminal channel-mix run (parallel or bootstrap),
+    or None. Backs the one-active-run guard (plan §6a): two
+    capital-consuming loops must never race the same UTXO set."""
+    return (
+        await db.execute(
+            select(ChannelMixRun)
+            .where(ChannelMixRun.state.in_(_NON_TERMINAL_RUN_STATES))
+            .order_by(ChannelMixRun.started_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
 
 
 # ─── Endpoints ────────────────────────────────────────────────────
@@ -153,8 +252,16 @@ async def post_channel_mix_plan(
     wizard while bounding a runaway loop that would otherwise burn
     mempool-fee-oracle calls without limit.
     """
+    if body.mode == "bootstrap":
+        bootstrap = await _build_bootstrap_plan(body)
+        return {
+            "mode": "bootstrap",
+            "plan": _plan_to_dict(bootstrap),
+            "plan_token": sign_plan(bootstrap),
+        }
     plan = await _build_plan(body)
     return {
+        "mode": "parallel",
         "plan": _plan_to_dict(plan),
         "plan_token": sign_plan(plan),
     }
@@ -184,7 +291,15 @@ async def post_channel_mix_execute(
     there to stop.
     """
     plan_inputs = ChannelMixPlanRequest(**body.model_dump(exclude={"plan_token"}))
-    plan = await _build_plan(plan_inputs)
+    is_bootstrap = body.mode == "bootstrap"
+
+    if is_bootstrap:
+        plan: Any = await _build_bootstrap_plan(plan_inputs)
+        has_work = bool(plan.rounds)
+    else:
+        plan = await _build_plan(plan_inputs)
+        has_work = bool(plan.per_channel)
+
     if not verify_plan_token(plan, body.plan_token):
         # Either the caller forged the token, the catalog refreshed, or
         # the fee oracle moved. Either way, the safe thing is to surface
@@ -194,16 +309,22 @@ async def post_channel_mix_execute(
             detail={
                 "code": "plan_stale",
                 "message": "The plan has changed since the token was issued — review and re-confirm.",
+                "mode": body.mode,
                 "plan": _plan_to_dict(plan),
                 "plan_token": sign_plan(plan),
             },
         )
-    if not plan.per_channel:
+    if not has_work:
         raise HTTPException(
             status_code=400,
             detail={
                 "code": "empty_plan",
-                "message": "The planner produced no channels for these inputs.",
+                "message": (
+                    "The planner produced no rounds for these inputs."
+                    if is_bootstrap
+                    else "The planner produced no channels for these inputs."
+                ),
+                "mode": body.mode,
                 "plan": _plan_to_dict(plan),
             },
         )
@@ -223,29 +344,75 @@ async def post_channel_mix_execute(
     if existing is not None:
         # Idempotent replay: return 200 OK (the default for this route),
         # not 201 Created, since no new row was created.
-        return {"mix_run_id": str(existing.id), "state": existing.state.value}
+        return {
+            "mix_run_id": str(existing.id),
+            "state": existing.state.value,
+            "mode": existing.mode,
+        }
 
-    channels = [
-        make_channel_entry(
-            peer_alias=ch.peer.alias,
-            peer_pubkey=ch.peer.node_id_hex,
-            peer_host=ch.peer.address,
-            capacity_sats=ch.capacity,
-            push_sat=ch.push_sat,
-            expected_inbound_seed_sats=ch.expected_inbound_seed_sats,
-            inbound_seed_strategy=ch.inbound_seed_strategy,
+    # One-active-run guard (plan §6a): never start a second capital-
+    # consuming loop while one is already in flight — two loops racing the
+    # same UTXO set is the worst case for the concurrency failure modes.
+    # Return the in-flight run so the UI resumes its progress view.
+    active = await _active_run(db)
+    if active is not None:
+        return {
+            "mix_run_id": str(active.id),
+            "state": active.state.value,
+            "mode": active.mode,
+            "resumed": True,
+        }
+
+    if is_bootstrap:
+        run = ChannelMixRun(
+            api_key_id=admin_key.id,
+            plan_token_digest=token_digest,
+            state=ChannelMixRunState.QUEUED,
+            mode="bootstrap",
+            # For a bootstrap run these mirror the initial deposit; the
+            # loop recomputes capacity from live balance each round.
+            minimum_sats=plan.initial_deposit_sats,
+            recommended_sats=plan.initial_deposit_sats,
+            target_inbound_sats=plan.target_inbound_sats,
+            channels=[],  # rounds appended as they run (not pre-materialized)
+            warnings=list(plan.diagnostics.warnings),
+            bootstrap_params={
+                "peer_mix_mode": plan_inputs.peer_mix_mode,
+                "manual_picks": list(plan_inputs.manual_picks),
+                "include_marginal_routing": bool(
+                    plan_inputs.include_marginal_routing
+                ),
+                "network": settings.bitcoin_network,
+                "final_push_round": bool(plan_inputs.bootstrap_final_push_round),
+                "deposit_sats": plan.initial_deposit_sats,
+                "expected_total_inbound_sats": plan.expected_total_inbound_sats,
+                "expected_rounds": plan.expected_rounds,
+                "expected_total_fees_sats": plan.expected_total_fees_sats,
+                "est_duration_minutes": plan.est_duration_minutes,
+            },
         )
-        for ch in plan.per_channel
-    ]
-    run = ChannelMixRun(
-        api_key_id=admin_key.id,
-        plan_token_digest=token_digest,
-        state=ChannelMixRunState.QUEUED,
-        minimum_sats=plan.minimum_sats,
-        recommended_sats=plan.recommended_sats,
-        channels=channels,
-        warnings=list(plan.diagnostics.warnings),
-    )
+    else:
+        channels = [
+            make_channel_entry(
+                peer_alias=ch.peer.alias,
+                peer_pubkey=ch.peer.node_id_hex,
+                peer_host=ch.peer.address,
+                capacity_sats=ch.capacity,
+                push_sat=ch.push_sat,
+                expected_inbound_seed_sats=ch.expected_inbound_seed_sats,
+                inbound_seed_strategy=ch.inbound_seed_strategy,
+            )
+            for ch in plan.per_channel
+        ]
+        run = ChannelMixRun(
+            api_key_id=admin_key.id,
+            plan_token_digest=token_digest,
+            state=ChannelMixRunState.QUEUED,
+            minimum_sats=plan.minimum_sats,
+            recommended_sats=plan.recommended_sats,
+            channels=channels,
+            warnings=list(plan.diagnostics.warnings),
+        )
     db.add(run)
     try:
         await db.commit()
@@ -260,7 +427,11 @@ async def post_channel_mix_execute(
             )
         ).scalar_one_or_none()
         if existing is not None:
-            return {"mix_run_id": str(existing.id), "state": existing.state.value}
+            return {
+                "mix_run_id": str(existing.id),
+                "state": existing.state.value,
+                "mode": existing.mode,
+            }
         # Shouldn't happen — surface a generic 409 so the caller retries.
         raise HTTPException(
             status_code=409,
@@ -282,6 +453,7 @@ async def post_channel_mix_execute(
     return {
         "mix_run_id": str(run.id),
         "state": run.state.value,
+        "mode": run.mode,
     }
 
 
@@ -316,11 +488,17 @@ async def get_channel_mix_run(
     return {
         "mix_run_id": str(run.id),
         "state": run.state.value,
+        "mode": run.mode,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "updated_at": run.updated_at.isoformat() if run.updated_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
         "minimum_sats": run.minimum_sats,
         "recommended_sats": run.recommended_sats,
+        "target_inbound_sats": run.target_inbound_sats,
+        "realized_inbound_sats": int(run.realized_inbound_sats or 0),
+        "total_fees_sats": int(run.total_fees_sats or 0),
+        "stop_requested": bool(run.stop_requested),
+        "bootstrap_params": run.bootstrap_params,
         "channels": list(run.channels),
         "warnings": list(run.warnings),
         "error_message": run.error_message,
@@ -329,8 +507,32 @@ async def get_channel_mix_run(
 
 
 def _channels_summary(run: ChannelMixRun) -> dict[str, Any]:
-    """Roll up the per-channel sub-states for the polling response."""
+    """Roll up the per-channel / per-round sub-states for polling."""
     channels = list(run.channels or [])
+    if run.mode == "bootstrap":
+        settled = sum(1 for c in channels if c.get("state") == "settled")
+        failed = sum(
+            1 for c in channels if c.get("state") in ("open_failed", "swap_failed")
+        )
+        in_flight = sum(
+            1
+            for c in channels
+            if c.get("state") not in BOOTSTRAP_ROUND_TERMINAL_STATES
+        )
+        params = run.bootstrap_params or {}
+        return {
+            "mode": "bootstrap",
+            "rounds_total": len(channels),
+            "rounds_settled": settled,
+            "rounds_failed": failed,
+            "rounds_in_flight": in_flight,
+            "expected_rounds": params.get("expected_rounds"),
+            "realized_inbound_sats": int(run.realized_inbound_sats or 0),
+            "expected_total_inbound_sats": params.get("expected_total_inbound_sats"),
+            "target_inbound_sats": run.target_inbound_sats,
+            "total_fees_sats": int(run.total_fees_sats or 0),
+            "overall_state": run.state.value,
+        }
     total = len(channels)
     active = sum(1 for c in channels if c.get("open_state") == "open_active")
     failed = sum(
@@ -338,10 +540,40 @@ def _channels_summary(run: ChannelMixRun) -> dict[str, Any]:
         if c.get("open_state") == "open_failed" or c.get("seed_state") == "seed_failed"
     )
     return {
+        "mode": "parallel",
         "channels_total": total,
         "channels_active": active,
         "channels_failed": failed,
         "overall_state": run.state.value,
+    }
+
+
+@router.post("/runs/{mix_run_id}/stop")
+async def post_channel_mix_run_stop(
+    mix_run_id: UUID,
+    admin_key: APIKey = Depends(get_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Request a cooperative stop of a run after its current round.
+
+    Used by the bootstrap "Stop after this round" control (plan §9 /
+    §7.10): the executor lets the in-flight round settle (so a half-done
+    swap isn't stranded), then finalizes instead of starting a new round.
+    A no-op on an already-terminal run.
+    """
+    run = (
+        await db.execute(select(ChannelMixRun).where(ChannelMixRun.id == mix_run_id))
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Channel-mix run not found")
+    if run.state not in TERMINAL_RUN_STATES and not run.stop_requested:
+        run.stop_requested = True
+        await db.commit()
+    return {
+        "mix_run_id": str(run.id),
+        "state": run.state.value,
+        "mode": run.mode,
+        "stop_requested": bool(run.stop_requested),
     }
 
 

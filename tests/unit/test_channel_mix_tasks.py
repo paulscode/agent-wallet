@@ -49,13 +49,20 @@ class _FakeLnd:
             return False, "peer unreachable"
         return True, None
 
-    async def open_channel(self, *, node_pubkey: str, local_funding_amount: int, push_sat: int):
-        outcome = self.behaviour.get(node_pubkey, "open_ok")
+    async def open_channel(
+        self,
+        node_pubkey_hex: str,
+        local_funding_amount: int,
+        sat_per_vbyte: int | None = None,
+        push_sat: int = 0,
+        private: bool = False,
+    ):
+        outcome = self.behaviour.get(node_pubkey_hex, "open_ok")
         if outcome == "open_fail":
             return None, "funding broadcast rejected"
-        # Successful open — return the LND-shape result.
-        self.active_pubkeys.append(node_pubkey)
-        return ({"funding_txid_str": "ab" * 32}, None)
+        # Successful open — return the real LND-service result shape.
+        self.active_pubkeys.append(node_pubkey_hex)
+        return ({"funding_txid": "ab" * 32, "output_index": 0}, None)
 
     async def get_channels(self):
         return (

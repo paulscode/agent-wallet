@@ -364,6 +364,195 @@ class TestExecuteEndpoint:
         mock_delay.assert_not_called()
 
 
+# ─── Bootstrap (capital-efficient inbound) endpoints ────────────────
+
+
+class TestBootstrapEndpoints:
+    """End-to-end coverage of the bootstrap strategy through the real
+    HTTP layer: request-model acceptance, ``BootstrapPlan`` JSON
+    serialization (nested peer), plan-token round-trip, run creation
+    with bootstrap fields, the one-active-run guard, stop, status
+    rollup, and the Boltz-unavailable gate."""
+
+    @staticmethod
+    def _oracle():
+        return patch(
+            "app.services.mempool_fee_service.mempool_fee_service.get_recommended_fees",
+            side_effect=_stub_fee_oracle(medium=10, high=15),
+        )
+
+    @staticmethod
+    def _boltz(available: bool):
+        return patch(
+            "app.api.channel_mix._resolve_boltz_available",
+            new_callable=AsyncMock,
+            return_value=available,
+        )
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_plan_returns_schedule(self, dashboard_client):
+        with self._oracle(), self._boltz(True):
+            resp = await dashboard_client.post(
+                "/dashboard/api/channel-mix/plan",
+                json={
+                    "mode": "bootstrap",
+                    "bootstrap_input_kind": "target",
+                    "bootstrap_target_inbound_sats": 1_500_000,
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["mode"] == "bootstrap"
+        plan = body["plan"]
+        assert plan["rounds"], "expected a non-empty bootstrap schedule"
+        assert plan["expected_total_inbound_sats"] >= 1_500_000
+        # The recycling win: the deposit needed is below the target.
+        assert plan["initial_deposit_sats"] < 1_500_000
+        # Nested SmallChannelPeer survives the asdict → JSON projection.
+        assert plan["rounds"][0]["peer"]["alias"]
+        assert body["plan_token"]
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_execute_then_stop_and_status(
+        self, dashboard_client, db_engine
+    ):
+        import uuid as _uuid
+
+        from sqlalchemy import select
+
+        from app.models.channel_mix_run import ChannelMixRun
+
+        inputs = {
+            "mode": "bootstrap",
+            "bootstrap_input_kind": "target",
+            "bootstrap_target_inbound_sats": 1_500_000,
+        }
+        with self._oracle(), self._boltz(True), patch(
+            "app.tasks.channel_mix_tasks.process_channel_mix_run.delay"
+        ) as mock_delay:
+            plan_resp = await dashboard_client.post(
+                "/dashboard/api/channel-mix/plan", json=inputs
+            )
+            plan_body = plan_resp.json()
+            exec_resp = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute",
+                json={**inputs, "plan_token": plan_body["plan_token"]},
+            )
+        assert exec_resp.status_code == 201, exec_resp.text
+        eb = exec_resp.json()
+        assert eb["mode"] == "bootstrap"
+        assert eb["state"] == "queued"
+        mock_delay.assert_called_once_with(eb["mix_run_id"])
+
+        # The persisted row is a bootstrap run with no pre-materialized
+        # channels and the runtime params the executor needs.
+        session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with session_factory() as s:
+            run = (
+                await s.execute(
+                    select(ChannelMixRun).where(
+                        ChannelMixRun.id == _uuid.UUID(eb["mix_run_id"])
+                    )
+                )
+            ).scalar_one()
+            assert run.mode == "bootstrap"
+            assert run.target_inbound_sats == 1_500_000
+            assert run.channels == []
+            assert run.bootstrap_params and run.bootstrap_params["network"]
+
+        # Stop control flips stop_requested.
+        stop_resp = await dashboard_client.post(
+            f"/dashboard/api/channel-mix/runs/{eb['mix_run_id']}/stop"
+        )
+        assert stop_resp.status_code == 200, stop_resp.text
+        assert stop_resp.json()["stop_requested"] is True
+
+        # Status exposes the bootstrap rollup shape.
+        status_resp = await dashboard_client.get(
+            f"/dashboard/api/channel-mix/runs/{eb['mix_run_id']}"
+        )
+        sb = status_resp.json()
+        assert sb["mode"] == "bootstrap"
+        assert sb["summary"]["mode"] == "bootstrap"
+        assert sb["stop_requested"] is True
+        assert sb["target_inbound_sats"] == 1_500_000
+
+    @pytest.mark.asyncio
+    async def test_one_active_run_guard_returns_existing(self, dashboard_client):
+        """A second run can't start while one is non-terminal — the
+        execute call returns the in-flight run (plan §6a)."""
+        with self._oracle(), self._boltz(True), patch(
+            "app.tasks.channel_mix_tasks.process_channel_mix_run.delay"
+        ):
+            plan_a = (
+                await dashboard_client.post(
+                    "/dashboard/api/channel-mix/plan",
+                    json={"mode": "bootstrap", "bootstrap_target_inbound_sats": 1_500_000},
+                )
+            ).json()
+            first = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute",
+                json={
+                    "mode": "bootstrap",
+                    "bootstrap_target_inbound_sats": 1_500_000,
+                    "plan_token": plan_a["plan_token"],
+                },
+            )
+            # A different plan (parallel this time) while one is active.
+            plan_b = (
+                await dashboard_client.post(
+                    "/dashboard/api/channel-mix/plan",
+                    json={"target_capacity_sats": 800_000},
+                )
+            ).json()
+            second = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute",
+                json={"target_capacity_sats": 800_000, "plan_token": plan_b["plan_token"]},
+            )
+        assert first.status_code == 201
+        assert second.status_code == 200, second.text
+        sb = second.json()
+        assert sb.get("resumed") is True
+        assert sb["mix_run_id"] == first.json()["mix_run_id"]
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_execute_same_token_is_idempotent(self, dashboard_client):
+        """A retried bootstrap execute with the same plan_token resolves to
+        the same run (digest idempotency), not a duplicate loop."""
+        inputs = {"mode": "bootstrap", "bootstrap_target_inbound_sats": 1_500_000}
+        with self._oracle(), self._boltz(True), patch(
+            "app.tasks.channel_mix_tasks.process_channel_mix_run.delay"
+        ) as mock_delay:
+            plan_body = (
+                await dashboard_client.post(
+                    "/dashboard/api/channel-mix/plan", json=inputs
+                )
+            ).json()
+            body = {**inputs, "plan_token": plan_body["plan_token"]}
+            first = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute", json=body
+            )
+            second = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute", json=body
+            )
+        assert first.status_code == 201
+        assert second.status_code == 200
+        assert first.json()["mix_run_id"] == second.json()["mix_run_id"]
+        mock_delay.assert_called_once_with(first.json()["mix_run_id"])
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_not_offered_when_boltz_unavailable(self, dashboard_client):
+        with self._oracle(), self._boltz(False):
+            resp = await dashboard_client.post(
+                "/dashboard/api/channel-mix/plan",
+                json={"mode": "bootstrap", "bootstrap_target_inbound_sats": 1_500_000},
+            )
+        assert resp.status_code == 200, resp.text
+        plan = resp.json()["plan"]
+        assert plan["rounds"] == []
+        assert any("Boltz" in w for w in plan["diagnostics"]["warnings"])
+
+
 # ─── Pydantic Literal-type validation on the dashboard wrapper ──────
 
 

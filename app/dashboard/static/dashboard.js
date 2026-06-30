@@ -135,6 +135,10 @@ const BRAIINS_DEPOSIT_GLOSSARY = {
         title: 'Lightning routing headroom',
         body: 'A safety reserve for the Lightning leg — capped at 3% — not a fee you pay. The actual routing fee is usually a small fraction of this (often well under 0.5%). It is reserved so the payment has enough fee budget to find a route and won\'t fail; whatever isn\'t used stays in your wallet\'s Lightning balance. It is not paid to the wallet operator or to Braiins.',
     },
+    'inbound-bootstrap': {
+        title: 'Build inbound efficiently',
+        body: 'Inbound (receive) capacity normally costs as much to set up as the amount you want to receive. This option recycles the same funds instead: it opens one channel, swaps that channel\'s balance back to your on-chain wallet (which leaves the channel able to receive), then reuses the returned funds to open the next channel — and repeats. You can build several times your starting amount in inbound, but each round waits for on-chain confirmations, so it takes hours and costs a little in fees each round. It runs in the background; you can keep using the wallet.',
+    },
     'btc-tx-prepared': {
         title: 'Bitcoin transaction prepared',
         body: 'Boltz Exchange has produced a Bitcoin transaction that pays the sats you converted into your wallet. The transaction has been broadcast to the network and is waiting to be confirmed by miners.',
@@ -1255,6 +1259,12 @@ document.addEventListener('alpine:init', () => {
             manual_picks: [],
             leave_room_for_one_more: false,
             include_marginal_routing: false,
+            // Bootstrap (capital-efficient inbound) inputs.
+            mode: 'parallel',
+            bootstrap_input_kind: 'target',
+            bootstrap_target_inbound_sats: null,
+            bootstrap_deposit_sats: null,
+            bootstrap_final_push_round: false,
         },
         // The {plan, plan_token} returned by ``/wallet/channel-mix/plan``.
         channelPlanResult: null,
@@ -7272,10 +7282,35 @@ document.addEventListener('alpine:init', () => {
         /** Drive the planner's submit-disabled state. */
         get channelPlanCanSubmit() {
             const f = this.channelPlanForm || {};
-            const target = Number(f.target_capacity_sats || 0);
-            if (target <= 0) return false;
             if (this.channelPlanLoading) return false;
-            return true;
+            if (f.mode === 'bootstrap') {
+                const amount = f.bootstrap_input_kind === 'deposit'
+                    ? Number(f.bootstrap_deposit_sats || 0)
+                    : Number(f.bootstrap_target_inbound_sats || 0);
+                return amount > 0;
+            }
+            return Number(f.target_capacity_sats || 0) > 0;
+        },
+
+        /** True when the active plan/preview is the bootstrap strategy. */
+        get channelPlanIsBootstrap() {
+            const m = (this.channelPlanResult && this.channelPlanResult.mode)
+                || (this.channelPlanForm && this.channelPlanForm.mode);
+            return m === 'bootstrap';
+        },
+
+        /** The BootstrapPlan body (same accessor as channelPlanPlan, but
+         *  named for the bootstrap-specific template bindings). */
+        get channelBootstrapPlan() {
+            return this.channelPlanPlan || {};
+        },
+
+        /** Human "~N hours" / "~N min" label for the bootstrap estimate. */
+        get channelBootstrapDurationLabel() {
+            const mins = (this.channelBootstrapPlan.est_duration_minutes) || 0;
+            if (mins >= 120) return Math.round(mins / 60) + ' hours';
+            if (mins >= 60) return '1 hour';
+            return Math.max(1, Math.round(mins)) + ' min';
         },
 
         /** True when the planner's plan-preview view should expose the
@@ -7355,13 +7390,77 @@ document.addEventListener('alpine:init', () => {
             return this.channelPlanBreakdown.future_channel_slot_sats || 0;
         },
 
-        /** Per-channel state entries for the executing screen; always
-         *  an array. */
+        /** Per-channel (or per-round) state entries for the executing
+         *  screen; always an array. */
         get channelMixRunChannels() {
             if (!this.channelMixRun) return [];
             return Array.isArray(this.channelMixRun.channels)
                 ? this.channelMixRun.channels
                 : [];
+        },
+
+        /** True when the run being polled is a bootstrap run. */
+        get channelMixRunIsBootstrap() {
+            return !!(this.channelMixRun && this.channelMixRun.mode === 'bootstrap');
+        },
+
+        get channelMixRunRealizedInbound() {
+            return (this.channelMixRun && this.channelMixRun.realized_inbound_sats) || 0;
+        },
+
+        get channelMixRunTotalFees() {
+            return (this.channelMixRun && this.channelMixRun.total_fees_sats) || 0;
+        },
+
+        get channelMixRunStopRequested() {
+            return !!(this.channelMixRun && this.channelMixRun.stop_requested);
+        },
+
+        get channelMixRunWarnings() {
+            if (!this.channelMixRun) return [];
+            return Array.isArray(this.channelMixRun.warnings)
+                ? this.channelMixRun.warnings
+                : [];
+        },
+
+        /** "settled / expected" rounds label for the bootstrap progress. */
+        get channelMixRunRoundsLabel() {
+            const s = (this.channelMixRun && this.channelMixRun.summary) || {};
+            const done = s.rounds_settled || 0;
+            const expected = s.expected_rounds;
+            return expected ? (done + ' / ~' + expected) : String(done);
+        },
+
+        /** A short status line for the bootstrap run's overall state. */
+        get channelMixRunStateLabel() {
+            const st = this.channelMixRun && this.channelMixRun.state;
+            if (st === 'awaiting_funds') return 'Waiting for funds to recycle…';
+            if (st === 'stopped_insufficient') return 'Stopped — not enough capital to continue.';
+            if (st === 'partial_failure') return 'Stopped early — some rounds didn’t complete.';
+            if (st === 'cancelled') return 'Stopped at your request.';
+            if (st === 'complete') return 'Finished.';
+            return '';
+        },
+
+        /** Non-fatal "taking longer than expected" note from the executor
+         *  (e.g. a confirmation that's slow); empty string when none. */
+        get channelMixRunNote() {
+            return (this.channelMixRun && this.channelMixRun.error_message) || '';
+        },
+
+        /** Friendly label for one bootstrap round's sub-state. */
+        channelMixRoundStateLabel(state) {
+            const map = {
+                opening: 'opening channel',
+                open_pending: 'confirming…',
+                open_active: 'channel active',
+                swapping: 'draining…',
+                swap_pending: 'recycling (confirming)…',
+                settled: 'done',
+                open_failed: 'open failed',
+                swap_failed: 'drain failed',
+            };
+            return map[state] || String(state || '').replace(/_/g, ' ');
         },
 
         /** Reset the planner state — used both when the user dismisses
@@ -7385,12 +7484,28 @@ document.addEventListener('alpine:init', () => {
                 manual_picks: [],
                 leave_room_for_one_more: false,
                 include_marginal_routing: false,
+                mode: 'parallel',
+                bootstrap_input_kind: 'target',
+                bootstrap_target_inbound_sats: null,
+                bootstrap_deposit_sats: null,
+                bootstrap_final_push_round: false,
             };
         },
 
         /** Open the planner — moves the wizard into ``plan_form``. */
         openChannelPlanner() {
             this._resetChannelPlanState();
+            this.channelPlanMode = 'plan_form';
+        },
+
+        /** Open the planner pre-set to the capital-efficient bootstrap
+         *  strategy — the onboarding "build inbound from a smaller
+         *  deposit" path (plan §9). Defaults to the target-inbound
+         *  framing so the new user states what they want to receive. */
+        openInboundBootstrap() {
+            this._resetChannelPlanState();
+            this.channelPlanForm.mode = 'bootstrap';
+            this.channelPlanForm.bootstrap_input_kind = 'target';
             this.channelPlanMode = 'plan_form';
         },
 
@@ -7445,9 +7560,11 @@ document.addEventListener('alpine:init', () => {
                 // preview with it so the user can re-confirm.
                 if (e && e.status === 409 && e.detail && e.detail.plan && e.detail.plan_token) {
                     this.channelPlanResult = {
+                        mode: e.detail.mode || this.channelPlanForm.mode,
                         plan: e.detail.plan,
                         plan_token: e.detail.plan_token,
                     };
+                    this.channelPlanMode = 'plan_preview';
                     this.channelPlanError = e.detail.message || 'The plan has changed — please review and re-confirm.';
                 } else {
                     this.channelPlanError = (e && e.message) || 'Couldn’t start the plan.';
@@ -7471,7 +7588,15 @@ document.addEventListener('alpine:init', () => {
                     );
                     this.channelMixRun = body;
                     const state = body && body.state;
-                    if (state === 'complete' || state === 'partial_failure' || state === 'cancelled') {
+                    // ``awaiting_funds`` is a transient bootstrap state —
+                    // keep polling. The rest are terminal.
+                    const terminal = (
+                        state === 'complete'
+                        || state === 'partial_failure'
+                        || state === 'cancelled'
+                        || state === 'stopped_insufficient'
+                    );
+                    if (terminal) {
                         this.channelPlanMode = 'done';
                         this._stopChannelMixPolling();
                         // Refresh the rest of the dashboard so the new
@@ -7491,6 +7616,23 @@ document.addEventListener('alpine:init', () => {
             if (this._channelMixPollTimer) {
                 clearInterval(this._channelMixPollTimer);
                 this._channelMixPollTimer = null;
+            }
+        },
+
+        /** Request a cooperative stop of the running bootstrap loop after
+         *  its current round (the "Stop after this round" control). */
+        async stopChannelMixRun() {
+            if (!this.channelMixRunId || this.channelMixRunStopRequested) return;
+            try {
+                const body = await this.api(
+                    'POST',
+                    '/channel-mix/runs/' + this.channelMixRunId + '/stop',
+                );
+                if (body && this.channelMixRun) {
+                    this.channelMixRun.stop_requested = !!body.stop_requested;
+                }
+            } catch (e) {
+                // Best-effort — the next poll reflects the real state.
             }
         },
 

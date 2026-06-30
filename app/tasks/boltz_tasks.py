@@ -95,9 +95,13 @@ celery_app.conf.update(
         # Same recovery role for channel-mix runs: a worker crash
         # mid-run would otherwise leave the per-channel state machine
         # idle until the next dashboard poll re-triggered the task.
+        # Runs every 60 s (not 300 s) because the sequential *bootstrap*
+        # executor relies on this beat — not task self-retry — to drive
+        # its multi-hour open→drain→recycle loop forward each cycle
+        # (see channel_mix_tasks.process_channel_mix_run).
         "recover-channel-mix-runs": {
             "task": "recover_channel_mix_runs",
-            "schedule": 300.0,  # Every 5 minutes
+            "schedule": 60.0,  # Every 60 seconds
         },
         # Sweep the UTXO label store: stamp spent_at on outpoints
         # that disappeared from ListUnspent, seed auto:receive

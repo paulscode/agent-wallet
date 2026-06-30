@@ -401,6 +401,15 @@
                         </p>
                     </template>
 
+                    <!-- Low-capital / receive-heavy path: build inbound by recycling
+                         a small deposit through swaps (plan §9 fresh-install tie-in). -->
+                    <template x-if="onboardingCatalogAvailable">
+                        <p class="text-xs text-gray-500 text-center mt-2">
+                            Want to receive more than you deposited?
+                            <button @click="openInboundBootstrap()" class="text-neon-cyan hover:underline">Build inbound efficiently</button>
+                        </p>
+                    </template>
+
                     <p class="text-xs text-gray-500 text-center mt-2">
                         Prefer the regular dashboard?
                         <button @click="onboardingSkip()" class="text-neon-cyan hover:underline">Skip to dashboard</button>
@@ -416,7 +425,33 @@
                     </p>
 
                     <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
+                        <!-- Strategy toggle: one-shot parallel vs capital-efficient bootstrap -->
                         <div>
+                            <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">Strategy</p>
+                            <div class="space-y-1.5">
+                                <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.mode === 'parallel' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.mode" value="parallel" class="mt-0.5 accent-neon-cyan">
+                                    <span><span class="text-white">Open channels now</span> — fund and open a few channels at once. Fast; needs the full amount up front.</span>
+                                </label>
+                                <label class="flex items-start gap-2 p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.mode === 'bootstrap' ? 'border-neon-cyan/40 bg-neon-cyan/5 text-gray-200' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.mode" value="bootstrap" class="mt-0.5 accent-neon-cyan">
+                                    <span class="flex-1">
+                                        <span class="text-white">Build inbound efficiently</span> — open one channel at a time and recycle the funds via swaps. Needs much less to start, but takes hours.
+                                        <button type="button" class="text-gray-500 hover:text-emerald-400 ml-1 align-middle"
+                                                x-on:click.stop.prevent="braiinsDepositToggleInfoTip('inbound-bootstrap')" aria-label="What is this?">
+                                            <svg class="w-3 h-3 inline" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                                        </button>
+                                        <span x-show="braiinsDepositInfoTipOpen === 'inbound-bootstrap'" x-cloak class="block mt-2 p-2 rounded bg-navy-700 border border-navy-500 text-[11px] text-gray-200 leading-relaxed normal-case"
+                                              x-text="braiinsDepositGlossaryBody('inbound-bootstrap')"></span>
+                                    </span>
+                                </label>
+                            </div>
+                        </div>
+
+                        <!-- Parallel: target capacity -->
+                        <div x-show="channelPlanForm.mode === 'parallel'">
                             <label class="text-xs uppercase tracking-wider text-gray-500 mb-1.5 block">
                                 Roughly how much to commit?
                             </label>
@@ -430,7 +465,42 @@
                             </p>
                         </div>
 
-                        <div>
+                        <!-- Bootstrap: target inbound / deposit -->
+                        <div x-show="channelPlanForm.mode === 'bootstrap'">
+                            <div class="grid grid-cols-2 gap-1.5 mb-3">
+                                <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.bootstrap_input_kind === 'target' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.bootstrap_input_kind" value="target" class="sr-only">
+                                    I want to receive…
+                                </label>
+                                <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
+                                       :class="channelPlanForm.bootstrap_input_kind === 'deposit' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                    <input type="radio" x-model="channelPlanForm.bootstrap_input_kind" value="deposit" class="sr-only">
+                                    I have to start…
+                                </label>
+                            </div>
+                            <div class="relative" x-show="channelPlanForm.bootstrap_input_kind === 'target'">
+                                <input type="number" min="1" x-model.number="channelPlanForm.bootstrap_target_inbound_sats"
+                                       placeholder="Target inbound"
+                                       class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40 focus:ring-1 focus:ring-neon-green/20 transition-all">
+                                <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
+                            </div>
+                            <div class="relative" x-show="channelPlanForm.bootstrap_input_kind === 'deposit'">
+                                <input type="number" min="1" x-model.number="channelPlanForm.bootstrap_deposit_sats"
+                                       placeholder="Amount to start with"
+                                       class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40 focus:ring-1 focus:ring-neon-green/20 transition-all">
+                                <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
+                            </div>
+                            <p class="text-[11px] text-gray-500 mt-1">
+                                Available: <span x-text="formatSats(onboardingOnchainSats)"></span> sats. We open one channel at a time and recycle the funds.
+                            </p>
+                            <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer mt-2">
+                                <input type="checkbox" x-model="channelPlanForm.bootstrap_final_push_round" class="accent-neon-cyan">
+                                Convert the leftover to inbound at the end (spends it; off by default)
+                            </label>
+                        </div>
+
+                        <div x-show="channelPlanForm.mode === 'parallel'">
                             <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">Balance shape</p>
                             <div class="grid grid-cols-3 gap-1.5">
                                 <label class="text-center p-2 rounded border cursor-pointer text-xs transition-colors"
@@ -467,7 +537,7 @@
                             </div>
                         </div>
 
-                        <div>
+                        <div x-show="channelPlanForm.mode === 'parallel'">
                             <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
                                 <input type="checkbox" x-model="channelPlanForm.leave_room_for_one_more" class="accent-neon-cyan">
                                 Leave room for one more channel later
@@ -504,14 +574,58 @@
                     <template x-if="channelPlanHasResult">
                         <div>
                             <h2 class="text-xl font-semibold text-white text-center mb-1">Here's the plan</h2>
-                            <p class="text-sm text-gray-400 text-center max-w-md mx-auto mb-6">
+                            <p class="text-sm text-gray-400 text-center max-w-md mx-auto mb-6" x-show="!channelPlanIsBootstrap">
                                 <span x-text="channelPlanPerChannel.length"></span> channels across
                                 <span x-text="channelPlanPerChannel.length"></span> peers.
                             </p>
+                            <p class="text-sm text-gray-400 text-center max-w-md mx-auto mb-6" x-show="channelPlanIsBootstrap">
+                                <span x-text="channelBootstrapPlan.expected_rounds"></span> rounds, one channel at a time —
+                                ~<span x-text="channelBootstrapDurationLabel"></span>.
+                            </p>
 
                             <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
-                                <!-- Headline two-number display -->
-                                <div class="text-center">
+                                <!-- Bootstrap estimate -->
+                                <template x-if="channelPlanIsBootstrap">
+                                    <div class="space-y-4">
+                                        <div class="text-center">
+                                            <p class="text-xs uppercase tracking-wider text-gray-500 mb-1">Deposit to start</p>
+                                            <p class="text-3xl font-bold font-mono text-white">
+                                                <span x-text="formatSats(channelBootstrapPlan.initial_deposit_sats)"></span>
+                                                <span class="text-base text-gray-500 font-normal">sats</span>
+                                            </p>
+                                        </div>
+                                        <div class="border-t border-navy-700 pt-4 space-y-1.5 text-xs">
+                                            <div class="flex justify-between">
+                                                <span class="text-gray-400">Inbound you'll build</span>
+                                                <span class="font-mono text-neon-green" x-text="formatSats(channelBootstrapPlan.expected_total_inbound_sats) + ' sat'"></span>
+                                            </div>
+                                            <div class="flex justify-between">
+                                                <span class="text-gray-400">Rounds</span>
+                                                <span class="font-mono text-gray-300" x-text="channelBootstrapPlan.expected_rounds"></span>
+                                            </div>
+                                            <div class="flex justify-between">
+                                                <span class="text-gray-400">Estimated time</span>
+                                                <span class="font-mono text-gray-300" x-text="channelBootstrapDurationLabel"></span>
+                                            </div>
+                                            <div class="flex justify-between">
+                                                <span class="text-gray-400">Estimated fees</span>
+                                                <span class="font-mono text-gray-300" x-text="formatSats(channelBootstrapPlan.expected_total_fees_sats) + ' sat'"></span>
+                                            </div>
+                                            <div class="flex justify-between">
+                                                <span class="text-gray-400">Left as outbound / reserve</span>
+                                                <span class="font-mono text-gray-300" x-text="formatSats(channelBootstrapPlan.residual_outbound_sats) + ' sat'"></span>
+                                            </div>
+                                        </div>
+                                        <p class="text-[11px] text-gray-500 leading-relaxed border-t border-navy-700 pt-3">
+                                            This runs in the background — you can keep using the wallet. We open a channel,
+                                            swap its balance back on-chain, and reuse it for the next one. Numbers are estimates;
+                                            fees and routing make the result best-effort.
+                                        </p>
+                                    </div>
+                                </template>
+
+                                <!-- Headline two-number display (parallel) -->
+                                <div class="text-center" x-show="!channelPlanIsBootstrap">
                                     <p class="text-xs uppercase tracking-wider text-gray-500 mb-1">
                                         <template x-if="!channelPlanShowMinimum">
                                             <span>Recommended funding</span>
@@ -549,7 +663,7 @@
                                 </div>
 
                                 <!-- Buffer disclosure -->
-                                <template x-if="channelPlanShowBuffer && !channelPlanShowMinimum">
+                                <template x-if="!channelPlanIsBootstrap && channelPlanShowBuffer && !channelPlanShowMinimum">
                                     <div class="border-t border-navy-700 pt-4">
                                         <button type="button" @click="channelPlanWhyOpen = !channelPlanWhyOpen"
                                                 class="w-full flex items-center justify-between text-left text-xs text-gray-400 hover:text-white">
@@ -581,7 +695,7 @@
                                 </template>
 
                                 <!-- Per-channel list -->
-                                <div class="border-t border-navy-700 pt-4">
+                                <div class="border-t border-navy-700 pt-4" x-show="!channelPlanIsBootstrap">
                                     <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">Channels</p>
                                     <ul class="space-y-2">
                                         <template x-for="(ch, idx) in channelPlanPerChannel" :key="idx">
@@ -626,8 +740,11 @@
                                         <template x-if="channelPlanLoading">
                                             <span class="flex items-center gap-2"><span class="w-3.5 h-3.5 border-2 border-neon-green border-t-transparent rounded-full animate-spin"></span> Starting…</span>
                                         </template>
-                                        <template x-if="!channelPlanLoading">
+                                        <template x-if="!channelPlanLoading && !channelPlanIsBootstrap">
                                             <span class="flex items-center gap-2"><i data-lucide="zap" class="w-4 h-4"></i> Open channels</span>
+                                        </template>
+                                        <template x-if="!channelPlanLoading && channelPlanIsBootstrap">
+                                            <span class="flex items-center gap-2"><i data-lucide="zap" class="w-4 h-4"></i> Start building inbound</span>
                                         </template>
                                     </button>
                                 </div>
@@ -652,11 +769,87 @@
                     </div>
 
                     <h2 class="text-xl font-semibold text-white text-center mb-2">
-                        <template x-if="channelPlanMode === 'executing'"><span>Opening your channels…</span></template>
+                        <template x-if="channelPlanMode === 'executing' && !channelMixRunIsBootstrap"><span>Opening your channels…</span></template>
+                        <template x-if="channelPlanMode === 'executing' && channelMixRunIsBootstrap"><span>Building inbound…</span></template>
                         <template x-if="channelPlanMode === 'done'"><span>All done</span></template>
                     </h2>
 
-                    <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto">
+                    <!-- Bootstrap: running totals + per-round progress + stop -->
+                    <template x-if="channelMixRunIsBootstrap">
+                        <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-4">
+                            <div class="grid grid-cols-3 gap-2 text-center">
+                                <div>
+                                    <p class="text-[10px] uppercase tracking-wider text-gray-500">Inbound built</p>
+                                    <p class="font-mono text-sm text-neon-green" x-text="formatSats(channelMixRunRealizedInbound)"></p>
+                                </div>
+                                <div>
+                                    <p class="text-[10px] uppercase tracking-wider text-gray-500">Rounds</p>
+                                    <p class="font-mono text-sm text-gray-200" x-text="channelMixRunRoundsLabel"></p>
+                                </div>
+                                <div>
+                                    <p class="text-[10px] uppercase tracking-wider text-gray-500">Fees</p>
+                                    <p class="font-mono text-sm text-gray-200" x-text="formatSats(channelMixRunTotalFees)"></p>
+                                </div>
+                            </div>
+                            <template x-if="channelMixRunStateLabel">
+                                <p class="text-[11px] text-center text-gray-400" x-text="channelMixRunStateLabel"></p>
+                            </template>
+                            <template x-if="channelMixRunNote">
+                                <p class="text-[11px] text-center text-neon-yellow" x-text="channelMixRunNote"></p>
+                            </template>
+                            <template x-if="channelMixRunChannels.length">
+                                <ul class="space-y-2">
+                                    <template x-for="(r, idx) in channelMixRunChannels" :key="idx">
+                                        <li class="bg-navy-800 border border-navy-700 rounded px-3 py-2 text-xs">
+                                            <div class="flex items-center justify-between">
+                                                <span class="font-medium text-white">Round <span x-text="r.round_index + 1"></span> · <span x-text="r.peer_alias"></span></span>
+                                                <span class="font-mono text-gray-300" x-text="formatSats(r.capacity_sats) + ' sat'"></span>
+                                            </div>
+                                            <div class="flex items-center justify-between mt-1">
+                                                <span class="text-[10px] text-gray-500" x-text="channelMixRoundStateLabel(r.state)"></span>
+                                                <template x-if="r.state === 'settled'">
+                                                    <i data-lucide="check" class="w-3.5 h-3.5 text-neon-green"></i>
+                                                </template>
+                                                <template x-if="r.state === 'open_failed' || r.state === 'swap_failed'">
+                                                    <i data-lucide="x" class="w-3.5 h-3.5 text-neon-pink"></i>
+                                                </template>
+                                                <template x-if="r.state !== 'settled' && r.state !== 'open_failed' && r.state !== 'swap_failed'">
+                                                    <span class="w-3 h-3 border-2 border-neon-yellow border-t-transparent rounded-full animate-spin"></span>
+                                                </template>
+                                            </div>
+                                            <template x-if="r.expected_inbound_sats > 0">
+                                                <p class="text-[10px] text-gray-500 mt-0.5">+<span x-text="formatSats(r.expected_inbound_sats)"></span> inbound</p>
+                                            </template>
+                                            <template x-if="r.open_error">
+                                                <p class="text-[10px] text-neon-pink mt-1" x-text="r.open_error"></p>
+                                            </template>
+                                            <template x-if="r.swap_error">
+                                                <p class="text-[10px] text-neon-yellow mt-1" x-text="r.swap_error"></p>
+                                            </template>
+                                        </li>
+                                    </template>
+                                </ul>
+                            </template>
+                            <template x-if="channelMixRunWarnings.length">
+                                <ul class="space-y-1 border-t border-navy-700 pt-3">
+                                    <template x-for="w in channelMixRunWarnings" :key="w">
+                                        <li class="text-[11px] text-neon-yellow flex items-start gap-1.5">
+                                            <i data-lucide="alert-triangle" class="w-3 h-3 shrink-0 mt-0.5"></i><span x-text="w"></span>
+                                        </li>
+                                    </template>
+                                </ul>
+                            </template>
+                            <template x-if="channelPlanMode === 'executing'">
+                                <button @click="stopChannelMixRun()" :disabled="channelMixRunStopRequested"
+                                        class="w-full px-4 py-2 rounded-lg border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 text-xs transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                                    <span x-show="!channelMixRunStopRequested">Stop after this round</span>
+                                    <span x-show="channelMixRunStopRequested">Stopping after this round…</span>
+                                </button>
+                            </template>
+                        </div>
+                    </template>
+
+                    <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto" x-show="!channelMixRunIsBootstrap">
                         <template x-if="channelMixRunChannels.length">
                             <ul class="space-y-2">
                                 <template x-for="(ch, idx) in channelMixRunChannels" :key="idx">

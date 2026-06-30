@@ -112,3 +112,70 @@ class TestMalformedTokens:
     def test_non_string_token_rejected(self):
         assert verify_plan_token(_make_plan(), None, secret="x" * 64) is False  # type: ignore[arg-type]
         assert verify_plan_token(_make_plan(), 42, secret="x" * 64) is False  # type: ignore[arg-type]
+
+
+# ─── BootstrapPlan also round-trips through the same token machinery ──
+
+
+def _make_bootstrap_plan(*, deposit: int = 500_000, rounds_meta: str = ""):
+    from app.services.channel_mix_planner import (
+        BootstrapPlan,
+        BootstrapRound,
+    )
+    from app.services.small_channel_peers import lookup
+
+    babylon = lookup(
+        "0340cfadaa3324e0dd176a9969be050114278f93260e1b6333bd2a2a2ea03c64a3",
+        network="bitcoin",
+    )
+    assert babylon is not None
+    return BootstrapPlan(
+        initial_deposit_sats=deposit,
+        target_inbound_sats=None,
+        expected_total_inbound_sats=2_000_000,
+        expected_total_fees_sats=50_000,
+        expected_rounds=1,
+        est_duration_minutes=40,
+        residual_outbound_sats=20_000,
+        rounds=(
+            BootstrapRound(
+                peer=babylon,
+                capacity_sats=deposit - 2_500,
+                drain_target_sats=400_000,
+                expected_inbound_sats=400_000,
+                est_open_fee_sats=2_500,
+                est_swap_fee_sats=1_200,
+            ),
+        ),
+        diagnostics=PlanDiagnostics(
+            warnings=(rounds_meta,) if rounds_meta else (),
+            fee_rate_sat_vb_medium=10.0,
+            fee_rate_sat_vb_high=15.0,
+            catalog_snapshot_date="2026-06-27",
+            diversity_axes_satisfied=(),
+        ),
+    )
+
+
+class TestBootstrapPlanToken:
+    def test_round_trip_passes(self):
+        plan = _make_bootstrap_plan()
+        token = sign_plan(plan)
+        assert verify_plan_token(plan, token) is True
+
+    def test_changing_deposit_invalidates(self):
+        token = sign_plan(_make_bootstrap_plan(deposit=500_000))
+        # A different deposit (different schedule) must not verify.
+        assert verify_plan_token(_make_bootstrap_plan(deposit=600_000), token) is False
+
+    def test_changing_a_round_field_invalidates(self):
+        plan = _make_bootstrap_plan()
+        token = sign_plan(plan)
+        tampered = _make_bootstrap_plan(rounds_meta="injected-warning")
+        assert verify_plan_token(tampered, token) is False
+
+    def test_bootstrap_and_parallel_plans_do_not_collide(self):
+        """A BootstrapPlan token must never validate a parallel Plan (the
+        execute endpoint re-builds the right type per mode)."""
+        bootstrap_token = sign_plan(_make_bootstrap_plan())
+        assert verify_plan_token(_make_plan(), bootstrap_token) is False

@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-29
+
+### Added
+
+- **Capital-efficient inbound bootstrap.** A new channel-mix strategy that
+  builds a large amount of inbound (receive) liquidity from a small on-chain
+  deposit by *recycling* capital: it opens one channel, reverse-swaps that
+  channel's balance back on-chain (which leaves the channel able to receive),
+  then reuses the returned funds to open the next channel — repeating until it
+  reaches your target or the recyclable balance falls below a single channel's
+  worth. A modest deposit can accumulate several times its size in inbound,
+  bounded only by the cumulative per-round fees and the unspendable channel
+  reserve rather than by the total inbound target.
+  - **Planner.** A pure, deterministic schedule simulator with two framings —
+    "I want to receive ~X" (finds the minimal deposit) and "I have ~X to start"
+    (shows the expected inbound) — surfacing the round count, time estimate
+    (each round waits for on-chain confirmations, so the loop takes hours),
+    total fees, and the capital left as outbound/reserve, all before anything
+    happens on-chain. Bootstrap is not offered when Boltz is unreachable.
+  - **Executor.** A sequential, settle-aware executor opens one channel at a
+    time, sizes the drain from the live channel, pins the reverse swap to that
+    channel, and waits for the swap claim to confirm on-chain before recycling
+    the returned capital into the next round. It is crash-safe and resumable
+    (idempotent on the funding txid and the swap id) and driven by the periodic
+    recovery beat, so a multi-hour run survives worker restarts. Failure modes
+    are handled conservatively — funds are never destroyed, only delayed or left
+    as a usable channel — and the loop stops cleanly with a partial result
+    rather than retrying forever; an unreachable peer escalates to the next one
+    instead of wedging.
+  - **Dashboard.** A "Build inbound efficiently" strategy toggle in the
+    channel-mix planner with the full pre-run estimate, live per-round progress
+    (inbound built, fees spent, rounds done), a "Stop after this round" control,
+    and an onboarding tie-in offering the bootstrap path to new users with a
+    small balance.
+  - Only one channel-mix run (parallel or bootstrap) executes at a time, so two
+    capital-consuming loops can't race the same on-chain UTXO set.
+
+### Fixed
+
+- **Channel-mix (parallel) executor: corrected the LND open-channel call.** The
+  parallel channel-mix path invoked `open_channel` with a stale keyword argument
+  and read a non-existent result field for the funding txid; both are corrected
+  to match the LND service contract, so executor-driven opens and their txid
+  audit records work as intended.
+
 ## [0.1.3] - 2026-06-29
 
 ### Fixed
