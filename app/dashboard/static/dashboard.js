@@ -31,6 +31,11 @@ const CHANNEL_PLANNER_AUTOOFFER_FLOOR_SATS = 400000;
 // doesn't accumulate background timers at different rates.
 const CHANNEL_MIX_RUN_POLL_MS = 5000;
 
+// First-screen funding wizard: scale presets (sats) and the localStorage key
+// that carries the chosen plan from the recommendation across the deposit wait.
+const WELCOME_SCALE_PRESETS = { light: 100000, standard: 500000, heavy: 2000000 };
+const ONBOARDING_PLAN_KEY = 'awOnboardingPlan';
+
 // Onboarding default-amount safety buffer (sats). We pre-fill the
 // channel amount as ``onchain - buffer`` so the wallet keeps a small
 // reserve for on-chain fees (e.g. cooperative close fees, future
@@ -1205,6 +1210,21 @@ document.addEventListener('alpine:init', () => {
         // user-controlled inputs (peer choice, amount, custom URI)
         // and a transient "I just submitted, suppress flicker" flag.
         onboardingSkipped: false,
+        // ── First-screen funding wizard (empty-wallet welcome) ──
+        // Which beat of the intent→amount→recommendation flow is showing.
+        welcomeBeat: 'use_case',                    // 'use_case' | 'scale' | 'recommend'
+        welcomeUseCase: '',                         // 'spend'|'receive'|'both'|'explore'
+        welcomeScalePreset: '',                     // 'light'|'standard'|'heavy'|'custom'
+        welcomeScaleCustom: null,                   // sats, when preset === 'custom'
+        welcomeRec: null,                           // {primary, alternative, warnings}
+        welcomeRecLoading: false,
+        welcomeRecError: '',
+        welcomeReceiveVariant: 'primary',           // which receive card is selected
+        welcomeWhyOpen: false,                      // "Why this amount?" disclosure
+        _welcomeScaleDebounce: null,
+        // Suggested deposit (sats) the Fund Wallet dialog echoes + encodes
+        // into the BIP21 QR; null when the dialog is opened normally.
+        fundSuggestedSats: null,
         // Which mode the wizard's picker is in. ``recommended_default``
         // auto-picks the cheapest ⭐ catalog peer that accepts the
         // current amount; ``pick_from_list`` lets the user choose any
@@ -1894,7 +1914,7 @@ document.addEventListener('alpine:init', () => {
             this.coldStep = 'form';
             this.coldResultData = null;
         },
-        openOnchainReceive() {
+        openOnchainReceive(suggestedSats) {
             // Always present a clean slate: a previous successful or
             // failed generate would otherwise leave `fundAddress`
             // populated (hiding the address-type picker behind
@@ -1904,7 +1924,23 @@ document.addEventListener('alpine:init', () => {
             this.fundLoading = false;
             this.fundCopied = false;
             this.fundAddrType = 'p2wkh';
+            // Optional funding guidance: the onboarding wizard passes the
+            // recommended amount so the dialog can show it and encode it in
+            // the BIP21 QR. Plain opens (Quick Receive, menu) pass nothing.
+            const sats = Number(suggestedSats) || 0;
+            this.fundSuggestedSats = sats > 0 ? sats : null;
             this.showFundWallet = true;
+        },
+
+        /** BIP21 URI for the QR — includes the suggested amount (in BTC) when
+         *  opened from the onboarding wizard so the sending wallet pre-fills
+         *  it. Plain on-chain `bitcoin:<addr>` otherwise. */
+        _fundBip21() {
+            const uri = 'bitcoin:' + this.fundAddress;
+            const sats = Number(this.fundSuggestedSats) || 0;
+            if (sats <= 0) return uri;
+            const btc = (sats / 1e8).toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+            return uri + '?amount=' + btc;
         },
 
         // ── Init ──
@@ -1946,6 +1982,12 @@ document.addEventListener('alpine:init', () => {
                 // we came from ``connecting`` (a channel-open the user
                 // actually drove through the wizard) AND the user did
                 // not explicitly skip. Otherwise quietly hand off.
+                if (oldStep && !newStep) {
+                    // Onboarding finished — the saved funding plan is spent;
+                    // clear it so a returning, funded user never sees stale
+                    // guidance.
+                    this._clearOnboardingPlan();
+                }
                 if (oldStep === 'connecting' && !newStep && !this.onboardingSkipped) {
                     this._triggerOnboardingCelebration();
                 } else if (!oldStep && newStep) {
@@ -5711,7 +5753,7 @@ document.addEventListener('alpine:init', () => {
                 const data = await this.api('POST', '/address', { address_type: this.fundAddrType, purpose: this.fundPurpose || '' });
                 this.fundAddress = data.address;
                 this.$nextTick(() => {
-                    this.renderQr(this.$refs.fundQr, 'bitcoin:' + this.fundAddress);
+                    this.renderQr(this.$refs.fundQr, this._fundBip21());
                     this.initIcons();
                 });
             } catch (e) {
@@ -7502,10 +7544,12 @@ document.addEventListener('alpine:init', () => {
          *  strategy — the onboarding "build inbound from a smaller
          *  deposit" path (plan §9). Defaults to the target-inbound
          *  framing so the new user states what they want to receive. */
-        openInboundBootstrap() {
+        openInboundBootstrap(targetInboundSats) {
             this._resetChannelPlanState();
             this.channelPlanForm.mode = 'bootstrap';
             this.channelPlanForm.bootstrap_input_kind = 'target';
+            const t = Number(targetInboundSats) || 0;
+            if (t > 0) this.channelPlanForm.bootstrap_target_inbound_sats = t;
             this.channelPlanMode = 'plan_form';
         },
 
@@ -7707,6 +7751,215 @@ document.addEventListener('alpine:init', () => {
             this.openOnchainReceive();
         },
 
+        // ── First-screen funding wizard (intent → amount → recommendation) ──
+
+        /** Verb for the scale question, by use case. */
+        get welcomeVerb() {
+            const m = { spend: 'spend', receive: 'receive', both: 'move' };
+            return m[this.welcomeUseCase] || 'commit';
+        },
+
+        /** Resolved scale in sats from the chosen preset / custom entry. */
+        get welcomeScaleSats() {
+            if (this.welcomeScalePreset === 'custom') {
+                return Number(this.welcomeScaleCustom) || 0;
+            }
+            return WELCOME_SCALE_PRESETS[this.welcomeScalePreset] || 0;
+        },
+
+        /** The recommendation card currently shown (receive can flip between
+         *  the primary and alternative strategies). */
+        get welcomeActiveCard() {
+            if (!this.welcomeRec) return null;
+            if (this.welcomeReceiveVariant === 'alternative' && this.welcomeRec.alternative) {
+                return this.welcomeRec.alternative;
+            }
+            return this.welcomeRec.primary;
+        },
+
+        get welcomeActiveIsBootstrap() {
+            const c = this.welcomeActiveCard;
+            return !!(c && c.strategy === 'bootstrap');
+        },
+
+        get welcomeActiveStrategy() {
+            const c = this.welcomeActiveCard;
+            return c ? c.strategy : '';
+        },
+
+        /** The active card's bootstrap estimate as a flat object (or {}), so
+         *  the template never dots two levels into a possibly-null card. */
+        get welcomeEstimate() {
+            const c = this.welcomeActiveCard;
+            return (c && c.estimate) ? c.estimate : {};
+        },
+
+        /** The active card's parallel breakdown as a flat object (or {}). */
+        get welcomeBreakdown() {
+            const c = this.welcomeActiveCard;
+            return (c && c.breakdown) ? c.breakdown : {};
+        },
+
+        get welcomeHasBreakdown() {
+            const c = this.welcomeActiveCard;
+            return !!(c && c.breakdown);
+        },
+
+        /** Switch the receive card between the two offered strategies. */
+        welcomeSelectStrategy(strategy) {
+            if (!this.welcomeRec) return;
+            if (this.welcomeRec.primary && this.welcomeRec.primary.strategy === strategy) {
+                this.welcomeReceiveVariant = 'primary';
+            } else if (this.welcomeRec.alternative
+                    && this.welcomeRec.alternative.strategy === strategy) {
+                this.welcomeReceiveVariant = 'alternative';
+            }
+        },
+
+        /** True when a receive recommendation offers both strategies, so the
+         *  card can show the efficient/fast switch. */
+        get welcomeHasAlternative() {
+            return !!(this.welcomeRec && this.welcomeRec.alternative);
+        },
+
+        get welcomeWarnings() {
+            return (this.welcomeRec && Array.isArray(this.welcomeRec.warnings))
+                ? this.welcomeRec.warnings : [];
+        },
+
+        /** "~N hours" / "~N min" label from a bootstrap estimate (minutes). */
+        welcomeDurationLabel(mins) {
+            const m = Number(mins) || 0;
+            if (m >= 120) return '~' + Math.round(m / 60) + ' hours';
+            if (m >= 60) return '~1 hour';
+            return '~' + Math.max(1, Math.round(m)) + ' min';
+        },
+
+        welcomeSelectUseCase(uc) {
+            this.welcomeUseCase = uc;
+            this.welcomeRec = null;
+            this.welcomeRecError = '';
+            this.welcomeReceiveVariant = 'primary';
+            if (uc === 'explore') {
+                this.welcomeBeat = 'recommend';        // no scale question
+                this._fetchWelcomeRecommendation();
+            } else {
+                this.welcomeScalePreset = '';
+                this.welcomeScaleCustom = null;
+                this.welcomeBeat = 'scale';
+            }
+        },
+
+        welcomeSelectScale(preset) {
+            this.welcomeScalePreset = preset;
+            if (preset === 'custom') return;           // wait for a valid amount
+            this.welcomeBeat = 'recommend';
+            this._fetchWelcomeRecommendation();
+        },
+
+        /** Advance from a typed custom amount (explicit button, so the field
+         *  doesn't vanish mid-typing). No-op until a valid amount is entered. */
+        welcomeSubmitCustomScale() {
+            this.welcomeScalePreset = 'custom';
+            if (this.welcomeScaleSats <= 0) return;
+            this.welcomeBeat = 'recommend';
+            this._fetchWelcomeRecommendation();
+        },
+
+        welcomeBack() {
+            if (this.welcomeBeat === 'recommend') {
+                this.welcomeBeat = (this.welcomeUseCase === 'explore') ? 'use_case' : 'scale';
+            } else if (this.welcomeBeat === 'scale') {
+                this.welcomeBeat = 'use_case';
+            }
+        },
+
+        async _fetchWelcomeRecommendation() {
+            this.welcomeRecLoading = true;
+            this.welcomeRecError = '';
+            this.welcomeRec = null;
+            this.welcomeReceiveVariant = 'primary';
+            this.welcomeWhyOpen = false;
+            try {
+                const body = { use_case: this.welcomeUseCase };
+                if (this.welcomeUseCase !== 'explore') body.scale_sats = this.welcomeScaleSats;
+                const res = await this.api('POST', '/onboarding/recommend', body);
+                this.welcomeRec = res;
+                if (!res || !res.primary) {
+                    this.welcomeRecError = (res && res.warnings && res.warnings[0])
+                        || 'We couldn’t compute a suggestion — you can choose an amount yourself.';
+                }
+            } catch (e) {
+                this.welcomeRecError = (e && e.message)
+                    || 'We couldn’t compute a suggestion — you can choose an amount yourself.';
+            } finally {
+                this.welcomeRecLoading = false;
+                this.$nextTick(() => this.initIcons());
+            }
+        },
+
+        /** Persist the chosen card and open the Fund Wallet dialog with the
+         *  suggested amount (which the dialog echoes + encodes in its QR). */
+        welcomeAcceptAndDeposit() {
+            const card = this.welcomeActiveCard;
+            if (!card) return;
+            this._saveOnboardingPlan(card);
+            this.openOnchainReceive(card.deposit_sats);
+        },
+
+        /** Escape hatch: skip the recommendation, just get an address. */
+        welcomeChooseAmountMyself() {
+            this._clearOnboardingPlan();
+            this.openOnchainReceive();
+        },
+
+        _saveOnboardingPlan(card) {
+            try {
+                localStorage.setItem(ONBOARDING_PLAN_KEY, JSON.stringify({
+                    use_case: this.welcomeUseCase,
+                    scale_sats: this.welcomeScaleSats,
+                    strategy: card.strategy,
+                    deposit_sats: card.deposit_sats,
+                    target_capacity_sats: card.target_capacity_sats || null,
+                    target_inbound_sats: card.target_inbound_sats || null,
+                    outbound_option: card.outbound_option || null,
+                }));
+            } catch (_e) {}
+        },
+
+        _loadOnboardingPlan() {
+            try {
+                const raw = localStorage.getItem(ONBOARDING_PLAN_KEY);
+                return raw ? JSON.parse(raw) : null;
+            } catch (_e) { return null; }
+        },
+
+        _clearOnboardingPlan() {
+            try { localStorage.removeItem(ONBOARDING_PLAN_KEY); } catch (_e) {}
+        },
+
+        /** Strategy remembered from the welcome wizard, for the
+         *  ready_to_connect pre-apply ('' when none). Primitive getters so
+         *  the CSP template never dots into a possibly-null object. */
+        get onboardingSavedStrategy() {
+            const p = this._loadOnboardingPlan();
+            return (p && p.strategy) || '';
+        },
+
+        get onboardingHasSavedBootstrap() {
+            return this.onboardingSavedStrategy === 'bootstrap';
+        },
+
+        get onboardingSavedTargetInbound() {
+            const p = this._loadOnboardingPlan();
+            return (p && p.target_inbound_sats) || 0;
+        },
+
+        get onboardingSavedDepositSats() {
+            const p = this._loadOnboardingPlan();
+            return (p && p.deposit_sats) || 0;
+        },
+
         /** Submit the wizard's open-channel form. Builds the peer
          *  arguments from the user's choice of catalog recommendation,
          *  catalog table selection, or custom URI, and delegates to
@@ -7798,6 +8051,7 @@ document.addEventListener('alpine:init', () => {
         onboardingSkip() {
             try { localStorage.setItem('onboardingSkipped', '1'); } catch (_e) {}
             this.onboardingSkipped = true;
+            this._clearOnboardingPlan();
             this._stopOnboardingPoller();
         },
 

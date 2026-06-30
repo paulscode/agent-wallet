@@ -553,6 +553,101 @@ class TestBootstrapEndpoints:
         assert any("Boltz" in w for w in plan["diagnostics"]["warnings"])
 
 
+# ─── Onboarding funding recommender endpoint ────────────────────────
+
+
+class TestOnboardingRecommend:
+    """End-to-end coverage of POST /onboarding/recommend: each use case maps
+    to the right strategy/numbers via the real planners."""
+
+    @staticmethod
+    def _oracle():
+        return patch(
+            "app.services.mempool_fee_service.mempool_fee_service.get_recommended_fees",
+            side_effect=_stub_fee_oracle(medium=10, high=15),
+        )
+
+    @staticmethod
+    def _boltz(available: bool):
+        return patch(
+            "app.api.channel_mix._resolve_boltz_available",
+            new_callable=AsyncMock,
+            return_value=available,
+        )
+
+    async def _post(self, client, body):
+        return await client.post("/dashboard/api/onboarding/recommend", json=body)
+
+    @pytest.mark.asyncio
+    async def test_spend_recommends_pure_outbound_parallel(self, dashboard_client):
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client, {"use_case": "spend", "scale_sats": 500_000}
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        p = body["primary"]
+        assert p["strategy"] == "parallel"
+        assert p["outbound_option"] == "custom"   # pure outbound (0% inbound)
+        assert p["deposit_sats"] >= 500_000
+        assert body["alternative"] is None
+
+    @pytest.mark.asyncio
+    async def test_both_recommends_balanced_parallel(self, dashboard_client):
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client, {"use_case": "both", "scale_sats": 800_000}
+            )
+        p = resp.json()["primary"]
+        assert p["strategy"] == "parallel"
+        assert p["outbound_option"] == "balanced"
+
+    @pytest.mark.asyncio
+    async def test_explore_uses_small_starter(self, dashboard_client):
+        from app.services.onboarding_recommender import EXPLORE_STARTER_SATS
+
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(dashboard_client, {"use_case": "explore"})
+        p = resp.json()["primary"]
+        assert p["strategy"] == "parallel"
+        assert p["target_capacity_sats"] == EXPLORE_STARTER_SATS
+
+    @pytest.mark.asyncio
+    async def test_receive_large_defaults_to_efficient_with_fast_alternative(
+        self, dashboard_client
+    ):
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client, {"use_case": "receive", "scale_sats": 2_000_000}
+            )
+        body = resp.json()
+        assert body["primary"]["strategy"] == "bootstrap"
+        assert body["primary"]["deposit_sats"] < 2_000_000  # the recycling win
+        assert body["primary"]["estimate"]["rounds"] >= 1
+        assert body["alternative"]["strategy"] == "parallel"
+
+    @pytest.mark.asyncio
+    async def test_receive_falls_back_to_fast_when_boltz_down(self, dashboard_client):
+        with self._oracle(), self._boltz(False):
+            resp = await self._post(
+                dashboard_client, {"use_case": "receive", "scale_sats": 2_000_000}
+            )
+        body = resp.json()
+        assert body["primary"]["strategy"] == "parallel"   # direct/fast
+        assert body["alternative"] is None
+        assert any("Boltz" in w for w in body["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_below_floor_scale_is_raised_with_a_note(self, dashboard_client):
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client, {"use_case": "spend", "scale_sats": 5_000}
+            )
+        body = resp.json()
+        assert body["primary"]["strategy"] == "parallel"
+        assert any("minimum" in w.lower() for w in body["warnings"])
+
+
 # ─── Pydantic Literal-type validation on the dashboard wrapper ──────
 
 

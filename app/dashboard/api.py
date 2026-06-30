@@ -2457,6 +2457,126 @@ async def channel_mix_run_stop(
     }
 
 
+# ── Onboarding funding recommender ───────────────────────────────────
+
+
+class _OnboardingRecommendRequest(BaseModel):
+    """Inputs to the first-screen funding recommender: the user's intent and
+    a rough scale. ``scale_sats`` is ignored for the ``explore`` starter."""
+
+    use_case: Literal["spend", "receive", "both", "explore"]
+    scale_sats: Optional[int] = Field(default=None, ge=0, le=1_000_000_000)
+
+
+@router.post("/onboarding/recommend", dependencies=[Depends(_require_auth_csrf)])
+@limiter.limit("60/minute")
+async def onboarding_recommend(
+    request: Request, body: _OnboardingRecommendRequest
+) -> Any:
+    """Recommend how much to deposit (and which strategy) from the user's
+    stated intent, reusing the channel-mix planners so the numbers match the
+    executor. See ``internal_docs/onboarding_funding_ux_plan.md``.
+
+    Returns ``{primary, alternative, warnings}``; ``primary`` is ``None`` when
+    no usable plan could be produced (catalog empty / non-mainnet), which the
+    wizard renders as the "choose the amount yourself" fallback state.
+    """
+    from app.api.channel_mix import (
+        ChannelMixPlanRequest,
+        _build_bootstrap_plan,
+        _build_plan,
+        _resolve_boltz_available,
+    )
+    from app.services import onboarding_recommender as rec
+
+    warnings: list[str] = []
+
+    def _note_bump(target: int, bumped: bool) -> None:
+        if bumped:
+            warnings.append(
+                f"That's below the minimum for one channel — raised to "
+                f"~{target:,} sats."
+            )
+
+    if body.use_case in ("spend", "both", "explore"):
+        if body.use_case == "explore":
+            target = rec.EXPLORE_STARTER_SATS
+        else:
+            target, bumped = rec.clamp_to_floor(body.scale_sats)
+            _note_bump(target, bumped)
+        if body.use_case == "spend":
+            plan = await _build_plan(
+                ChannelMixPlanRequest(
+                    target_capacity_sats=target,
+                    outbound_option="custom",
+                    custom_inbound_pct=0,
+                )
+            )
+            primary = rec.parallel_card(
+                plan, target_capacity_sats=target, outbound_option="custom",
+                rationale=rec.spend_rationale(target),
+            )
+        else:
+            rationale = (
+                rec.explore_rationale(target)
+                if body.use_case == "explore"
+                else rec.both_rationale(target)
+            )
+            plan = await _build_plan(
+                ChannelMixPlanRequest(
+                    target_capacity_sats=target, outbound_option="balanced"
+                )
+            )
+            primary = rec.parallel_card(
+                plan, target_capacity_sats=target, outbound_option="balanced",
+                rationale=rationale,
+            )
+        if primary is None:
+            warnings.extend(plan.diagnostics.warnings)
+        return {"primary": primary, "alternative": None, "warnings": warnings}
+
+    # ── receive: efficient (bootstrap) vs fast (direct), pick the default ──
+    target, bumped = rec.clamp_to_floor(body.scale_sats)
+    _note_bump(target, bumped)
+    boltz = await _resolve_boltz_available()
+
+    bplan = await _build_bootstrap_plan(
+        ChannelMixPlanRequest(
+            mode="bootstrap",
+            bootstrap_input_kind="target",
+            bootstrap_target_inbound_sats=target,
+        )
+    )
+    efficient = (
+        rec.bootstrap_card(bplan, rationale=rec.receive_efficient_rationale(bplan))
+        if bplan.rounds
+        else None
+    )
+
+    fast_cap = min(rec.receive_fast_capacity(target), 1_000_000_000)
+    fplan = await _build_plan(
+        ChannelMixPlanRequest(
+            target_capacity_sats=fast_cap, outbound_option="receive_heavy"
+        )
+    )
+    fast = rec.parallel_card(
+        fplan, target_capacity_sats=fast_cap, outbound_option="receive_heavy",
+        rationale=rec.receive_fast_rationale(target),
+    )
+
+    if efficient is not None and rec.receive_default_is_efficient(target, boltz):
+        primary, alternative = efficient, fast
+    else:
+        primary, alternative = fast, efficient
+
+    # Surface why efficient isn't available (e.g. Boltz down) when it's absent.
+    if efficient is None:
+        warnings.extend(w for w in bplan.diagnostics.warnings if "Boltz" in w)
+    if primary is None and fplan is not None:
+        warnings.extend(fplan.diagnostics.warnings)
+    return {"primary": primary, "alternative": alternative, "warnings": warnings}
+
+
 @router.post("/cold-storage/initiate", dependencies=[Depends(_require_auth_csrf)])
 async def cold_storage_initiate(
     request: Request,

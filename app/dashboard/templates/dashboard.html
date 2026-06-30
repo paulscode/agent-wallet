@@ -140,25 +140,193 @@
              ``onboardingStep``. -->
         <template x-if="summary && (onboardingStep || onboardingCelebrating || channelPlannerActive)">
             <div class="max-w-2xl mx-auto">
-                <!-- WELCOME ─────────────────────────────────────────── -->
-                <div x-show="onboardingStep === 'welcome'" class="onboarding-fade-up text-center py-12">
-                    <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-neon-yellow/15 border-2 border-neon-yellow/40 mb-6 animate-pulse-neon">
-                        <i data-lucide="zap" class="w-10 h-10 text-neon-yellow"></i>
+                <!-- WELCOME (intent → amount → recommendation) ───────── -->
+                <div x-show="onboardingStep === 'welcome'" class="onboarding-fade-up py-10">
+                    <div class="text-center mb-6">
+                        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-neon-yellow/15 border-2 border-neon-yellow/40 mb-4 animate-pulse-neon">
+                            <i data-lucide="zap" class="w-8 h-8 text-neon-yellow"></i>
+                        </div>
+                        <h2 class="text-2xl font-semibold text-white mb-2">Welcome to Agent Wallet</h2>
+                        <p class="text-sm text-gray-400 max-w-md mx-auto">
+                            Agent Wallet lets you and your AI agents send and receive Bitcoin over
+                            Lightning. Tell us how you'll use it and we'll suggest how much to deposit.
+                        </p>
                     </div>
-                    <h2 class="text-2xl font-semibold text-white mb-2">Welcome to Agent Wallet</h2>
-                    <p class="text-sm text-gray-400 max-w-md mx-auto mb-8">
-                        Your wallet is empty. Deposit some bitcoin to get started — we'll guide you through the rest.
-                        It only takes a few minutes.
-                    </p>
-                    <button @click="onboardingOpenDeposit()"
-                        class="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green hover:bg-neon-green/25 hover:border-neon-green/60 transition-all font-medium">
-                        <i data-lucide="arrow-down-to-line" class="w-5 h-5"></i>
-                        Deposit Bitcoin
-                    </button>
-                    <p class="text-xs text-gray-500 mt-8">
-                        Already familiar with setting up a Lightning node?
-                        <button @click="onboardingSkip()" class="text-neon-cyan hover:underline">Skip to dashboard</button>
-                    </p>
+
+                    <!-- progress dots -->
+                    <div class="flex items-center justify-center gap-1.5 mb-5">
+                        <span class="w-2 h-2 rounded-full transition-colors" :class="welcomeBeat === 'use_case' ? 'bg-neon-cyan' : 'bg-navy-600'"></span>
+                        <span class="w-2 h-2 rounded-full transition-colors" :class="welcomeBeat === 'scale' ? 'bg-neon-cyan' : 'bg-navy-600'"></span>
+                        <span class="w-2 h-2 rounded-full transition-colors" :class="welcomeBeat === 'recommend' ? 'bg-neon-cyan' : 'bg-navy-600'"></span>
+                    </div>
+
+                    <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto">
+                        <!-- BEAT 1: use case -->
+                        <div x-show="welcomeBeat === 'use_case'" class="space-y-1.5">
+                            <p class="text-xs uppercase tracking-wider text-gray-500 mb-2">What will you use Agent Wallet for?</p>
+                            <button @click="welcomeSelectUseCase('spend')" class="w-full text-left p-3 rounded border border-navy-700 hover:border-neon-cyan/40 hover:bg-neon-cyan/5 transition-colors">
+                                <span class="text-sm font-medium text-white block">Spend / pay out</span>
+                                <span class="text-xs text-gray-400">Pay for goods, services, and tips.</span>
+                            </button>
+                            <button @click="welcomeSelectUseCase('receive')" class="w-full text-left p-3 rounded border border-navy-700 hover:border-neon-cyan/40 hover:bg-neon-cyan/5 transition-colors">
+                                <span class="text-sm font-medium text-white block">Receive / get paid</span>
+                                <span class="text-xs text-gray-400">Accept payments, tips, payouts.</span>
+                            </button>
+                            <button @click="welcomeSelectUseCase('both')" class="w-full text-left p-3 rounded border border-navy-700 hover:border-neon-cyan/40 hover:bg-neon-cyan/5 transition-colors">
+                                <span class="text-sm font-medium text-white block">Both</span>
+                                <span class="text-xs text-gray-400">Send and receive in roughly equal measure.</span>
+                            </button>
+                            <button @click="welcomeSelectUseCase('explore')" class="w-full text-left p-3 rounded border border-navy-700 hover:border-neon-cyan/40 hover:bg-neon-cyan/5 transition-colors">
+                                <span class="text-sm font-medium text-white block">Not sure / just exploring</span>
+                                <span class="text-xs text-gray-400">Start small; you can add more later.</span>
+                            </button>
+                        </div>
+
+                        <!-- BEAT 2: scale -->
+                        <div x-show="welcomeBeat === 'scale'" class="space-y-3">
+                            <button @click="welcomeBack()" class="text-[11px] text-gray-500 hover:text-neon-cyan">&larr; Back</button>
+                            <p class="text-xs uppercase tracking-wider text-gray-500">Roughly how much do you want to <span x-text="welcomeVerb"></span>?</p>
+                            <div class="grid grid-cols-3 gap-1.5">
+                                <button @click="welcomeSelectScale('light')" class="text-center p-2.5 rounded border border-navy-700 hover:border-neon-green/40 hover:bg-neon-green/5 transition-colors">
+                                    <span class="text-sm font-medium text-white block">Light</span>
+                                    <span class="text-[10px] text-gray-500 font-mono">100k sats</span>
+                                </button>
+                                <button @click="welcomeSelectScale('standard')" class="text-center p-2.5 rounded border border-navy-700 hover:border-neon-green/40 hover:bg-neon-green/5 transition-colors">
+                                    <span class="text-sm font-medium text-white block">Standard</span>
+                                    <span class="text-[10px] text-gray-500 font-mono">500k sats</span>
+                                </button>
+                                <button @click="welcomeSelectScale('heavy')" class="text-center p-2.5 rounded border border-navy-700 hover:border-neon-green/40 hover:bg-neon-green/5 transition-colors">
+                                    <span class="text-sm font-medium text-white block">Heavy</span>
+                                    <span class="text-[10px] text-gray-500 font-mono">2M sats</span>
+                                </button>
+                            </div>
+                            <div>
+                                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                                    <input type="radio" name="welcomeScale" value="custom" x-model="welcomeScalePreset" class="accent-neon-green">
+                                    Custom amount
+                                </label>
+                                <div x-show="welcomeScalePreset === 'custom'" class="mt-2 space-y-2">
+                                    <div class="relative">
+                                        <input type="number" min="1" x-model.number="welcomeScaleCustom" @keydown.enter="welcomeSubmitCustomScale()"
+                                               placeholder="Amount in sats"
+                                               class="no-spinner w-full pl-3 pr-12 py-2.5 rounded-lg text-sm font-mono bg-navy-800 border border-navy-700 text-gray-200 placeholder-gray-600 focus:outline-none focus:border-neon-green/40">
+                                        <span class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-500">sats</span>
+                                    </div>
+                                    <button @click="welcomeSubmitCustomScale()" :disabled="welcomeScaleSats <= 0"
+                                            class="w-full px-4 py-2 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green text-sm font-medium hover:bg-neon-green/25 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                                        See suggestion &rarr;
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- BEAT 3: recommendation -->
+                        <div x-show="welcomeBeat === 'recommend'" class="space-y-4">
+                            <button @click="welcomeBack()" class="text-[11px] text-gray-500 hover:text-neon-cyan">&larr; Back</button>
+
+                            <template x-if="welcomeRecLoading">
+                                <div class="text-center py-6 text-sm text-gray-400">
+                                    <span class="inline-block w-4 h-4 border-2 border-neon-cyan border-t-transparent rounded-full animate-spin align-[-2px]"></span>
+                                    Working out a suggestion…
+                                </div>
+                            </template>
+
+                            <template x-if="!welcomeRecLoading && welcomeRecError">
+                                <div class="space-y-3">
+                                    <div class="flex items-start gap-2 p-3 rounded-lg bg-neon-yellow/10 border border-neon-yellow/20">
+                                        <i data-lucide="alert-triangle" class="w-4 h-4 text-neon-yellow shrink-0 mt-0.5"></i>
+                                        <p class="text-xs text-neon-yellow" x-text="welcomeRecError"></p>
+                                    </div>
+                                    <button @click="welcomeChooseAmountMyself()"
+                                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green font-medium hover:bg-neon-green/25 text-sm">
+                                        Choose the amount myself
+                                    </button>
+                                </div>
+                            </template>
+
+                            <template x-if="!welcomeRecLoading && !welcomeRecError && welcomeActiveCard">
+                                <div class="space-y-4">
+                                    <!-- receive: efficient / fast switch -->
+                                    <template x-if="welcomeHasAlternative">
+                                        <div class="grid grid-cols-2 gap-1.5">
+                                            <button @click="welcomeSelectStrategy('bootstrap')"
+                                                    class="text-center p-2 rounded border text-xs transition-colors"
+                                                    :class="welcomeActiveStrategy === 'bootstrap' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                                <span class="font-medium block">Efficient</span>
+                                                <span class="text-[10px] text-gray-500">less to start · slower</span>
+                                            </button>
+                                            <button @click="welcomeSelectStrategy('parallel')"
+                                                    class="text-center p-2 rounded border text-xs transition-colors"
+                                                    :class="welcomeActiveStrategy === 'parallel' ? 'border-neon-green/40 bg-neon-green/5 text-white' : 'border-navy-700 text-gray-400 hover:border-navy-600'">
+                                                <span class="font-medium block">Fast</span>
+                                                <span class="text-[10px] text-gray-500">instant · costs more</span>
+                                            </button>
+                                        </div>
+                                    </template>
+
+                                    <div class="text-center">
+                                        <p class="text-xs uppercase tracking-wider text-gray-500 mb-1">Suggested deposit</p>
+                                        <p class="text-3xl font-bold font-mono text-white">
+                                            <span x-text="formatSats(welcomeActiveCard.deposit_sats)"></span>
+                                            <span class="text-base text-gray-500 font-normal">sats</span>
+                                        </p>
+                                    </div>
+                                    <p class="text-[12px] text-gray-400 text-center leading-relaxed" x-text="welcomeActiveCard.rationale"></p>
+
+                                    <!-- bootstrap estimate -->
+                                    <template x-if="welcomeActiveIsBootstrap">
+                                        <div class="border-t border-navy-700 pt-3 space-y-1.5 text-xs">
+                                            <div class="flex justify-between"><span class="text-gray-400">Inbound you'll build</span><span class="font-mono text-neon-green" x-text="formatSats(welcomeEstimate.expected_total_inbound_sats) + ' sat'"></span></div>
+                                            <div class="flex justify-between"><span class="text-gray-400">Estimated time</span><span class="font-mono text-gray-300" x-text="welcomeDurationLabel(welcomeEstimate.est_duration_minutes)"></span></div>
+                                            <div class="flex justify-between"><span class="text-gray-400">Estimated fees</span><span class="font-mono text-gray-300" x-text="formatSats(welcomeEstimate.total_fees_sats) + ' sat'"></span></div>
+                                            <div class="flex justify-between"><span class="text-gray-400">Left as outbound / reserve</span><span class="font-mono text-gray-300" x-text="formatSats(welcomeEstimate.residual_outbound_sats) + ' sat'"></span></div>
+                                            <p class="text-[11px] text-gray-500 pt-1 leading-relaxed">Runs in the background over a few hours — you can close this and come back. You'll have little inbound right after depositing; it builds round by round.</p>
+                                        </div>
+                                    </template>
+
+                                    <!-- "Why this amount?" — parallel breakdown -->
+                                    <template x-if="welcomeHasBreakdown">
+                                        <div class="border-t border-navy-700 pt-3">
+                                            <button @click="welcomeWhyOpen = !welcomeWhyOpen" class="w-full flex items-center justify-between text-xs text-gray-400 hover:text-white">
+                                                <span>Why this amount?</span>
+                                                <i :data-lucide="welcomeWhyOpen ? 'chevron-up' : 'chevron-down'" class="w-3.5 h-3.5"></i>
+                                            </button>
+                                            <template x-if="welcomeWhyOpen">
+                                                <div class="mt-2 space-y-1 text-[11px] text-gray-400">
+                                                    <div class="flex justify-between"><span>Channel capacity</span><span class="font-mono text-gray-300" x-text="formatSats(welcomeBreakdown.channel_capacity_sats) + ' sat'"></span></div>
+                                                    <div class="flex justify-between"><span>Open fee</span><span class="font-mono text-gray-300" x-text="formatSats(welcomeBreakdown.open_fees_sats) + ' sat'"></span></div>
+                                                    <div class="flex justify-between"><span>Close reserve</span><span class="font-mono text-gray-300" x-text="formatSats(welcomeBreakdown.close_reserve_sats) + ' sat'"></span></div>
+                                                    <div class="flex justify-between"><span>Fee-spike cushion</span><span class="font-mono text-gray-300" x-text="formatSats(welcomeBreakdown.fee_spike_cushion_sats) + ' sat'"></span></div>
+                                                    <p class="pt-1 text-gray-500 leading-relaxed">The reserve and cushion stay on-chain so you can close cleanly even if fees spike.</p>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+
+                                    <template x-if="welcomeWarnings.length">
+                                        <ul class="space-y-1">
+                                            <template x-for="w in welcomeWarnings" :key="w">
+                                                <li class="text-[11px] text-neon-yellow flex items-start gap-1.5">
+                                                    <i data-lucide="alert-triangle" class="w-3 h-3 shrink-0 mt-0.5"></i><span x-text="w"></span>
+                                                </li>
+                                            </template>
+                                        </ul>
+                                    </template>
+
+                                    <button @click="welcomeAcceptAndDeposit()"
+                                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green font-medium hover:bg-neon-green/25 hover:border-neon-green/60 transition-all text-sm">
+                                        <i data-lucide="arrow-down-to-line" class="w-4 h-4"></i> Get deposit address
+                                    </button>
+                                    <button @click="welcomeChooseAmountMyself()" class="w-full text-[11px] text-gray-500 hover:text-neon-cyan">Choose the amount myself</button>
+                                </div>
+                            </template>
+                        </div>
+
+                        <p class="text-xs text-gray-500 text-center mt-5 pt-4 border-t border-navy-800">
+                            Already familiar with setting up a Lightning node?
+                            <button @click="onboardingSkip()" class="text-neon-cyan hover:underline">Skip to dashboard</button>
+                        </p>
+                    </div>
                 </div>
 
                 <!-- AWAITING DEPOSIT ───────────────────────────────────── -->
@@ -172,6 +340,14 @@
                     <p class="text-sm text-gray-400 text-center max-w-md mx-auto mb-6">
                         We'll let you know the moment it lands. Bitcoin transactions usually take about 10 minutes to confirm.
                     </p>
+
+                    <!-- Echo the remembered funding plan so the wait feels purposeful. -->
+                    <template x-if="onboardingHasSavedBootstrap">
+                        <p class="text-xs text-neon-cyan text-center max-w-md mx-auto mb-6 -mt-3">
+                            Once it confirms, we'll start <span class="font-medium">building inbound efficiently</span> —
+                            it runs in the background over a few hours, so you can close this and come back.
+                        </p>
+                    </template>
 
                     <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-4">
                         <div class="text-center">
@@ -229,6 +405,23 @@
                         A Lightning channel is like a payment lane between you and another node. Once it's open, you can
                         send and receive instantly.
                     </p>
+
+                    <!-- Pre-applied funding plan from the welcome wizard: when the
+                         user chose to build inbound efficiently, lead with that. -->
+                    <template x-if="onboardingHasSavedBootstrap">
+                        <div class="bg-navy-900 border border-neon-green/30 rounded-lg p-5 max-w-md mx-auto mb-4">
+                            <p class="text-sm text-white font-medium mb-1">You chose to build inbound efficiently</p>
+                            <p class="text-xs text-gray-400 mb-3">
+                                We'll open a channel, swap its balance back on-chain, and reuse it to build your
+                                receiving capacity over a few hours — running in the background.
+                            </p>
+                            <button @click="openInboundBootstrap(onboardingSavedTargetInbound)"
+                                    class="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green font-medium hover:bg-neon-green/25 hover:border-neon-green/60 transition-all text-sm">
+                                <i data-lucide="zap" class="w-4 h-4"></i> Review &amp; start building inbound
+                            </button>
+                            <p class="text-[11px] text-gray-500 text-center mt-3">or open a single channel manually below</p>
+                        </div>
+                    </template>
 
                     <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
                         <!-- Amount -->
@@ -401,9 +594,11 @@
                         </p>
                     </template>
 
-                    <!-- Low-capital / receive-heavy path: build inbound by recycling
-                         a small deposit through swaps (plan §9 fresh-install tie-in). -->
-                    <template x-if="onboardingCatalogAvailable">
+                    <!-- Fallback bootstrap link — only when the welcome wizard
+                         didn't already pre-apply a bootstrap plan (cleared cache /
+                         direct nav). The pre-applied case shows the prominent CTA
+                         above instead. -->
+                    <template x-if="onboardingCatalogAvailable && !onboardingHasSavedBootstrap">
                         <p class="text-xs text-gray-500 text-center mt-2">
                             Want to receive more than you deposited?
                             <button @click="openInboundBootstrap()" class="text-neon-cyan hover:underline">Build inbound efficiently</button>
@@ -5130,6 +5325,20 @@
                     </button>
                 </div>
                 <p class="text-xs text-gray-500 -mt-3 mb-5">Generate a fresh on-chain address to receive bitcoin.</p>
+
+                <!-- Suggested amount from the onboarding wizard (informational;
+                     also encoded into the BIP21 QR so the sending wallet
+                     pre-fills it). Absent on plain opens. -->
+                <template x-if="fundSuggestedSats">
+                    <div class="flex items-start gap-2 p-3 mb-5 rounded-lg bg-neon-green/10 border border-neon-green/20">
+                        <i data-lucide="lightbulb" class="w-4 h-4 text-neon-green shrink-0 mt-0.5"></i>
+                        <p class="text-xs text-gray-200 leading-relaxed">
+                            Suggested deposit:
+                            <span class="font-mono text-neon-green" x-text="formatSats(fundSuggestedSats) + ' sats'"></span>.
+                            The QR includes this amount so your sending wallet can pre-fill it.
+                        </p>
+                    </div>
+                </template>
 
                 <!-- Step 1: Address type selection + Generate -->
                 <div x-show="!fundAddress" class="space-y-4">

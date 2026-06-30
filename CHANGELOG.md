@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-30
+
+### Added
+
+- **Intent-first funding guidance on first launch.** The empty-wallet welcome
+  screen is now a short, conversational wizard that helps a new user decide
+  *how much* to deposit based on *how* they'll use the node, instead of a bare
+  "deposit some bitcoin" prompt. It asks what they want to do (spend / receive /
+  both / just exploring) and a rough scale, then recommends a concrete deposit
+  amount and strategy — reusing the channel-mix planners so the numbers match
+  what the wallet will actually do.
+  - **Receive** offers an honest **Efficient vs Fast** choice: *Efficient* uses
+    the capital-efficient inbound bootstrap (deposit a fraction, build the rest
+    over a few hours by recycling); *Fast* funds the inbound directly up front.
+    Each shows its real time and fee cost. Bootstrap is only offered when Boltz
+    is reachable.
+  - **Spend** is funded as pure outbound (a clean ~1:1 deposit, no swap), and
+    **Both** as a balanced channel; *just exploring* suggests a small starter.
+  - The recommendation card shows the suggested deposit, a plain-language
+    rationale, and a **"Why this amount?"** breakdown (capacity, fees, reserve,
+    cushion — or, for bootstrap, rounds/time/fees/residual). Loading and error
+    states never dead-end: a failed suggestion falls back to "choose the amount
+    myself."
+  - The chosen plan is carried through the deposit wait (so the "deposit on the
+    way" screen explains what happens next) and pre-applies after funds confirm —
+    the connect step leads with the chosen strategy. The **Fund Wallet** dialog
+    now shows the suggested amount and encodes it in the address QR (BIP21) so a
+    sending wallet pre-fills it.
+  - Backed by a new dashboard endpoint that maps intent → deposit recommendation
+    over the existing planners.
+
 ## [0.2.0] - 2026-06-29
 
 ### Added
