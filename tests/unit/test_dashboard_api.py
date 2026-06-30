@@ -268,6 +268,40 @@ class TestSendOnchain:
             resp = await send_onchain(request, body, db_session)
         assert resp.status_code == 502
 
+    @pytest.mark.asyncio
+    async def test_send_max_sweeps_with_send_all_no_change(self, db_session):
+        """A "Send max" request (send_all=True) must reach LND as a sweep —
+        send_all=True with amount_sats=None — so no change output is left
+        behind. ``amount_sats`` in the request is only the UI estimate."""
+        request = _mock_request()
+        body = SendOnchainRequest(
+            address="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            amount_sats=50000,  # the UI estimate; ignored by the sweep
+            send_all=True,
+        )
+        send_coins = AsyncMock(return_value=({"txid": "ab" * 32}, None))
+        with patch("app.dashboard.api.lnd_service.send_coins", send_coins):
+            await send_onchain(request, body, db_session)
+        kwargs = send_coins.call_args.kwargs
+        assert kwargs["send_all"] is True
+        assert kwargs["amount_sats"] is None
+
+    @pytest.mark.asyncio
+    async def test_normal_send_passes_explicit_amount(self, db_session):
+        """A normal (non-max) send still passes the explicit amount and
+        leaves send_all off."""
+        request = _mock_request()
+        body = SendOnchainRequest(
+            address="bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            amount_sats=50000,
+        )
+        send_coins = AsyncMock(return_value=({"txid": "cd" * 32}, None))
+        with patch("app.dashboard.api.lnd_service.send_coins", send_coins):
+            await send_onchain(request, body, db_session)
+        kwargs = send_coins.call_args.kwargs
+        assert kwargs["send_all"] is False
+        assert kwargs["amount_sats"] == 50000
+
 
 class TestOpenChannel:
     @pytest.mark.asyncio

@@ -285,6 +285,12 @@ class SendOnchainRequest(BaseModel):
     sat_per_vbyte: Optional[int] = Field(default=None, ge=1, le=10_000)
     label: str = ""
     outpoints: Optional[list[OutpointModel]] = None
+    # "Send max" / sweep: let LND spend the entire balance (or the whole
+    # selected coin-control set) to the destination with NO change output, so
+    # nothing is left behind. When set, ``amount_sats`` is only the UI's
+    # estimate (used for the spend-limit check + audit); LND computes the
+    # exact swept amount = inputs − fee.
+    send_all: bool = False
 
     @field_validator("address")
     @classmethod
@@ -1546,10 +1552,12 @@ async def send_onchain(request: Request, body: SendOnchainRequest, db: AsyncSess
     )
     data, error = await lnd_service.send_coins(
         address=body.address,
-        amount_sats=body.amount_sats,
+        # send_all sweeps everything (no change); amount must be None then.
+        amount_sats=None if body.send_all else body.amount_sats,
         sat_per_vbyte=body.sat_per_vbyte,
         label=body.label,
         outpoints=outpoints_payload,
+        send_all=body.send_all,
     )
     ip = request.client.host if request.client else None
     coin_control = bool(outpoints_payload)

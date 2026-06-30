@@ -921,6 +921,10 @@ document.addEventListener('alpine:init', () => {
         coldStep: 'form',
         coldAddress: '',
         coldAmount: null,
+        // "Send max" sweep flag: when set, the send goes out as an LND
+        // send_all (no change output) so nothing is left behind. Cleared the
+        // moment the user edits the amount by hand.
+        coldSendMax: false,
         coldFeePriority: 'medium',
         coldEstimate: null,
         coldBoltzAddress: '',
@@ -1840,8 +1844,12 @@ document.addEventListener('alpine:init', () => {
             return !this.activity || this.activityOffset + 50 >= this.activity.total;
         },
 
-        /** Set cold on-chain amount to max sendable. */
+        /** Set cold on-chain amount to max sendable. Flags the send as a
+         *  sweep (send_all) so it goes out with no change output and leaves
+         *  nothing behind — the shown amount is just an estimate; LND
+         *  computes the exact swept amount (inputs − fee) at broadcast. */
         setMaxColdAmount() {
+            this.coldSendMax = true;
             if (this.sendCoinControlMode === 'manual' && this.sendCoinControlSelected.length > 0) {
                 this.coldAmount = Math.max(0, this.sendCoinControlSelectedTotal - (this.coldEstimate ? this.coldEstimate.fee_sat : 500));
                 return;
@@ -1910,6 +1918,7 @@ document.addEventListener('alpine:init', () => {
             this.coldError = '';
             this.coldResultData = null;
             this.coldEstimate = null;
+            this.coldSendMax = false;
             this.showSendOnchain = true;
         },
         /** Close the Send On-chain dialog and reset its state. Mirrors
@@ -1921,6 +1930,7 @@ document.addEventListener('alpine:init', () => {
             this.coldError = '';
             this.coldEstimate = null;
             this.coldResultData = null;
+            this.coldSendMax = false;
         },
         /** Reset the Send On-chain dialog after a failed send. */
         sendOnchainTryAgain() {
@@ -2201,6 +2211,8 @@ document.addEventListener('alpine:init', () => {
             // Cold Storage: auto-fetch Boltz fees + swap history when dialog opens
             this.$watch('showColdStorage', (val) => {
                 if (val) {
+                    // Fresh open: clear any stale "send max" sweep flag.
+                    this.coldSendMax = false;
                     // If there's already an active swap (e.g. the user
                     // closed the dialog mid-flow and re-opened it),
                     // route straight to the progress view and make
@@ -6447,11 +6459,14 @@ document.addEventListener('alpine:init', () => {
                     sat_per_vbyte: feeRate || undefined,
                     label,
                 };
+                // "Send max" → sweep with no change output (nothing left behind).
+                if (this.coldSendMax) body.send_all = true;
                 const ops = this._currentSendOutpoints();
                 if (ops) body.outpoints = ops;
                 const data = await this.api('POST', '/send-onchain', body);
                 this.coldResultData = { success: true, txid: data.txid };
                 this.coldStep = 'result';
+                this.coldSendMax = false;
                 this.fetchSummary();
                 // Refresh the transactions + UTXO lists immediately so the
                 // newly-broadcast tx appears in the On-chain tab the

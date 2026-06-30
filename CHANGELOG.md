@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-06-30
+
+### Fixed
+
+- **On-chain "Send max" now truly empties the wallet.** It previously sent
+  `balance − estimated_fee` as an explicit amount, so when the actual fee came
+  in lower than the estimate LND created a change output and left a small
+  remainder behind (e.g. ~346 sats). "Send max" now uses LND's native sweep
+  (`send_all`) — the entire balance goes to the destination with no change
+  output, so nothing is left over. Applies to both the On-chain Send and Cold
+  Storage "max", including coin-control (sweeps the selected UTXOs). A normal
+  partial send is unchanged.
+
 ## [0.4.3] - 2026-06-30
 
 ### Removed
