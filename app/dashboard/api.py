@@ -2128,7 +2128,6 @@ class _DashChannelMixPlanRequest(BaseModel):
     bootstrap_deposit_sats: Optional[int] = Field(
         default=None, ge=0, le=1_000_000_000
     )
-    bootstrap_final_push_round: bool = False
 
 
 class _DashChannelMixExecuteRequest(_DashChannelMixPlanRequest):
@@ -2337,7 +2336,6 @@ async def channel_mix_execute(
                     plan_inputs.include_marginal_routing
                 ),
                 "network": settings.bitcoin_network,
-                "final_push_round": bool(plan_inputs.bootstrap_final_push_round),
                 "deposit_sats": plan.initial_deposit_sats,
                 "expected_total_inbound_sats": plan.expected_total_inbound_sats,
                 "expected_rounds": plan.expected_rounds,

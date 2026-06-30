@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-06-30
+
+### Removed
+
+- Removed the bootstrap planner's "final push round" option. Its trigger
+  condition could never actually be met (a channel large enough to open was
+  always large enough to drain by swap, so the push path was unreachable), and
+  the underlying behaviour — pushing the leftover to the peer's side of a
+  channel — was a sharp, easily-misunderstood trade-off (you'd recover that
+  balance only by receiving payments, and forfeit it on an early close). The
+  checkbox, request fields, and the unreachable executor branch are gone; the
+  loop simply stops and leaves any un-swappable residual on-chain (spendable).
+
 ## [0.4.2] - 2026-06-30
 
 ### Fixed

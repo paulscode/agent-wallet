@@ -912,7 +912,6 @@ class TestForceCancelAndGuard:
                         "manual_picks": [],
                         "include_marginal_routing": False,
                         "network": "bitcoin",
-                        "final_push_round": False,
                     }
                     if mode == "bootstrap"
                     else None

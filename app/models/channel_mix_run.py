@@ -228,7 +228,6 @@ class ChannelMixRun(Base):
     #     "manual_picks": list[str],
     #     "include_marginal_routing": bool,
     #     "network": str,
-    #     "final_push_round": bool,
     #     "deposit_sats": int,            # the plan estimate, for reference
     #     "expected_total_inbound_sats": int,
     #     "expected_rounds": int,

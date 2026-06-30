@@ -762,7 +762,6 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
         BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS,
         BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS,
         BOOTSTRAP_ROUTING_FEE_PCT,
-        bootstrap_reserve_for_capacity,
     )
     from app.services.lnd_service import lnd_service
 
@@ -776,7 +775,6 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             run.channels[idx] = entry
             return
 
-        push_only = bool(entry.get("push_only"))
         sat_per_vb = await _bootstrap_feerate_sat_vb()
 
         _ok, conn_err = await lnd_service.connect_peer(
@@ -804,16 +802,11 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             run.channels[idx] = entry
             return
 
-        push_sat = 0
-        if push_only:
-            reserve = bootstrap_reserve_for_capacity(int(entry["capacity_sats"]))
-            push_sat = max(0, int(entry["capacity_sats"]) - reserve - 1_000)
-
         result, open_err = await lnd_service.open_channel(
             entry["peer_pubkey"],
             int(entry["capacity_sats"]),
             sat_per_vbyte=max(1, int(sat_per_vb)),
-            push_sat=push_sat,
+            push_sat=0,
         )
         if open_err or not result or not result.get("funding_txid"):
             # Hard, pre-broadcast (no funds moved): try the next eligible
@@ -867,21 +860,6 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
 
     # ── open_active: size the drain from the LIVE channel + create swap ──
     if state == "open_active":
-        # A push_only round needs no swap: the inbound was created at open
-        # via push_sat. Settle immediately.
-        if bool(entry.get("push_only")):
-            reserve = bootstrap_reserve_for_capacity(int(entry["capacity_sats"]))
-            push = max(0, int(entry["capacity_sats"]) - reserve - 1_000)
-            entry["expected_inbound_sats"] = push
-            entry["recycled_sats"] = 0
-            entry["state"] = "settled"
-            run.channels[idx] = entry
-            run.realized_inbound_sats = int(run.realized_inbound_sats or 0) + push
-            run.total_fees_sats = int(run.total_fees_sats or 0) + int(
-                entry.get("open_fee_sats") or 0
-            )
-            return
-
         channels, err = await lnd_service.get_channels()
         if err or not isinstance(channels, list):
             return  # transient
@@ -1146,17 +1124,16 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
     drain_est = bootstrap_drain_for_capacity(
         capacity, boltz_max=BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS
     )
-    final_push = bool((run.bootstrap_params or {}).get("final_push_round"))
-    push_only = False
     if drain_est < BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS:
-        if not (final_push and capacity >= PER_CHANNEL_FLOOR_SATS):
-            finalize_run(run, ChannelMixRunState.COMPLETE)
-            run.warnings.append(
-                "Reached the practical limit — the remaining balance can't be "
-                "drained by swap."
-            )
-            return
-        push_only = True  # one final round: convert residual to inbound via push
+        # The remaining balance is too small to drain by swap. Stop cleanly
+        # and leave it on-chain (spendable) rather than opening a channel we
+        # can't recycle.
+        finalize_run(run, ChannelMixRunState.COMPLETE)
+        run.warnings.append(
+            "Reached the practical limit — the remaining balance can't be "
+            "drained by swap."
+        )
+        return
 
     peer = _bootstrap_next_peer(run, settled)
     if peer is None:
@@ -1175,8 +1152,6 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
         state="opening",
     )
     entry["open_fee_sats"] = open_fee
-    if push_only:
-        entry["push_only"] = True
     run.channels.append(entry)
     run.state = ChannelMixRunState.IN_PROGRESS
 

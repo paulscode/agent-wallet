@@ -710,10 +710,6 @@
                             <p class="text-[11px] text-gray-500 mt-1">
                                 Available: <span x-text="formatSats(onboardingOnchainSats)"></span> sats. We open one channel at a time and recycle the funds.
                             </p>
-                            <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer mt-2">
-                                <input type="checkbox" :checked="channelPlanForm.bootstrap_final_push_round" @change="setPlanField('bootstrap_final_push_round', $event.target.checked)" class="accent-neon-cyan">
-                                Convert the leftover to inbound at the end (spends it; off by default)
-                            </label>
                         </div>
 
                         <div x-show="channelPlanForm.mode === 'parallel'">

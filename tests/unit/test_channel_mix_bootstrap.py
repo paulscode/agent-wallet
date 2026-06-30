@@ -329,7 +329,6 @@ def _bootstrap_run(*, channels=None, target=None, stop=False,
             "manual_picks": [],
             "include_marginal_routing": False,
             "network": "bitcoin",
-            "final_push_round": False,
         },
     )
 
@@ -1025,51 +1024,17 @@ class TestBootstrapSizingAndStops:
         assert row.channels[0]["state"] == "open_pending"
 
 
-# ─── Executor: push_only + Boltz-min stop (defensive; §7.8, §11.5) ─
+# ─── Executor: Boltz-min stop (defensive; §7.8) ─
 
 
-class TestBootstrapPushOnly:
+class TestBootstrapBoltzMinStop:
     @pytest.mark.asyncio
-    async def test_push_only_round_settles_with_push_inbound(
+    async def test_undrainable_capacity_completes(
         self, monkeypatch, session_factory
     ):
-        """A push_only round needs no swap — it settles as soon as the
-        channel is active, crediting the pushed amount as inbound
-        (plan §11.5)."""
-        from app.services.channel_mix_planner import bootstrap_reserve_for_capacity
-        from app.tasks import channel_mix_tasks as cmix
-
-        cap = 200_000
-        entry = _seed_round("open_active", capacity_sats=cap, open_txid="cd" * 32,
-                            open_output_index=0, push_only=True, open_fee_sats=2_500)
-        lnd = _BootLnd(confirmed=5_000)  # park after settle
-        lnd.opened.append("aa" * 33)
-        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
-        async with session_factory() as s:
-            run = _bootstrap_run(channels=[entry])
-            run.state = ChannelMixRunState.IN_PROGRESS
-            s.add(run)
-            await s.commit()
-            await s.refresh(run)
-            run_id = run.id
-
-        await cmix._run_one_mix(run_id)
-
-        async with session_factory() as s:
-            row = (
-                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
-            ).scalar_one()
-        push = cap - bootstrap_reserve_for_capacity(cap) - 1_000
-        assert row.channels[0]["state"] == "settled"
-        assert row.realized_inbound_sats == push
-
-    @pytest.mark.asyncio
-    async def test_undrainable_capacity_completes_without_push_by_default(
-        self, monkeypatch, session_factory
-    ):
-        """When the next round's drain would fall below the Boltz minimum
-        and the user did NOT opt into a final push round, the loop stops
-        COMPLETE with a note (plan §7.8, default off)."""
+        """When the next round's drain would fall below the Boltz minimum,
+        the loop stops COMPLETE with a note and leaves the residual on-chain
+        (spendable) rather than opening a channel it can't recycle (§7.8)."""
         from app.tasks import channel_mix_tasks as cmix
 
         # Force the "drain below min" branch by raising the Boltz minimum
@@ -1082,7 +1047,7 @@ class TestBootstrapPushOnly:
         lnd = _BootLnd(confirmed=300_000)
         _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
         async with session_factory() as s:
-            run = _bootstrap_run()  # final_push_round defaults False
+            run = _bootstrap_run()
             s.add(run)
             await s.commit()
             await s.refresh(run)

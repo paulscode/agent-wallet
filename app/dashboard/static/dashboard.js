@@ -1294,7 +1294,6 @@ document.addEventListener('alpine:init', () => {
             bootstrap_input_kind: 'target',
             bootstrap_target_inbound_sats: null,
             bootstrap_deposit_sats: null,
-            bootstrap_final_push_round: false,
         },
         // The {plan, plan_token} returned by ``/wallet/channel-mix/plan``.
         channelPlanResult: null,
@@ -7587,7 +7586,6 @@ document.addEventListener('alpine:init', () => {
                 bootstrap_input_kind: 'target',
                 bootstrap_target_inbound_sats: null,
                 bootstrap_deposit_sats: null,
-                bootstrap_final_push_round: false,
             };
         },
 
