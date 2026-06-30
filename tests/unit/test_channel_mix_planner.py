@@ -26,18 +26,23 @@ from typing import Optional
 import pytest
 
 from app.services.channel_mix_planner import (
-    CLOSE_RESERVE_SATS_PER_CHANNEL,
+    CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS,
+    CLOSE_RESERVE_FIRST_CHANNEL_SATS,
     FALLBACK_SAT_PER_VB,
     FEE_SPIKE_CUSHION_FLOOR_SATS,
     FUTURE_CHANNEL_SLOT_SATS,
     MAX_CHANNELS_PER_PLAN,
+    MULTI_CHANNEL_MIN_SATS,
     PER_CHANNEL_FLOOR_SATS,
     VBYTES_PER_CHANNEL_OPEN,
     Breakdown,
     Plan,
+    _peer_weight,
     allocate_capacity,
+    close_reserve_sats,
     derive_channel_count,
     derive_seed_plan,
+    peer_selection_seed,
     plan_channel_mix,
     select_peers,
 )
@@ -61,24 +66,26 @@ def _oracle_error():
 
 
 class TestDeriveChannelCount:
-    def test_below_threshold_single_channel(self):
+    def test_single_channel_below_multi_threshold(self):
+        # Below 2× the 150k floor (300k) a single channel is the only
+        # viable option.
         assert derive_channel_count(150_000) == 1
-        assert derive_channel_count(600_000) == 1
+        assert derive_channel_count(250_000) == 1
+        assert derive_channel_count(299_999) == 1
 
-    def test_at_2_channel_threshold(self):
-        # Just over single-channel ceiling.
-        assert derive_channel_count(600_001) == 2
-        # Just under the 2-channel ceiling.
-        assert derive_channel_count(1_500_000) == 2
+    def test_one_channel_per_floor_slice(self):
+        # Robustness-first: spread across providers, one per 150k slice.
+        assert derive_channel_count(300_000) == 2
+        assert derive_channel_count(500_000) == 3   # was 1 under the old rule
+        assert derive_channel_count(600_000) == 4
+        assert derive_channel_count(900_000) == 6
 
-    def test_large_targets_split_by_2m_soft_ceiling(self):
-        # 4 M sats → 2 channels (2 M each).
-        assert derive_channel_count(4_000_000) == 2
-        # 5 M sats → 3 channels (~1.67 M each).
-        assert derive_channel_count(5_000_000) == 3
+    def test_capped_then_channels_grow(self):
+        # Past the cap the count stops; capacity per channel grows instead.
+        assert derive_channel_count(1_000_000) == MAX_CHANNELS_PER_PLAN
+        assert derive_channel_count(2_000_000) == MAX_CHANNELS_PER_PLAN
 
     def test_extremely_large_capped_at_plan_max(self):
-        # 20 M sats would naively be 10 channels — capped at 6.
         assert derive_channel_count(20_000_000) == MAX_CHANNELS_PER_PLAN
 
     def test_zero_or_negative_returns_zero(self):
@@ -142,8 +149,8 @@ class TestPlanBufferMath:
             fee_oracle=_stub_oracle(medium=10.0, high=15.0),
             boltz_available=True,
         )
-        # Sanity: 3 M → 2 channels, both above the per-channel floor.
-        assert len(plan.per_channel) == 2
+        # Sanity: 3 M is well past the cap → MAX channels, all above floor.
+        assert len(plan.per_channel) == MAX_CHANNELS_PER_PLAN
 
         # ``minimum_sats = capacity + medium-priority open fees``.
         expected_min = (
@@ -163,9 +170,9 @@ class TestPlanBufferMath:
         assert plan.recommended_sats > plan.minimum_sats
 
     @pytest.mark.asyncio
-    async def test_close_reserve_scales_with_channel_count(self):
+    async def test_close_reserve_is_sub_linear_in_channel_count(self):
         small = await plan_channel_mix(
-            target_capacity_sats=400_000,  # 1 channel
+            target_capacity_sats=250_000,  # < 300k → 1 channel
             outbound_option="balanced",
             peer_mix_mode="recommended_diverse",
             network="bitcoin",
@@ -174,7 +181,7 @@ class TestPlanBufferMath:
             boltz_available=True,
         )
         big = await plan_channel_mix(
-            target_capacity_sats=3_000_000,  # 2 channels (above 1.5 M ceiling)
+            target_capacity_sats=3_000_000,  # capped → MAX channels
             outbound_option="balanced",
             peer_mix_mode="recommended_diverse",
             network="bitcoin",
@@ -183,10 +190,17 @@ class TestPlanBufferMath:
             boltz_available=True,
         )
         assert len(small.per_channel) == 1
-        assert len(big.per_channel) == 2
-        # 2 channels → 2× the close reserve.
-        assert big.breakdown.close_reserve_sats == 2 * small.breakdown.close_reserve_sats
-        assert small.breakdown.close_reserve_sats == CLOSE_RESERVE_SATS_PER_CHANNEL
+        n_big = len(big.per_channel)
+        assert n_big > 1
+        # First channel full reserve; each additional adds the smaller increment.
+        assert small.breakdown.close_reserve_sats == CLOSE_RESERVE_FIRST_CHANNEL_SATS
+        assert big.breakdown.close_reserve_sats == close_reserve_sats(n_big)
+        assert big.breakdown.close_reserve_sats == (
+            CLOSE_RESERVE_FIRST_CHANNEL_SATS
+            + (n_big - 1) * CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS
+        )
+        # Sub-linear: strictly less than naive per-channel × count.
+        assert big.breakdown.close_reserve_sats < n_big * CLOSE_RESERVE_FIRST_CHANNEL_SATS
 
     @pytest.mark.asyncio
     async def test_fee_spike_cushion_uses_high_feerate(self):
@@ -446,3 +460,176 @@ class TestPlanEmptyCatalog:
         assert plan.per_channel == ()
         joined = " ".join(plan.diagnostics.warnings)
         assert "catalog" in joined.lower()
+
+
+class TestCloseReserveSubLinear:
+    def test_values(self):
+        assert close_reserve_sats(0) == 0
+        assert close_reserve_sats(1) == CLOSE_RESERVE_FIRST_CHANNEL_SATS
+        assert close_reserve_sats(2) == (
+            CLOSE_RESERVE_FIRST_CHANNEL_SATS + CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS
+        )
+        assert close_reserve_sats(6) == (
+            CLOSE_RESERVE_FIRST_CHANNEL_SATS + 5 * CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS
+        )
+
+    def test_sub_linear(self):
+        # 6 channels reserves strictly less than 6× the per-channel amount.
+        assert close_reserve_sats(6) < 6 * CLOSE_RESERVE_FIRST_CHANNEL_SATS
+
+
+class TestWeightedRandomSelection:
+    def _pubkeys(self, chosen):
+        return [p.node_id_hex for p in chosen]
+
+    def test_seeded_selection_is_deterministic(self):
+        seed = b"\x11" * 32
+        a, _ = select_peers(
+            network="bitcoin", channel_count=6, mode="recommended_diverse", rng_seed=seed
+        )
+        b, _ = select_peers(
+            network="bitcoin", channel_count=6, mode="recommended_diverse", rng_seed=seed
+        )
+        assert self._pubkeys(a) == self._pubkeys(b)
+        assert len(a) == 6
+
+    def test_unseeded_is_deterministic_and_unchanged(self):
+        a, _ = select_peers(network="bitcoin", channel_count=6, mode="recommended_diverse")
+        b, _ = select_peers(network="bitcoin", channel_count=6, mode="recommended_diverse")
+        assert self._pubkeys(a) == self._pubkeys(b)
+
+    def test_different_seeds_fan_out(self):
+        """Different installs (distinct seeds) spread across providers rather
+        than all piling onto the same set."""
+        sets = set()
+        for i in range(24):
+            seed = peer_selection_seed(
+                secret=f"wallet-secret-{i}",
+                network="bitcoin",
+                peer_mix_mode="cheapest_only",
+            )
+            chosen, _ = select_peers(
+                network="bitcoin", channel_count=6, mode="cheapest_only", rng_seed=seed
+            )
+            sets.add(frozenset(self._pubkeys(chosen)))
+        # Many distinct selections across installs (decentralisation).
+        assert len(sets) >= 5
+
+    def test_weight_favors_cheaper_and_healthier(self):
+        from app.services.small_channel_peers import all_peers
+
+        peers = [p for p in all_peers(network="bitcoin")]
+        cheapest = min(peers, key=lambda p: p.typical.fee_rate_milli_msat)
+        priciest = max(peers, key=lambda p: p.typical.fee_rate_milli_msat)
+        if cheapest.typical.fee_rate_milli_msat != priciest.typical.fee_rate_milli_msat:
+            assert _peer_weight(cheapest) > _peer_weight(priciest)
+
+
+class TestPeerSelectionSeed:
+    def test_deterministic_for_same_inputs(self):
+        a = peer_selection_seed(secret="s", network="bitcoin", peer_mix_mode="recommended_diverse")
+        b = peer_selection_seed(secret="s", network="bitcoin", peer_mix_mode="recommended_diverse")
+        assert a == b
+
+    def test_varies_by_secret(self):
+        a = peer_selection_seed(secret="wallet-a", network="bitcoin", peer_mix_mode="recommended_diverse")
+        b = peer_selection_seed(secret="wallet-b", network="bitcoin", peer_mix_mode="recommended_diverse")
+        assert a != b
+
+    def test_varies_by_mode(self):
+        a = peer_selection_seed(secret="s", network="bitcoin", peer_mix_mode="recommended_diverse")
+        b = peer_selection_seed(secret="s", network="bitcoin", peer_mix_mode="cheapest_only")
+        assert a != b
+
+
+class TestWeightedRandomSelectionDefault:
+    """Coverage for the mode actually used in production
+    (``recommended_diverse``): it must decentralise, stay deterministic,
+    keep the ⭐ quality floor, and not reshuffle earlier channels when the
+    user funds more."""
+
+    def _pubkeys(self, chosen):
+        return frozenset(p.node_id_hex for p in chosen)
+
+    def test_default_mode_diverges_across_wallets(self):
+        sets = set()
+        for i in range(40):
+            seed = peer_selection_seed(
+                secret=f"wallet-{i}", network="bitcoin", peer_mix_mode="recommended_diverse"
+            )
+            chosen, _ = select_peers(
+                network="bitcoin", channel_count=6, mode="recommended_diverse", rng_seed=seed
+            )
+            sets.add(self._pubkeys(chosen))
+        # Strong spread for the default mode (empirically ~28 over 40).
+        assert len(sets) >= 10
+
+    def test_seeded_keeps_starred_quality_floor(self):
+        from app.services.small_channel_peers import recommended_defaults
+
+        starred = {p.node_id_hex for p in recommended_defaults(network="bitcoin")}
+        assert starred  # sanity
+        for i in range(8):
+            seed = peer_selection_seed(
+                secret=f"w{i}", network="bitcoin", peer_mix_mode="recommended_diverse"
+            )
+            chosen, _ = select_peers(
+                network="bitcoin", channel_count=6, mode="recommended_diverse", rng_seed=seed
+            )
+            assert any(p.node_id_hex in starred for p in chosen), (
+                "every selection must still include at least one vetted ⭐ peer"
+            )
+
+    def test_funding_more_does_not_reshuffle_earlier_channels(self):
+        # Same wallet (seed), a 2-channel pick must be a subset of the
+        # 6-channel pick — funding more only *adds* channels.
+        seed = peer_selection_seed(
+            secret="stable-wallet", network="bitcoin", peer_mix_mode="recommended_diverse"
+        )
+        two, _ = select_peers(
+            network="bitcoin", channel_count=2, mode="recommended_diverse", rng_seed=seed
+        )
+        six, _ = select_peers(
+            network="bitcoin", channel_count=6, mode="recommended_diverse", rng_seed=seed
+        )
+        assert self._pubkeys(two).issubset(self._pubkeys(six))
+
+
+class TestPlanIntentShaping:
+    """The planner output must match the funding *intent* — the root of the
+    Fast-receive bug was a flow that opened outbound-only channels for a
+    receive intent."""
+
+    @pytest.mark.asyncio
+    async def test_receive_heavy_seeds_inbound_across_channels(self):
+        plan = await plan_channel_mix(
+            target_capacity_sats=2_000_000,
+            outbound_option="receive_heavy",
+            peer_mix_mode="recommended_diverse",
+            network="bitcoin",
+            catalog_snapshot_date="2026-06-27",
+            fee_oracle=_stub_oracle(medium=10.0, high=15.0),
+            boltz_available=True,
+        )
+        assert len(plan.per_channel) > 1  # spreads across providers
+        # Every channel is set up to receive (push and/or a follow-on swap).
+        for ch in plan.per_channel:
+            assert ch.expected_inbound_seed_sats > 0 or ch.push_sat > 0
+        assert any(ch.expected_inbound_seed_sats > 0 for ch in plan.per_channel)
+
+    @pytest.mark.asyncio
+    async def test_spend_is_pure_outbound_and_multichannel(self):
+        plan = await plan_channel_mix(
+            target_capacity_sats=600_000,
+            outbound_option="custom",
+            custom_inbound_pct=0,  # the spend path
+            peer_mix_mode="recommended_diverse",
+            network="bitcoin",
+            catalog_snapshot_date="2026-06-27",
+            fee_oracle=_stub_oracle(medium=10.0, high=15.0),
+            boltz_available=True,
+        )
+        assert len(plan.per_channel) > 1  # 600k → multiple channels
+        for ch in plan.per_channel:
+            assert ch.push_sat == 0
+            assert ch.expected_inbound_seed_sats == 0  # no swap seeding

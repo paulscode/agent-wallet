@@ -20,11 +20,15 @@ from app.services.channel_mix_planner import (
 from app.services.onboarding_recommender import (
     EXPLORE_STARTER_SATS,
     RECEIVE_EFFICIENT_MIN_TARGET_SATS,
+    both_rationale,
     bootstrap_card,
     clamp_to_floor,
+    explore_rationale,
     parallel_card,
     receive_default_is_efficient,
     receive_fast_capacity,
+    receive_fast_rationale,
+    spend_rationale,
 )
 from app.services.small_channel_peers import lookup
 
@@ -70,6 +74,24 @@ class TestNumericHelpers:
         assert receive_default_is_efficient(RECEIVE_EFFICIENT_MIN_TARGET_SATS - 1, True) is False
         # Never efficient when Boltz is unavailable.
         assert receive_default_is_efficient(5_000_000, False) is False
+
+
+class TestRationales:
+    """Rationale copy is honest and references the amount it's explaining."""
+
+    def test_spend_rationale_mentions_amount_and_both_hint(self):
+        r = spend_rationale(500_000)
+        assert "500,000" in r
+        assert "Both" in r            # nudge for users who also want to receive
+
+    def test_both_rationale_mentions_amount(self):
+        assert "800,000" in both_rationale(800_000)
+
+    def test_explore_rationale_mentions_amount(self):
+        assert "300,000" in explore_rationale(300_000)
+
+    def test_receive_fast_rationale_mentions_amount(self):
+        assert "1,000,000" in receive_fast_rationale(1_000_000)
 
 
 class TestCardSerializers:

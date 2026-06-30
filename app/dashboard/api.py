@@ -2135,6 +2135,13 @@ class _DashChannelMixExecuteRequest(_DashChannelMixPlanRequest):
     plan_token: str = Field(min_length=10, max_length=200)
 
 
+class _DashChannelMixStopRequest(BaseModel):
+    """Body for the dashboard run-stop endpoint. ``force=true`` cancels
+    the run immediately; default is the cooperative stop-after-round."""
+
+    force: bool = False
+
+
 async def _dash_build_plan(request: _DashChannelMixPlanRequest):
     """Run the planner on behalf of the dashboard SPA.
 
@@ -2221,6 +2228,7 @@ async def channel_mix_execute(
     from dataclasses import asdict as _asdict
 
     from app.api.channel_mix import (
+        _acquire_execute_lock,
         _active_run,
         _build_bootstrap_plan,
     )
@@ -2294,6 +2302,10 @@ async def channel_mix_execute(
             "state": existing.state.value,
             "mode": existing.mode,
         }
+
+    # Serialize the guard→insert→commit critical section across concurrent
+    # executes (recovery plan §2) — no-op on SQLite (tests).
+    await _acquire_execute_lock(db)
 
     # One-active-run guard (plan §6a): never start a second capital-
     # consuming loop while one is in flight. Return the in-flight run so
@@ -2435,11 +2447,51 @@ async def channel_mix_run_status(
 )
 async def channel_mix_run_stop(
     mix_run_id: UUID,
+    body: _DashChannelMixStopRequest = _DashChannelMixStopRequest(),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
-    """Cooperatively stop a run after its current round (bootstrap's
-    "Stop after this round" control)."""
-    from app.models.channel_mix_run import TERMINAL_RUN_STATES, ChannelMixRun
+    """Stop a run — gracefully (default) or force-cancel now.
+
+    Mirrors the v1 endpoint: ``force=false`` requests a cooperative stop
+    after the current round (bootstrap's "Stop after this round"
+    control); ``force=true`` marks the run ``cancelled`` immediately
+    under a row lock, freeing the one-active-run guard (recovery plan
+    §1). In-flight chain ops self-resolve, so force-cancel strands
+    nothing.
+    """
+    from app.models.channel_mix_run import (
+        TERMINAL_RUN_STATES,
+        ChannelMixRun,
+        ChannelMixRunState,
+        finalize_run,
+    )
+
+    force = bool(body.force) if body is not None else False
+
+    if force:
+        run = (
+            await db.execute(
+                select(ChannelMixRun)
+                .where(ChannelMixRun.id == mix_run_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if run is None:
+            return JSONResponse(status_code=404, content={"detail": "Channel-mix run not found"})
+        # stop_requested is belt-and-suspenders against the bootstrap
+        # executor's mid-tick commits (which release the row lock): even if
+        # a tick's final commit ever clobbered the cancel back to a
+        # non-terminal state, the run would still finalize cancelled at the
+        # next between-rounds check. See the v1 endpoint for the full note.
+        run.stop_requested = True
+        finalize_run(run, ChannelMixRunState.CANCELLED)
+        await db.commit()
+        return {
+            "mix_run_id": str(run.id),
+            "state": run.state.value,
+            "mode": run.mode,
+            "stop_requested": bool(run.stop_requested),
+        }
 
     run = (
         await db.execute(select(ChannelMixRun).where(ChannelMixRun.id == mix_run_id))
@@ -2462,10 +2514,16 @@ async def channel_mix_run_stop(
 
 class _OnboardingRecommendRequest(BaseModel):
     """Inputs to the first-screen funding recommender: the user's intent and
-    a rough scale. ``scale_sats`` is ignored for the ``explore`` starter."""
+    a rough scale. ``scale_sats`` is ignored for the ``explore`` starter.
+
+    ``scale_is_custom`` distinguishes a *user-typed* amount from one of our own
+    preset suggestions: the "we raised it to the minimum" note is only shown for
+    a custom amount the user explicitly entered — a preset is our suggestion, so
+    silently sizing it to a viable channel must not nag the user."""
 
     use_case: Literal["spend", "receive", "both", "explore"]
     scale_sats: Optional[int] = Field(default=None, ge=0, le=1_000_000_000)
+    scale_is_custom: bool = False
 
 
 @router.post("/onboarding/recommend", dependencies=[Depends(_require_auth_csrf)])
@@ -2492,7 +2550,8 @@ async def onboarding_recommend(
     warnings: list[str] = []
 
     def _note_bump(target: int, bumped: bool) -> None:
-        if bumped:
+        # Only nag when the user typed the amount — not for our own presets.
+        if bumped and body.scale_is_custom:
             warnings.append(
                 f"That's below the minimum for one channel — raised to "
                 f"~{target:,} sats."

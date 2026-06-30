@@ -67,11 +67,21 @@ class _FakeLnd:
     async def get_channels(self):
         return (
             [
-                {"remote_pubkey": pk, "active": True}
+                {
+                    "remote_pubkey": pk,
+                    "channel_point": "ab" * 32 + ":0",
+                    "active": True,
+                }
                 for pk in self.active_pubkeys
             ],
             None,
         )
+
+    async def get_pending_channels_detail(self):
+        # Opens in these tests promote straight to active, so nothing is
+        # pending — but the auto-resolution backstop (recovery plan §3)
+        # may probe, so answer cleanly.
+        return [], None
 
     async def new_address(self, address_type: str = "p2wkh"):
         return {"address": "bc1qstub"}, None
@@ -238,6 +248,213 @@ class TestExecutorRollup:
         # Second channel: open failed, seed promoted to skipped.
         assert row.channels[1]["open_state"] == "open_failed"
         assert row.channels[1]["seed_state"] == "skipped"
+
+
+def _one_channel_run() -> ChannelMixRun:
+    import hashlib
+    import uuid as _uuid
+
+    entry = make_channel_entry(
+        peer_alias="alpha",
+        peer_pubkey="aa" * 33,
+        peer_host="alpha:9735",
+        capacity_sats=400_000,
+        push_sat=0,
+        expected_inbound_seed_sats=0,
+        inbound_seed_strategy="push_only",
+    )
+    return ChannelMixRun(
+        api_key_id=UUID("00000000-0000-0000-0000-da5b0a4d0000"),
+        plan_token_digest=hashlib.sha256(_uuid.uuid4().bytes).hexdigest(),
+        state=ChannelMixRunState.QUEUED,
+        minimum_sats=400_000,
+        recommended_sats=400_000,
+        channels=[entry],
+        warnings=[],
+    )
+
+
+class _StuckParallelLnd:
+    """Open succeeds but the channel never promotes to active; the pending
+    view can be steered to report it force-closing (confirmed-dead) or
+    clean (still pending)."""
+
+    def __init__(self, *, dead: bool):
+        self.dead = dead
+        self.active_pubkeys: list[str] = []
+
+    async def connect_peer(self, pubkey, host):
+        return True, None
+
+    async def open_channel(self, node_pubkey_hex, local_funding_amount,
+                           sat_per_vbyte=None, push_sat=0, private=False):
+        self.active_pubkeys.append(node_pubkey_hex)
+        return ({"funding_txid": "ab" * 32, "output_index": 0}, None)
+
+    async def get_channels(self):
+        # Never report the channel active → it stays open_pending.
+        return [], None
+
+    async def get_pending_channels_detail(self):
+        if self.dead:
+            return ([{"type": "force_closing",
+                      "channel_point": "ab" * 32 + ":0",
+                      "remote_node_pub": "aa" * 33}], None)
+        return ([{"type": "pending_open",
+                  "channel_point": "ab" * 32 + ":0",
+                  "remote_node_pub": "aa" * 33}], None)
+
+    async def new_address(self, address_type: str = "p2wkh"):
+        return {"address": "bc1qstub"}, None
+
+
+class TestParallelAutoResolution:
+    """A parallel channel wedged in open_pending is auto-failed when
+    confirmed-dead or past the per-wait hard backstop (recovery plan §3)."""
+
+    @pytest.mark.asyncio
+    async def test_confirmed_dead_parallel_channel_fails(
+        self, monkeypatch, session_factory
+    ):
+        from contextlib import asynccontextmanager
+
+        from app.tasks import channel_mix_tasks as cmix
+
+        async with session_factory() as s:
+            run = _one_channel_run()
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        monkeypatch.setattr(
+            "app.services.lnd_service.lnd_service",
+            _StuckParallelLnd(dead=True), raising=False,
+        )
+
+        @asynccontextmanager
+        async def fake_ctx():
+            async with session_factory() as s:
+                yield s
+
+        monkeypatch.setattr(
+            "app.tasks.channel_mix_tasks.get_db_context", fake_ctx, raising=False,
+        )
+
+        # Tick 1 opens the channel (→ open_pending). The confirmed-dead
+        # probe runs BEFORE the open step, so a just-opened channel is
+        # deliberately NOT checked on the same tick (LND may not have
+        # registered the funding tx yet). Tick 2 detects it force-closing.
+        await cmix._run_one_mix(run_id)
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[0]["open_state"] == "open_pending"
+
+        await cmix._run_one_mix(run_id)
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[0]["open_state"] == "open_failed"
+        assert row.state == ChannelMixRunState.PARTIAL_FAILURE
+        assert row.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_slow_parallel_channel_not_failed(
+        self, monkeypatch, session_factory
+    ):
+        from contextlib import asynccontextmanager
+
+        from app.tasks import channel_mix_tasks as cmix
+
+        async with session_factory() as s:
+            run = _one_channel_run()
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        monkeypatch.setattr(
+            "app.services.lnd_service.lnd_service",
+            _StuckParallelLnd(dead=False), raising=False,
+        )
+
+        @asynccontextmanager
+        async def fake_ctx():
+            async with session_factory() as s:
+                yield s
+
+        monkeypatch.setattr(
+            "app.tasks.channel_mix_tasks.get_db_context", fake_ctx, raising=False,
+        )
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        # Still pending (alive-but-slow), fresh wait → not failed.
+        assert row.channels[0]["open_state"] == "open_pending"
+        assert row.state == ChannelMixRunState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_hard_timeout_fails_parallel_channel(
+        self, monkeypatch, session_factory
+    ):
+        """A parallel open_pending wait older than the per-wait backstop is
+        failed even when the channel isn't confirmed-dead."""
+        from contextlib import asynccontextmanager
+        from datetime import datetime, timedelta, timezone
+
+        from app.services.channel_mix_planner import (
+            CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES,
+        )
+        from app.tasks import channel_mix_tasks as cmix
+
+        async with session_factory() as s:
+            run = _one_channel_run()
+            # Pre-stamp the channel as already open_pending with an ancient
+            # wait, so the backstop fires this tick.
+            entry = run.channels[0]
+            entry["open_state"] = "open_pending"
+            entry["open_txid"] = "ab" * 32
+            entry["open_output_index"] = 0
+            entry["open_pending_since"] = (
+                datetime.now(timezone.utc)
+                - timedelta(minutes=CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES + 60)
+            ).isoformat()
+            run.channels[0] = entry
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        # Channel is alive-but-slow (pending_open) → only the timeout fails it.
+        monkeypatch.setattr(
+            "app.services.lnd_service.lnd_service",
+            _StuckParallelLnd(dead=False), raising=False,
+        )
+
+        @asynccontextmanager
+        async def fake_ctx():
+            async with session_factory() as s:
+                yield s
+
+        monkeypatch.setattr(
+            "app.tasks.channel_mix_tasks.get_db_context", fake_ctx, raising=False,
+        )
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[0]["open_state"] == "open_failed"
+        assert row.state == ChannelMixRunState.PARTIAL_FAILURE
 
 
 class TestExecutorAuditLog:

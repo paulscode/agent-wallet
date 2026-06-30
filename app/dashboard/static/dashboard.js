@@ -33,7 +33,11 @@ const CHANNEL_MIX_RUN_POLL_MS = 5000;
 
 // First-screen funding wizard: scale presets (sats) and the localStorage key
 // that carries the chosen plan from the recommendation across the deposit wait.
-const WELCOME_SCALE_PRESETS = { light: 100000, standard: 500000, heavy: 2000000 };
+// Presets must each be >= the one-channel floor (PER_CHANNEL_FLOOR_SATS, 150k)
+// so picking one never clamps to the minimum (which would surface a confusing
+// "raised to ~150,000" note the user didn't ask for). Light sits right at the
+// floor — the smallest viable channel, which every catalog peer accepts.
+const WELCOME_SCALE_PRESETS = { light: 150000, standard: 500000, heavy: 2000000 };
 const ONBOARDING_PLAN_KEY = 'awOnboardingPlan';
 
 // Onboarding default-amount safety buffer (sats). We pre-fill the
@@ -1302,6 +1306,8 @@ document.addEventListener('alpine:init', () => {
         channelMixRunId: '',
         // Latest polled status of that run.
         channelMixRun: null,
+        // Inline-confirm gate for the force-cancel ("Cancel run") control.
+        channelMixCancelConfirm: false,
         _channelMixPollTimer: null,
         // True for a brief window after a channel first goes active
         // so the wizard's celebration view can play before the regular
@@ -7476,9 +7482,10 @@ document.addEventListener('alpine:init', () => {
         /** A short status line for the bootstrap run's overall state. */
         get channelMixRunStateLabel() {
             const st = this.channelMixRun && this.channelMixRun.state;
+            const unit = this.channelMixRunIsBootstrap ? 'rounds' : 'channels';
             if (st === 'awaiting_funds') return 'Waiting for funds to recycle…';
             if (st === 'stopped_insufficient') return 'Stopped — not enough capital to continue.';
-            if (st === 'partial_failure') return 'Stopped early — some rounds didn’t complete.';
+            if (st === 'partial_failure') return 'Stopped early — some ' + unit + ' didn’t complete.';
             if (st === 'cancelled') return 'Stopped at your request.';
             if (st === 'complete') return 'Finished.';
             return '';
@@ -7517,6 +7524,7 @@ document.addEventListener('alpine:init', () => {
             this.channelPlanError = '';
             this.channelMixRunId = '';
             this.channelMixRun = null;
+            this.channelMixCancelConfirm = false;
             this._stopChannelMixPolling();
             this.channelPlanForm = {
                 target_capacity_sats: this.channelPlanSuggestedTarget,
@@ -7550,6 +7558,25 @@ document.addEventListener('alpine:init', () => {
             this.channelPlanForm.bootstrap_input_kind = 'target';
             const t = Number(targetInboundSats) || 0;
             if (t > 0) this.channelPlanForm.bootstrap_target_inbound_sats = t;
+            this.channelPlanMode = 'plan_form';
+        },
+
+        /** Open the channel-mix planner pre-set to the remembered parallel
+         *  plan (spend / both / fast-receive). Routing through the planner —
+         *  rather than the single-channel onboarding open — is what actually
+         *  splits across providers and seeds inbound for receive/balanced
+         *  intents. A saved ``custom`` outbound option means pure outbound
+         *  (the spend path), so pin its inbound % to 0. */
+        openParallelPlan() {
+            const p = this._loadOnboardingPlan() || {};
+            this._resetChannelPlanState();
+            this.channelPlanForm.mode = 'parallel';
+            this.channelPlanForm.outbound_option = p.outbound_option || 'balanced';
+            if (p.outbound_option === 'custom') {
+                this.channelPlanForm.custom_inbound_pct = 0;
+            }
+            const t = Number(p.target_capacity_sats) || 0;
+            if (t > 0) this.channelPlanForm.target_capacity_sats = t;
             this.channelPlanMode = 'plan_form';
         },
 
@@ -7674,6 +7701,29 @@ document.addEventListener('alpine:init', () => {
                 );
                 if (body && this.channelMixRun) {
                     this.channelMixRun.stop_requested = !!body.stop_requested;
+                }
+            } catch (e) {
+                // Best-effort — the next poll reflects the real state.
+            }
+        },
+
+        /** Force-cancel the running plan immediately (both modes): mark it
+         *  terminal now, regardless of in-flight round/channel/swap state
+         *  (recovery plan §1). In-flight chain ops self-resolve, so this
+         *  strands nothing — it just stops the executor and frees the
+         *  one-active-run guard. The poller then flips the view to ``done``
+         *  ("Stopped at your request"). */
+        async forceCancelChannelMixRun() {
+            this.channelMixCancelConfirm = false;
+            if (!this.channelMixRunId) return;
+            try {
+                const body = await this.api(
+                    'POST',
+                    '/channel-mix/runs/' + this.channelMixRunId + '/stop',
+                    { force: true },
+                );
+                if (body && this.channelMixRun) {
+                    this.channelMixRun.state = body.state || this.channelMixRun.state;
                 }
             } catch (e) {
                 // Best-effort — the next poll reflects the real state.
@@ -7882,7 +7932,10 @@ document.addEventListener('alpine:init', () => {
             this.welcomeWhyOpen = false;
             try {
                 const body = { use_case: this.welcomeUseCase };
-                if (this.welcomeUseCase !== 'explore') body.scale_sats = this.welcomeScaleSats;
+                if (this.welcomeUseCase !== 'explore') {
+                    body.scale_sats = this.welcomeScaleSats;
+                    body.scale_is_custom = (this.welcomeScalePreset === 'custom');
+                }
                 const res = await this.api('POST', '/onboarding/recommend', body);
                 this.welcomeRec = res;
                 if (!res || !res.primary) {
@@ -7948,6 +8001,10 @@ document.addEventListener('alpine:init', () => {
 
         get onboardingHasSavedBootstrap() {
             return this.onboardingSavedStrategy === 'bootstrap';
+        },
+
+        get onboardingHasSavedParallel() {
+            return this.onboardingSavedStrategy === 'parallel';
         },
 
         get onboardingSavedTargetInbound() {

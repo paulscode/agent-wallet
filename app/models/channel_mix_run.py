@@ -305,6 +305,23 @@ class ChannelMixRun(Base):
     )
 
 
+def finalize_run(run: "ChannelMixRun", state: ChannelMixRunState) -> None:
+    """Move a run to a terminal ``state`` and stamp ``completed_at``.
+
+    The single audit point for every terminal transition — the parallel
+    ``_rollup_state`` path, the bootstrap finalizers, the force-cancel
+    endpoint, and the auto-resolution backstops all route through here so
+    no path can forget to set ``completed_at`` (recovery plan §3.3). A
+    no-op if the run is already terminal, so racing callers (an executor
+    tick finishing as a force-cancel lands) settle on the first writer's
+    state rather than overwriting it.
+    """
+    if run.state in TERMINAL_RUN_STATES:
+        return
+    run.state = state
+    run.completed_at = _utc_now()
+
+
 # Helpers for callers building / mutating ``channels`` entries — kept
 # next to the model so the schema and helpers stay in lockstep.
 
@@ -357,6 +374,13 @@ def make_channel_entry(
         "inbound_seed_strategy": inbound_seed_strategy,
         "open_state": "queued",
         "open_txid": None,
+        # Funding vout + per-wait timestamp, populated when the open is
+        # broadcast (open_state → open_pending). Drive the auto-resolution
+        # backstops (recovery plan §3): the vout lets the executor build a
+        # channel point for confirmed-dead matching, and the timestamp
+        # bounds a single open wait. JSON fields → no migration.
+        "open_output_index": None,
+        "open_pending_since": None,
         "open_error": None,
         "seed_state": seed_state,
         "seed_swap_id": None,
@@ -427,6 +451,7 @@ __all__ = [
     "TERMINAL_RUN_STATES",
     "ChannelMixRun",
     "ChannelMixRunState",
+    "finalize_run",
     "make_bootstrap_round_entry",
     "make_channel_entry",
 ]

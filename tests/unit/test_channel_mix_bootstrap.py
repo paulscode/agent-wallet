@@ -186,6 +186,31 @@ class TestDeriveBootstrapSchedule:
         # The recycling win: the deposit needed is far below the target.
         assert plan.initial_deposit_sats < 1_500_000
 
+    def test_small_target_is_reached_not_under_recommended(self):
+        """Regression: for small receive targets the required deposit is
+        *larger* than the target (one channel's drainable < its capacity).
+        The solver must reach the target — not under-recommend a deposit that
+        builds less, with a false 'short of target' warning."""
+        peers = self._peers()
+        for target in (150_000, 155_000, 160_000, 200_000):
+            plan = derive_bootstrap_schedule(
+                target_inbound_sats=target,
+                fee_rate_sat_vb_medium=10.0,
+                fee_rate_sat_vb_high=20.0,
+                peers=peers,
+                catalog_snapshot_date="2026-01-01",
+            )
+            assert plan.expected_total_inbound_sats >= target, (target, plan)
+            assert not any(
+                "short of" in w for w in plan.diagnostics.warnings
+            ), (target, plan.diagnostics.warnings)
+        # The smallest target needs a deposit above it (no recycling room).
+        small = derive_bootstrap_schedule(
+            target_inbound_sats=150_000, fee_rate_sat_vb_medium=10.0,
+            fee_rate_sat_vb_high=20.0, peers=peers, catalog_snapshot_date="x",
+        )
+        assert small.initial_deposit_sats > 150_000
+
     def test_peers_assigned_round_robin(self):
         peers = self._peers()
         plan = derive_bootstrap_schedule(
@@ -238,6 +263,10 @@ class _BootLnd:
             [
                 {
                     "remote_pubkey": pk,
+                    # Default open returns funding_txid "cd"*32 / vout 0, so
+                    # the channel point the confirmed-dead check (recovery
+                    # plan §3.1) builds matches this.
+                    "channel_point": "cd" * 32 + ":0",
                     "active": self.active,
                     "chan_id": "12345",
                     "local_balance": self.local_balance,
@@ -246,6 +275,23 @@ class _BootLnd:
                     "unsettled_balance": 0,
                 }
                 for pk in self.opened
+            ],
+            None,
+        )
+
+    async def get_pending_channels_detail(self):
+        # While the channel hasn't gone active it's still confirming →
+        # report it as pending_open so the confirmed-dead backstop treats
+        # it as alive-but-slow rather than abandoned (recovery plan §3.1).
+        if self.active:
+            return [], None
+        return (
+            [
+                {
+                    "type": "pending_open",
+                    "channel_point": "cd" * 32 + ":0",
+                    "remote_node_pub": "aa" * 33,
+                }
             ],
             None,
         )
@@ -1162,3 +1208,194 @@ class TestBootstrapModelHelper:
         ):
             assert entry[k] is None
         assert entry["expected_inbound_sats"] == 0
+
+
+# ─── Auto-resolution backstops (recovery plan §3) ──────────────────
+
+
+class _DeadChannelLnd(_BootLnd):
+    """LND stub whose channel point is reported force-closing — the
+    confirmed-dead signal (recovery plan §3.1)."""
+
+    async def channel_is_active(self, channel_point):
+        return False, None, None
+
+    async def get_pending_channels_detail(self):
+        return (
+            [
+                {
+                    "type": "force_closing",
+                    "channel_point": "cd" * 32 + ":0",
+                    "remote_node_pub": "aa" * 33,
+                }
+            ],
+            None,
+        )
+
+    async def get_channels(self):
+        return [], None
+
+
+class _AliveChannelLnd(_BootLnd):
+    """Channel exists and is active — never confirmed-dead, so only the
+    hard wall-clock backstop can fail a wait against it."""
+
+    def __init__(self, **kw):
+        super().__init__(active=True, **kw)
+
+    async def channel_is_active(self, channel_point):
+        return False, {"active": False}, None  # not active yet (still waiting)
+
+    async def get_pending_channels_detail(self):
+        return [], None
+
+    async def get_channels(self):
+        return (
+            [{"remote_pubkey": "aa" * 33, "channel_point": "cd" * 32 + ":0",
+              "active": True, "chan_id": "1", "local_balance": 400_000,
+              "local_chan_reserve_sat": 4_000, "commit_fee": 1_000,
+              "unsettled_balance": 0}],
+            None,
+        )
+
+
+class TestBootstrapAutoResolution:
+    @pytest.mark.asyncio
+    async def test_confirmed_dead_channel_fails_round(
+        self, monkeypatch, session_factory
+    ):
+        """An open_pending round whose channel LND reports force-closing is
+        auto-failed → run PARTIAL_FAILURE (also closes §7.11)."""
+        from app.tasks import channel_mix_tasks as cmix
+
+        entry = _seed_round("open_pending", open_txid="cd" * 32, open_output_index=0)
+        lnd = _DeadChannelLnd(active=False)
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[entry], target=10_000_000)
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[0]["state"] == "open_failed"
+        assert row.state == ChannelMixRunState.PARTIAL_FAILURE
+        assert row.completed_at is not None
+        assert "force-closed or abandoned" in (row.channels[0].get("open_error") or "")
+
+    @pytest.mark.asyncio
+    async def test_slow_pending_channel_is_not_failed(
+        self, monkeypatch, session_factory
+    ):
+        """A merely-slow channel (still pending_open, within the backstop)
+        is left waiting — no false fail."""
+        from app.tasks import channel_mix_tasks as cmix
+
+        entry = _seed_round("open_pending", open_txid="cd" * 32, open_output_index=0)
+        lnd = _BootLnd(active=False)  # pending_open via stub, fresh wait
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[entry], target=10_000_000)
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[0]["state"] == "open_pending"  # still waiting
+        assert row.state == ChannelMixRunState.IN_PROGRESS
+
+    @pytest.mark.asyncio
+    async def test_hard_timeout_fails_a_stuck_wait(
+        self, monkeypatch, session_factory
+    ):
+        """A single wait older than the per-wait hard backstop is failed
+        even when the channel itself isn't confirmed-dead (§3.2)."""
+        from datetime import datetime, timedelta, timezone
+
+        from app.services.channel_mix_planner import (
+            CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES,
+        )
+        from app.tasks import channel_mix_tasks as cmix
+
+        old = (
+            datetime.now(timezone.utc)
+            - timedelta(minutes=CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES + 60)
+        ).isoformat()
+        entry = _seed_round(
+            "open_pending", open_txid="cd" * 32, open_output_index=0,
+            waiting_since=old,
+        )
+        lnd = _AliveChannelLnd()  # channel alive → only the timeout can fail it
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[entry], target=10_000_000)
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[0]["state"] == "open_failed"
+        assert row.state == ChannelMixRunState.PARTIAL_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_per_wait_not_per_run_timeout(
+        self, monkeypatch, session_factory
+    ):
+        """A healthy long-running bootstrap whose *total* age exceeds the
+        cap but whose *current* wait is fresh is NOT failed — proving the
+        per-wait (not per-run) semantics."""
+        from datetime import datetime, timedelta, timezone
+
+        from app.services.channel_mix_planner import (
+            CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES,
+        )
+        from app.tasks import channel_mix_tasks as cmix
+
+        settled = _seed_round("settled", round_index=0)
+        # In-flight round: a fresh wait (just started), but the run as a
+        # whole is very old.
+        fresh = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        inflight = _seed_round(
+            "open_pending", round_index=1, open_txid="cd" * 32,
+            open_output_index=0, waiting_since=fresh,
+        )
+        lnd = _BootLnd(active=False)  # pending_open, alive-but-slow
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[settled, inflight], target=10_000_000)
+            run.state = ChannelMixRunState.IN_PROGRESS
+            run.started_at = datetime(2020, 1, 1, tzinfo=timezone.utc)  # ancient
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        assert row.channels[1]["state"] == "open_pending"  # current wait fresh
+        assert row.state == ChannelMixRunState.IN_PROGRESS

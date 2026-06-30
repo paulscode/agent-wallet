@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from sqlalchemy import select
@@ -38,6 +38,7 @@ from app.models.channel_mix_run import (
     TERMINAL_RUN_STATES,
     ChannelMixRun,
     ChannelMixRunState,
+    finalize_run,
     make_bootstrap_round_entry,
 )
 from app.tasks.boltz_tasks import celery_app, track_task
@@ -73,6 +74,76 @@ def _run_async(coro: Any) -> Any:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ─── Auto-resolution backstops (recovery plan §3) ─────────────────
+#
+# Two complementary mechanisms transition a wedged channel/round to a
+# terminal state even when the user never clicks Cancel, so a single
+# stuck run can't lock the one-active-run guard forever:
+#
+#   §3.1 confirmed-dead — precise, no false positives: a channel that
+#        LND reports force-closing / waiting-close, or that has vanished
+#        from both the active and pending-open sets, is genuinely gone.
+#   §3.2 hard wall-clock backstop — per *waiting state* (not per run):
+#        a single open/swap wait that blows ``CHANNEL_MIX_WAIT_HARD_TIMEOUT``
+#        is failed even if §3.1 can't classify the stall.
+
+
+async def _channel_confirmed_dead(channel_point: str) -> Optional[bool]:
+    """Is the channel at ``channel_point`` (``txid:vout``) genuinely gone?
+
+    Returns:
+      * ``True``  — force-closing / waiting-close / pending-close, or
+        absent from *both* the pending-open and active sets (abandoned).
+      * ``False`` — still pending-open (merely slow) or active (alive).
+      * ``None``  — can't tell right now (LND error) → caller retries.
+
+    Matches by **channel point**, not pubkey, because repeat-peer
+    multi-channel plans can hold several channels to one peer (recovery
+    plan §3.1). Reads the pending view first, then the active set, so the
+    pending-open → active transition (which momentarily could be read as
+    absent if ordered the other way) can never be misclassified as dead.
+    """
+    from app.services.lnd_service import lnd_service
+
+    pending, perr = await lnd_service.get_pending_channels_detail()
+    if perr or not isinstance(pending, list):
+        return None
+    for pch in pending:
+        if pch.get("channel_point") == channel_point:
+            if pch.get("type") == "pending_open":
+                return False  # still confirming — slow, not dead
+            return True  # waiting_close / pending_close / force_closing
+
+    active, aerr = await lnd_service.get_channels()
+    if aerr or not isinstance(active, list):
+        return None
+    for ch in active:
+        if ch.get("channel_point") == channel_point:
+            return False  # present (active or merely inactive) — not dead
+
+    # Absent from both the pending and active sets → the funding tx was
+    # dropped/replaced or the channel fully closed: genuinely gone.
+    return True
+
+
+def _wait_hard_timed_out(since_iso: Optional[str], now: datetime) -> bool:
+    """True once a single waiting state stamped at ``since_iso`` has blown
+    the per-wait hard backstop (recovery plan §3.2)."""
+    from app.services.channel_mix_planner import (
+        CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES,
+    )
+
+    if not since_iso:
+        return False
+    try:
+        since = datetime.fromisoformat(since_iso)
+    except (TypeError, ValueError):
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return (now - since).total_seconds() >= CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES * 60
 
 
 async def _open_one_channel(db, run: ChannelMixRun, channel_idx: int) -> None:
@@ -145,9 +216,15 @@ async def _open_one_channel(db, run: ChannelMixRun, channel_idx: int) -> None:
         return
 
     entry["open_state"] = "open_pending"
+    # Stamp the per-wait timer (recovery plan §3.2) and the funding vout so
+    # the auto-resolution backstops can build this channel's channel point.
+    entry["open_pending_since"] = _utc_now().isoformat()
     txid = result.get("funding_txid")
     if txid:
         entry["open_txid"] = str(txid)
+    output_index = result.get("output_index")
+    if output_index is not None:
+        entry["open_output_index"] = int(output_index)
     run.channels[channel_idx] = entry
     await _audit_channel_open(db, run, entry, channel_idx, success=True)
 
@@ -256,6 +333,60 @@ async def _refresh_open_pending_states(db, run: ChannelMixRun) -> None:
             continue
         entry["open_state"] = "open_active"
         run.channels[idx] = entry
+
+
+async def _resolve_stuck_parallel_channels(
+    db, run: ChannelMixRun, *, skip_indices: "set[int] | None" = None
+) -> None:
+    """Fail any parallel channel wedged in ``open_pending`` that's either
+    confirmed-dead (§3.1) or past the per-wait hard backstop (§3.2).
+
+    Mutates ``run.channels`` in place; the caller's ``_rollup_state`` then
+    rolls the run up to ``partial_failure`` (terminal), freeing the
+    one-active-run guard without user action. A merely-slow channel (still
+    in pending-open, within the backstop) is left untouched.
+
+    ``skip_indices`` are channels opened on the current tick — skipped so a
+    just-broadcast funding tx LND hasn't registered yet isn't mistaken for
+    abandoned (checked next tick instead)."""
+    skip = skip_indices or set()
+    now = _utc_now()
+    for idx, entry in enumerate(run.channels):
+        if idx in skip:
+            continue
+        if entry.get("open_state") != "open_pending":
+            continue
+        # Only build a channel point when BOTH the txid and the funding
+        # vout are known. A legacy row persisted before this feature has
+        # no ``open_output_index`` — guessing vout 0 could match the wrong
+        # output and mis-classify a healthy channel as gone, so skip the
+        # confirmed-dead probe for those and let the hard timeout (which
+        # is also absent on legacy rows → never fires) stay conservative.
+        # Such a run is still force-cancellable by the user (recovery §1).
+        channel_point = None
+        oidx = entry.get("open_output_index")
+        if entry.get("open_txid") and oidx is not None:
+            channel_point = f"{entry['open_txid']}:{int(oidx)}"
+        reason = None
+        if channel_point:
+            dead = await _channel_confirmed_dead(channel_point)
+            if dead:
+                reason = "the channel was force-closed or abandoned before it confirmed"
+        if reason is None and _wait_hard_timed_out(entry.get("open_pending_since"), now):
+            reason = "the channel didn't confirm within the safety window"
+        if reason is None:
+            continue
+        entry["open_state"] = "open_failed"
+        entry["open_error"] = reason[:512]
+        # No channel means no seed step — settle the seed slot so the
+        # rollup can reach a terminal state.
+        if entry.get("seed_state") == "queued":
+            entry["seed_state"] = "skipped"
+        run.channels[idx] = entry
+        run.warnings.append(
+            f"Channel to {entry.get('peer_alias') or 'peer'}: stopped "
+            f"automatically — {reason}."
+        )
 
 
 def _rollup_state(run: ChannelMixRun) -> ChannelMixRunState:
@@ -462,6 +593,53 @@ def _bootstrap_switch_to_next_peer(run: ChannelMixRun, entry: dict[str, Any], re
     return True
 
 
+async def _bootstrap_resolve_stuck_round(
+    db, run: ChannelMixRun, entry: dict[str, Any], idx: int
+) -> bool:
+    """Auto-resolve a wedged in-flight bootstrap round (recovery plan §3).
+
+    Fails the round (terminal for the round) when its channel is
+    confirmed-dead — force-closed/abandoned, §3.1, which also closes the
+    deferred force-close case §7.11 — or when its current wait has blown
+    the per-wait hard backstop (§3.2). Returns True if the round was
+    failed (the caller then stops advancing it; the run-level rollup turns
+    it into ``partial_failure``).
+
+    ``open_failed`` vs ``swap_failed`` is keyed on whether a drain swap was
+    already created (``swap_id``): before the swap the channel never went
+    productive (open_failed); after, the channel opened but couldn't be
+    drained (swap_failed)."""
+    now = _utc_now()
+    channel_point = None
+    if entry.get("open_txid"):
+        channel_point = (
+            f"{entry['open_txid']}:{int(entry.get('open_output_index') or 0)}"
+        )
+
+    reason = None
+    if channel_point:
+        dead = await _channel_confirmed_dead(channel_point)
+        if dead:
+            reason = "the channel was force-closed or abandoned before the round finished"
+    if reason is None and _wait_hard_timed_out(entry.get("waiting_since"), now):
+        reason = "the round didn't confirm within the safety window"
+    if reason is None:
+        return False
+
+    fail_state = "swap_failed" if entry.get("swap_id") else "open_failed"
+    _bootstrap_clear_waiting(run, entry)
+    entry["state"] = fail_state
+    if fail_state == "swap_failed":
+        entry["swap_error"] = reason[:512]
+    else:
+        entry["open_error"] = reason[:512]
+    run.channels[idx] = entry
+    run.warnings.append(
+        f"Round {entry.get('round_index')}: stopped automatically — {reason}."
+    )
+    return True
+
+
 def _bootstrap_inflight_index(run: ChannelMixRun) -> int | None:
     """Index of the single non-terminal round, or None if every round is
     terminal (settled / failed). The loop is sequential so there is at
@@ -531,16 +709,33 @@ async def _bootstrap_feerate_sat_vb() -> float:
 
 def _bootstrap_eligible_peers(run: ChannelMixRun):
     """Re-derive the ordered eligible peer pool from the stored
-    selection inputs (the schedule isn't pre-materialized)."""
-    from app.services.channel_mix_planner import select_peers
+    selection inputs (the schedule isn't pre-materialized).
+
+    Seeds the weighted-random selection identically to plan time
+    (``secret_key`` + the stored selection inputs), so every tick — and
+    the original plan — reproduce the same provider order."""
+    from app.core.config import settings
+    from app.services.channel_mix_planner import peer_selection_seed, select_peers
 
     params = run.bootstrap_params or {}
+    network = params.get("network", "mainnet")
+    peer_mix_mode = params.get("peer_mix_mode", "recommended_diverse")
+    manual_picks = tuple(params.get("manual_picks") or ())
+    include_marginal = bool(params.get("include_marginal_routing"))
+    seed = peer_selection_seed(
+        secret=settings.secret_key,
+        network=network,
+        peer_mix_mode=peer_mix_mode,
+        manual_picks=manual_picks,
+        include_marginal_routing=include_marginal,
+    )
     peers, _axes = select_peers(
-        network=params.get("network", "mainnet"),
+        network=network,
         channel_count=64,  # large: we want the full ordered pool, not a cap
-        mode=params.get("peer_mix_mode", "recommended_diverse"),
-        manual_picks=tuple(params.get("manual_picks") or ()),
-        include_marginal_routing=bool(params.get("include_marginal_routing")),
+        mode=peer_mix_mode,
+        manual_picks=manual_picks,
+        include_marginal_routing=include_marginal,
+        rng_seed=seed,
     )
     return peers
 
@@ -663,7 +858,8 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             return  # transient LND error — retry next tick
         if not is_active:
             _bootstrap_flag_stuck_if_waiting(run, entry, idx, "the channel open")
-            return  # still confirming
+            await _bootstrap_resolve_stuck_round(db, run, entry, idx)
+            return  # still confirming (or just auto-failed)
         _bootstrap_clear_waiting(run, entry)
         entry["state"] = "open_active"
         run.channels[idx] = entry
@@ -697,6 +893,12 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
                 match = ch
                 break
         if match is None:
+            # The channel was active (we reached open_active) but isn't in
+            # the active set now — a transient race, OR it force-closed
+            # mid-round. Stamp the per-wait timer and let the backstops
+            # decide; a transient race clears on the next tick.
+            _bootstrap_flag_stuck_if_waiting(run, entry, idx, "the channel open")
+            await _bootstrap_resolve_stuck_round(db, run, entry, idx)
             return  # not active yet (race) — retry
 
         local = int(match.get("local_balance", 0) or 0)
@@ -843,6 +1045,7 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
 
         # Still in flight (paying / claiming) — stay, flag if slow, poll.
         _bootstrap_flag_stuck_if_waiting(run, entry, idx, "the swap claim")
+        await _bootstrap_resolve_stuck_round(db, run, entry, idx)
         return
 
 
@@ -885,22 +1088,18 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
         # to settle (this branch only runs when no round is in flight); we
         # finalize CANCELLED rather than COMPLETE so the run records that
         # the user stopped it early, not that it ran to its natural end.
-        run.state = ChannelMixRunState.CANCELLED
-        run.completed_at = now
+        finalize_run(run, ChannelMixRunState.CANCELLED)
         run.warnings.append("Stopped after the current round at your request.")
         return
     if _bootstrap_target_reached(run):
-        run.state = ChannelMixRunState.COMPLETE
-        run.completed_at = now
+        finalize_run(run, ChannelMixRunState.COMPLETE)
         return
     if settled >= BOOTSTRAP_MAX_ROUNDS:
-        run.state = ChannelMixRunState.COMPLETE
-        run.completed_at = now
+        finalize_run(run, ChannelMixRunState.COMPLETE)
         run.warnings.append(f"Reached the {BOOTSTRAP_MAX_ROUNDS}-round cap.")
         return
     if _bootstrap_duration_exceeded(run, now):
-        run.state = ChannelMixRunState.COMPLETE
-        run.completed_at = now
+        finalize_run(run, ChannelMixRunState.COMPLETE)
         run.warnings.append("Reached the maximum run duration.")
         return
 
@@ -921,8 +1120,7 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
 
     if capacity < PER_CHANNEL_FLOOR_SATS:
         if settled == 0:
-            run.state = ChannelMixRunState.STOPPED_INSUFFICIENT
-            run.completed_at = now
+            finalize_run(run, ChannelMixRunState.STOPPED_INSUFFICIENT)
             run.warnings.append(
                 "Not enough confirmed on-chain balance to open the first channel "
                 f"(need ~{PER_CHANNEL_FLOOR_SATS + open_fee:,} sats)."
@@ -931,8 +1129,7 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
         # Transient: the prior swap's claim may still be confirming, or
         # the user may top up. Enter / stay AWAITING_FUNDS until timeout.
         if _bootstrap_awaiting_timed_out(run, now):
-            run.state = ChannelMixRunState.STOPPED_INSUFFICIENT
-            run.completed_at = now
+            finalize_run(run, ChannelMixRunState.STOPPED_INSUFFICIENT)
             run.warnings.append(
                 "Stopped — recyclable balance stayed below the next channel for too long."
             )
@@ -953,8 +1150,7 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
     push_only = False
     if drain_est < BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS:
         if not (final_push and capacity >= PER_CHANNEL_FLOOR_SATS):
-            run.state = ChannelMixRunState.COMPLETE
-            run.completed_at = now
+            finalize_run(run, ChannelMixRunState.COMPLETE)
             run.warnings.append(
                 "Reached the practical limit — the remaining balance can't be "
                 "drained by swap."
@@ -964,8 +1160,7 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
 
     peer = _bootstrap_next_peer(run, settled)
     if peer is None:
-        run.state = ChannelMixRunState.COMPLETE
-        run.completed_at = now
+        finalize_run(run, ChannelMixRunState.COMPLETE)
         run.warnings.append("No eligible peer available to open another channel.")
         return
 
@@ -988,8 +1183,7 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
     # Do the open now (idempotent) so a tick makes real progress.
     await _advance_bootstrap_round(db, run, len(run.channels) - 1)
     if run.channels[-1].get("state") == "open_failed":
-        run.state = ChannelMixRunState.PARTIAL_FAILURE
-        run.completed_at = _utc_now()
+        finalize_run(run, ChannelMixRunState.PARTIAL_FAILURE)
 
 
 async def _advance_bootstrap(db, run: ChannelMixRun) -> None:
@@ -1004,8 +1198,7 @@ async def _advance_bootstrap(db, run: ChannelMixRun) -> None:
         # The round finished this tick.
         last = run.channels[-1]
         if last.get("state") in ("open_failed", "swap_failed"):
-            run.state = ChannelMixRunState.PARTIAL_FAILURE
-            run.completed_at = _utc_now()
+            finalize_run(run, ChannelMixRunState.PARTIAL_FAILURE)
             return
         # Settled — fall through and try to start the next round.
     await _bootstrap_maybe_start_round(db, run)
@@ -1051,14 +1244,31 @@ async def _run_one_mix(run_id: UUID) -> dict[str, Any]:
         # the row lock stays held through the per-channel work.
         run.state = ChannelMixRunState.IN_PROGRESS
 
-        # 1) Open queued channels.
+        # 1) Open queued channels. Track the indices opened on *this* tick
+        #    so the auto-resolution step can skip them: LND may not have
+        #    registered a just-broadcast funding tx yet, which would read
+        #    as "abandoned" and false-fail a brand-new channel. They're
+        #    checked on the next tick instead.
+        opened_this_tick: set[int] = set()
         for idx in range(len(run.channels)):
             if run.channels[idx]["open_state"] == "queued":
                 await _open_one_channel(db, run, idx)
+                opened_this_tick.add(idx)
 
         # 2) Promote open_pending → open_active where confirmation has
         #    landed.
         await _refresh_open_pending_states(db, run)
+
+        # 2b) Auto-resolve channels wedged in open_pending — confirmed
+        #     force-closed/abandoned, or past the per-wait hard backstop
+        #     (recovery plan §3) — so a stuck open can't pin the guard.
+        #     Runs AFTER refresh so a channel that has actually gone active
+        #     is already promoted out of open_pending (and thus never
+        #     hard-timeout-failed despite a successful open); and skips
+        #     channels opened this very tick (see step 1).
+        await _resolve_stuck_parallel_channels(
+            db, run, skip_indices=opened_this_tick
+        )
 
         # 3) Issue seed swaps on channels now active.
         for idx in range(len(run.channels)):
@@ -1071,9 +1281,10 @@ async def _run_one_mix(run_id: UUID) -> dict[str, Any]:
         # 4) Roll up the run-wide state.
         new_state = _rollup_state(run)
         if new_state != run.state:
-            run.state = new_state
             if new_state in (ChannelMixRunState.COMPLETE, ChannelMixRunState.PARTIAL_FAILURE):
-                run.completed_at = _utc_now()
+                finalize_run(run, new_state)
+            else:
+                run.state = new_state
         run.updated_at = _utc_now()
 
         # Single commit at the end — releases the row lock and flushes

@@ -17,13 +17,14 @@ Three endpoints, all admin-gated:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict
 from typing import Any, Literal, Optional, Sequence
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +38,7 @@ from app.models.channel_mix_run import (
     TERMINAL_RUN_STATES,
     ChannelMixRun,
     ChannelMixRunState,
+    finalize_run,
     make_channel_entry,
 )
 from app.services.channel_mix_plan_token import (
@@ -61,6 +63,39 @@ _NON_TERMINAL_RUN_STATES = (
     ChannelMixRunState.IN_PROGRESS,
     ChannelMixRunState.AWAITING_FUNDS,
 )
+
+# Fixed signed-64-bit key for the Postgres transaction-advisory lock that
+# serializes the one-active-run guard's check-then-insert critical section
+# (recovery plan §2). The wallet is a single node, so "one active run" is
+# global — one constant key. Derived from a literal so it's stable across
+# restarts and impossible to collide with another subsystem's lock.
+_CHANNEL_MIX_EXECUTE_LOCK_KEY = int.from_bytes(
+    hashlib.sha256(b"agent-wallet/channel-mix-execute").digest()[:8],
+    "big",
+    signed=True,
+)
+
+
+async def _acquire_execute_lock(db: AsyncSession) -> None:
+    """Serialize concurrent ``execute`` calls so the one-active-run guard
+    is atomic (recovery plan §2).
+
+    Acquires a Postgres transaction-advisory lock held to transaction end
+    (the request's commit/rollback in ``get_db`` teardown): the second
+    waiter only proceeds after the first commits, so its ``_active_run``
+    lookup reliably sees the first run and returns ``resumed`` instead of
+    inserting a second active run. A SQLAlchemy transaction is already
+    open by the time this is called (prior read queries ran), so the
+    statement joins it. No-op on SQLite (tests) — advisory locks don't
+    exist there, and tests run executes sequentially, so the
+    application-level ``_active_run`` check already suffices.
+    """
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:k)"),
+            {"k": _CHANNEL_MIX_EXECUTE_LOCK_KEY},
+        )
+
 
 router = APIRouter(prefix=f"{API_V1_PREFIX}/wallet/channel-mix", tags=["channel-mix"])
 
@@ -109,6 +144,14 @@ class ChannelMixExecuteRequest(ChannelMixPlanRequest):
     plan_token: str = Field(min_length=10, max_length=200)
 
 
+class ChannelMixRunStopRequest(BaseModel):
+    """Body for the run-stop endpoint. ``force=false`` (default) is the
+    cooperative "stop after this round" request; ``force=true`` cancels
+    the run immediately (recovery plan §1)."""
+
+    force: bool = False
+
+
 # ─── Helpers ──────────────────────────────────────────────────────
 
 
@@ -138,6 +181,22 @@ async def _resolve_boltz_available() -> bool:
     return bool(settings.boltz_api_url)
 
 
+def _selection_seed(request: ChannelMixPlanRequest) -> bytes:
+    """Per-wallet, per-selection-inputs seed for weighted-random peer
+    selection — keyed by this node's ``secret_key`` so every install fans
+    out across providers, and stable across plan→execute (excludes the
+    target amount) so the token re-derivation reproduces the same peers."""
+    from app.services.channel_mix_planner import peer_selection_seed
+
+    return peer_selection_seed(
+        secret=settings.secret_key,
+        network=settings.bitcoin_network,
+        peer_mix_mode=request.peer_mix_mode,
+        manual_picks=tuple(request.manual_picks),
+        include_marginal_routing=request.include_marginal_routing,
+    )
+
+
 async def _build_plan(
     request: ChannelMixPlanRequest,
 ) -> Plan:
@@ -162,6 +221,7 @@ async def _build_plan(
         custom_inbound_pct=request.custom_inbound_pct,
         manual_picks=tuple(request.manual_picks),
         include_marginal_routing=request.include_marginal_routing,
+        rng_seed=_selection_seed(request),
     )
 
 
@@ -192,6 +252,7 @@ async def _build_bootstrap_plan(request: ChannelMixPlanRequest) -> BootstrapPlan
         mode=request.peer_mix_mode,
         manual_picks=tuple(request.manual_picks),
         include_marginal_routing=request.include_marginal_routing,
+        rng_seed=_selection_seed(request),
     )
 
     deposit = None
@@ -349,6 +410,13 @@ async def post_channel_mix_execute(
             "state": existing.state.value,
             "mode": existing.mode,
         }
+
+    # Serialize the guard→insert→commit critical section across concurrent
+    # executes (recovery plan §2). Acquired after the read-only token /
+    # digest checks (those have their own UNIQUE backstop) and before the
+    # guard, so two near-simultaneous distinct-plan executes can't both
+    # pass the guard and create two active runs.
+    await _acquire_execute_lock(db)
 
     # One-active-run guard (plan §6a): never start a second capital-
     # consuming loop while one is already in flight — two loops racing the
@@ -551,16 +619,57 @@ def _channels_summary(run: ChannelMixRun) -> dict[str, Any]:
 @router.post("/runs/{mix_run_id}/stop")
 async def post_channel_mix_run_stop(
     mix_run_id: UUID,
+    body: ChannelMixRunStopRequest = ChannelMixRunStopRequest(),
     admin_key: APIKey = Depends(get_admin_key),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    """Request a cooperative stop of a run after its current round.
+    """Stop a run — gracefully (default) or by force-cancelling now.
 
-    Used by the bootstrap "Stop after this round" control (plan §9 /
-    §7.10): the executor lets the in-flight round settle (so a half-done
-    swap isn't stranded), then finalizes instead of starting a new round.
-    A no-op on an already-terminal run.
+    * ``force=false`` (default): request a cooperative stop after the
+      current round (the bootstrap "Stop after this round" control, plan
+      §9 / §7.10). The executor lets the in-flight round settle (so a
+      half-done swap isn't stranded), then finalizes instead of starting
+      a new round. A no-op on an already-terminal run.
+    * ``force=true``: mark the run terminal (``cancelled``) immediately,
+      regardless of in-flight round/channel/swap state (recovery plan
+      §1). The chain operations the run kicked off are independent and
+      self-resolving (a broadcast open keeps confirming; an in-flight
+      Boltz swap is driven to completion/refund by ``recover_boltz_swaps``),
+      so cancelling strands nothing — it only stops the executor from
+      starting *new* work and frees the one-active-run guard. The
+      ``SELECT … FOR UPDATE`` serializes with any in-flight executor tick,
+      so the cancel commits after the tick holding the row lock (the next
+      tick early-returns on the terminal state). Idempotent on an
+      already-terminal run.
+
+      We also set ``stop_requested`` as belt-and-suspenders: the bootstrap
+      executor commits mid-tick (open broadcast / swap create), which
+      *releases* the row lock before its tick's final commit. Today every
+      such path leaves the run non-dirty so the final commit can't clobber
+      the cancel, but that's a fragile invariant — ``stop_requested``
+      guarantees the run still finalizes cancelled at the next
+      between-rounds check even if a future change reintroduced a clobber.
     """
+    if body.force:
+        run = (
+            await db.execute(
+                select(ChannelMixRun)
+                .where(ChannelMixRun.id == mix_run_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if run is None:
+            raise HTTPException(status_code=404, detail="Channel-mix run not found")
+        run.stop_requested = True
+        finalize_run(run, ChannelMixRunState.CANCELLED)
+        await db.commit()
+        return {
+            "mix_run_id": str(run.id),
+            "state": run.state.value,
+            "mode": run.mode,
+            "stop_requested": bool(run.stop_requested),
+        }
+
     run = (
         await db.execute(select(ChannelMixRun).where(ChannelMixRun.id == mix_run_id))
     ).scalar_one_or_none()

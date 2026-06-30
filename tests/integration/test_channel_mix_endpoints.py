@@ -287,6 +287,31 @@ class TestExecuteEndpoint:
         mock_delay.assert_called_once_with(exec_body["mix_run_id"])
 
     @pytest.mark.asyncio
+    async def test_multichannel_plan_executes_without_token_drift(self, dashboard_client):
+        """A larger target splits into multiple channels chosen by
+        weighted-random selection; plan→execute must still verify the token
+        (the per-wallet seed is stable across the two calls)."""
+        with patch(
+            "app.dashboard.api.mempool_fee_service.get_recommended_fees",
+            side_effect=_stub_fee_oracle(medium=10, high=15),
+        ), patch("app.tasks.channel_mix_tasks.process_channel_mix_run.delay"):
+            plan_resp = await dashboard_client.post(
+                "/dashboard/api/channel-mix/plan",
+                json={"target_capacity_sats": 900_000, "outbound_option": "balanced"},
+            )
+            plan_body = plan_resp.json()
+            assert len(plan_body["plan"]["per_channel"]) > 1   # multi-channel
+            exec_resp = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute",
+                json={
+                    "target_capacity_sats": 900_000,
+                    "outbound_option": "balanced",
+                    "plan_token": plan_body["plan_token"],
+                },
+            )
+        assert exec_resp.status_code == 201, exec_resp.text   # not 409 plan_stale
+
+    @pytest.mark.asyncio
     async def test_repeat_execute_with_same_token_is_idempotent(
         self, dashboard_client,
     ):
@@ -638,14 +663,68 @@ class TestOnboardingRecommend:
         assert any("Boltz" in w for w in body["warnings"])
 
     @pytest.mark.asyncio
-    async def test_below_floor_scale_is_raised_with_a_note(self, dashboard_client):
+    async def test_receive_small_target_defaults_to_fast(self, dashboard_client):
+        """A small receive target (below the efficiency threshold) leads with
+        the fast/direct path and offers efficient as the alternative."""
         with self._oracle(), self._boltz(True):
             resp = await self._post(
-                dashboard_client, {"use_case": "spend", "scale_sats": 5_000}
+                dashboard_client, {"use_case": "receive", "scale_sats": 300_000}
+            )
+        body = resp.json()
+        assert body["primary"]["strategy"] == "parallel"      # fast/direct
+        assert body["alternative"]["strategy"] == "bootstrap"  # efficient offered
+
+    @pytest.mark.asyncio
+    async def test_explore_ignores_supplied_scale(self, dashboard_client):
+        """The explore starter uses a fixed amount regardless of any scale."""
+        from app.services.onboarding_recommender import EXPLORE_STARTER_SATS
+
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client, {"use_case": "explore", "scale_sats": 9_999_999}
+            )
+        assert resp.json()["primary"]["target_capacity_sats"] == EXPLORE_STARTER_SATS
+
+    @pytest.mark.asyncio
+    async def test_below_floor_custom_amount_is_raised_with_a_note(self, dashboard_client):
+        """A *user-typed* amount below the one-channel floor is raised and the
+        user is told why."""
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client,
+                {"use_case": "spend", "scale_sats": 5_000, "scale_is_custom": True},
             )
         body = resp.json()
         assert body["primary"]["strategy"] == "parallel"
         assert any("minimum" in w.lower() for w in body["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_below_floor_preset_does_not_warn(self, dashboard_client):
+        """A preset (not user-typed) that happens to be below the floor must
+        NOT surface the 'raised to minimum' note — it's our suggestion, sized
+        silently. (Regression: clicking Spend → Light nagged the user.)"""
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client,
+                {"use_case": "spend", "scale_sats": 5_000},  # scale_is_custom defaults False
+            )
+        body = resp.json()
+        assert body["primary"] is not None
+        assert not any("minimum" in w.lower() for w in body["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_non_mainnet_yields_no_primary(self, dashboard_client, monkeypatch):
+        """When the catalog is empty (non-mainnet), there's no usable plan, so
+        primary is None and the wizard falls back to 'choose amount myself'."""
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "bitcoin_network", "regtest")
+        with self._oracle(), self._boltz(True):
+            resp = await self._post(
+                dashboard_client, {"use_case": "spend", "scale_sats": 500_000}
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["primary"] is None
 
 
 # ─── Pydantic Literal-type validation on the dashboard wrapper ──────
@@ -782,3 +861,246 @@ class TestRunStatusEndpoint:
         # operator can see why a slot failed.
         failed = [c for c in body["channels"] if c["open_state"] == "open_failed"]
         assert failed and failed[0]["open_error"] == "peer rejected open"
+
+
+# ─── Force-cancel + atomic guard (recovery plan §1, §2) ─────────────
+
+
+class TestForceCancelAndGuard:
+    """The user escape from a wedged run (force-cancel → terminal now) and
+    the atomic one-active-run guard that the cancel unblocks."""
+
+    @staticmethod
+    def _oracle():
+        return patch(
+            "app.services.mempool_fee_service.mempool_fee_service.get_recommended_fees",
+            side_effect=_stub_fee_oracle(medium=10, high=15),
+        )
+
+    @staticmethod
+    def _boltz(available: bool):
+        return patch(
+            "app.api.channel_mix._resolve_boltz_available",
+            new_callable=AsyncMock,
+            return_value=available,
+        )
+
+    async def _insert_run(self, db_engine, *, state, mode="bootstrap", channels=None):
+        """Persist a run pinned to ``state`` (any non-terminal state, so we
+        can drive force-cancel from each wedge), returning its id."""
+        import uuid as _uuid
+
+        from app.dashboard import DASHBOARD_KEY_ID
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with session_factory() as s:
+            run = ChannelMixRun(
+                api_key_id=DASHBOARD_KEY_ID,
+                # Fresh 64-char digest per run (UNIQUE constraint).
+                plan_token_digest=(_uuid.uuid4().hex + _uuid.uuid4().hex),
+                state=state,
+                mode=mode,
+                minimum_sats=500_000,
+                recommended_sats=500_000,
+                target_inbound_sats=1_500_000 if mode == "bootstrap" else None,
+                channels=channels or [],
+                warnings=[],
+                bootstrap_params=(
+                    {
+                        "peer_mix_mode": "recommended_diverse",
+                        "manual_picks": [],
+                        "include_marginal_routing": False,
+                        "network": "bitcoin",
+                        "final_push_round": False,
+                    }
+                    if mode == "bootstrap"
+                    else None
+                ),
+            )
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            return str(run.id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state_name",
+        ["QUEUED", "IN_PROGRESS", "AWAITING_FUNDS"],
+    )
+    async def test_force_cancel_from_each_nonterminal_state(
+        self, dashboard_client, db_engine, state_name
+    ):
+        """``force=true`` finalizes a run terminal (cancelled) + stamps
+        completed_at, regardless of which non-terminal state it sat in."""
+        import uuid as _uuid
+
+        from sqlalchemy import select
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        state = getattr(ChannelMixRunState, state_name)
+        run_id = await self._insert_run(db_engine, state=state)
+
+        resp = await dashboard_client.post(
+            f"/dashboard/api/channel-mix/runs/{run_id}/stop",
+            json={"force": True},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["state"] == "cancelled"
+
+        session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with session_factory() as s:
+            row = (
+                await s.execute(
+                    select(ChannelMixRun).where(ChannelMixRun.id == _uuid.UUID(run_id))
+                )
+            ).scalar_one()
+        assert row.state == ChannelMixRunState.CANCELLED
+        assert row.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_force_cancel_is_idempotent_on_terminal_run(
+        self, dashboard_client, db_engine
+    ):
+        """Force-cancelling a run that's already terminal is a harmless
+        no-op (doesn't overwrite the original terminal state)."""
+        import uuid as _uuid
+
+        from sqlalchemy import select
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        run_id = await self._insert_run(
+            db_engine, state=ChannelMixRunState.COMPLETE
+        )
+        resp = await dashboard_client.post(
+            f"/dashboard/api/channel-mix/runs/{run_id}/stop",
+            json={"force": True},
+        )
+        assert resp.status_code == 200, resp.text
+        # finalize_run is a no-op on an already-terminal run.
+        assert resp.json()["state"] == "complete"
+
+        session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with session_factory() as s:
+            row = (
+                await s.execute(
+                    select(ChannelMixRun).where(ChannelMixRun.id == _uuid.UUID(run_id))
+                )
+            ).scalar_one()
+        assert row.state == ChannelMixRunState.COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_force_cancel_unblocks_the_guard(self, dashboard_client, db_engine):
+        """The whole point: after force-cancel, a fresh execute is admitted
+        (the wedged run no longer pins the one-active-run guard)."""
+        from app.models.channel_mix_run import ChannelMixRunState
+
+        # A wedged run is active → the guard would resume it.
+        await self._insert_run(
+            db_engine, state=ChannelMixRunState.IN_PROGRESS, mode="bootstrap"
+        )
+
+        with self._oracle(), self._boltz(True), patch(
+            "app.tasks.channel_mix_tasks.process_channel_mix_run.delay"
+        ):
+            plan = (
+                await dashboard_client.post(
+                    "/dashboard/api/channel-mix/plan",
+                    json={"target_capacity_sats": 800_000},
+                )
+            ).json()
+            blocked = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute",
+                json={"target_capacity_sats": 800_000, "plan_token": plan["plan_token"]},
+            )
+            # The wedged run blocks it → resumed.
+            assert blocked.json().get("resumed") is True
+            wedged_id = blocked.json()["mix_run_id"]
+
+            # Force-cancel the wedged run, then retry the SAME distinct plan.
+            cancel = await dashboard_client.post(
+                f"/dashboard/api/channel-mix/runs/{wedged_id}/stop",
+                json={"force": True},
+            )
+            assert cancel.json()["state"] == "cancelled"
+
+            plan2 = (
+                await dashboard_client.post(
+                    "/dashboard/api/channel-mix/plan",
+                    json={"target_capacity_sats": 800_000},
+                )
+            ).json()
+            admitted = await dashboard_client.post(
+                "/dashboard/api/channel-mix/execute",
+                json={"target_capacity_sats": 800_000, "plan_token": plan2["plan_token"]},
+            )
+        # Guard unblocked → a brand-new run is created (201), not resumed.
+        assert admitted.status_code == 201, admitted.text
+        assert admitted.json().get("resumed") is not True
+        assert admitted.json()["mix_run_id"] != wedged_id
+
+    @pytest.mark.asyncio
+    async def test_v1_force_cancel_finalizes_run(self, authed_client, db_engine):
+        """The agent-facing v1 endpoint force-cancels too (same logic as the
+        dashboard mirror)."""
+        import uuid as _uuid
+
+        from sqlalchemy import select
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        client, _raw, _kid = authed_client
+        run_id = await self._insert_run(
+            db_engine, state=ChannelMixRunState.IN_PROGRESS
+        )
+        resp = await client.post(
+            f"/v1/wallet/channel-mix/runs/{run_id}/stop",
+            json={"force": True},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["state"] == "cancelled"
+
+        session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with session_factory() as s:
+            row = (
+                await s.execute(
+                    select(ChannelMixRun).where(ChannelMixRun.id == _uuid.UUID(run_id))
+                )
+            ).scalar_one()
+        assert row.state == ChannelMixRunState.CANCELLED
+        assert row.completed_at is not None
+        # Belt-and-suspenders: stop_requested also set (durable cancel).
+        assert row.stop_requested is True
+
+    @pytest.mark.asyncio
+    async def test_graceful_stop_still_default(self, dashboard_client, db_engine):
+        """Omitting ``force`` (or force=false) keeps the cooperative
+        stop-after-round behaviour (sets stop_requested, stays running)."""
+        import uuid as _uuid
+
+        from sqlalchemy import select
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        run_id = await self._insert_run(
+            db_engine, state=ChannelMixRunState.IN_PROGRESS
+        )
+        resp = await dashboard_client.post(
+            f"/dashboard/api/channel-mix/runs/{run_id}/stop"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["stop_requested"] is True
+        assert resp.json()["state"] == "in_progress"  # NOT cancelled
+
+        session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+        async with session_factory() as s:
+            row = (
+                await s.execute(
+                    select(ChannelMixRun).where(ChannelMixRun.id == _uuid.UUID(run_id))
+                )
+            ).scalar_one()
+        assert row.state == ChannelMixRunState.IN_PROGRESS
+        assert row.stop_requested is True
+        assert row.completed_at is None

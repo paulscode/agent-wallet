@@ -29,7 +29,10 @@ Architectural notes
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Literal, Optional, Sequence
 
@@ -47,10 +50,18 @@ from app.services.small_channel_peers import (
 # average across regtest-measured opens.
 VBYTES_PER_CHANNEL_OPEN = 250
 
-# Per-channel on-chain reserve sized so a future cooperative or anchor
-# close can fee-bump at high feerate. LND wants ~10 k available; doubled
-# gives headroom for a spike at close time.
-CLOSE_RESERVE_SATS_PER_CHANNEL = 25_000
+# On-chain reserve so opened channels can later be cleanly closed
+# (fee-bumped at high feerate). Sub-linear in channel count: the first
+# channel reserves the full amount; each additional channel adds less,
+# because closes can be staggered rather than all force-closed at peak
+# feerate simultaneously, and the reserve is the user's own recoverable
+# on-chain balance. This keeps the suggested deposit sane in the
+# many-small-channel regime (6 channels → 75k of reserve, not 150k).
+# See :func:`close_reserve_sats`.
+CLOSE_RESERVE_FIRST_CHANNEL_SATS = 25_000
+CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS = 10_000
+# Back-compat alias: the "per-channel" reserve is the first-channel value.
+CLOSE_RESERVE_SATS_PER_CHANNEL = CLOSE_RESERVE_FIRST_CHANNEL_SATS
 
 # Fee-spike cushion that absorbs a +50 % mempool move between deposit
 # and channel-open broadcast. Floor of 10 k keeps the cushion meaningful
@@ -67,15 +78,19 @@ FUTURE_CHANNEL_SLOT_SATS = 250_000
 # rather than under-estimating it.
 FALLBACK_SAT_PER_VB = 20
 
-# Channel-count thresholds (sats of target Lightning capacity).
-SINGLE_CHANNEL_CEILING_SATS = 600_000
-TWO_CHANNEL_CEILING_SATS = 1_500_000
-PER_CHANNEL_SOFT_CEILING_SATS = 2_000_000
+# Smallest viable channel — matches the small-channel catalog's minimum
+# (every catalog peer accepts 150 k).
 PER_CHANNEL_FLOOR_SATS = 150_000
 
-# Cap on the number of channels a single plan opens. Beyond this the
-# user genuinely wants a manual flow.
+# Cap on the number of channels a single plan opens. Also bounded at
+# selection time by the number of distinct eligible providers.
 MAX_CHANNELS_PER_PLAN = 6
+
+# At/above this target we open one floor-sized channel per slice and
+# spread across providers (no single point of failure); below it a single
+# channel is the only sensible option (can't make two viable channels).
+# = 2× the per-channel floor.
+MULTI_CHANNEL_MIN_SATS = 2 * PER_CHANNEL_FLOOR_SATS
 
 # Healthy outbound ratio below which a peer's outbound-enabled rate is
 # flagged as a yellow signal even when no caveat is present.
@@ -135,6 +150,18 @@ BOOTSTRAP_BLOCK_MINUTES = 10
 # "taking longer than expected" note — it never auto-fails or moves funds
 # (plan §7.2, operator-runbook behavior).
 BOOTSTRAP_STUCK_MINUTES = 90
+
+# Hard wall-clock backstop on a *single* waiting state (one channel's
+# ``open_pending`` / one round's ``open_pending`` / ``swap_pending``). Once
+# a single wait exceeds this, the executor fails that channel/round and
+# rolls the run up to ``partial_failure`` so a stall the precise
+# confirmed-dead check (recovery plan §3.1) can't classify still self-heals.
+# This is per-waiting-state, NOT per-run: a healthy bootstrap can span
+# ~27 h across 40 rounds, but each single wait is ~40 min, so a per-run cap
+# would false-fail a healthy run while a per-wait cap never does. Far beyond
+# normal confirmation even in a sustained fee spike; the precise §3.1 check
+# resolves the common dead cases far sooner (recovery plan §3.2).
+CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES = 24 * 60
 
 # Boltz reverse-swap amount bounds — defaults mirror
 # ``boltz_service.BOLTZ_MIN/MAX_AMOUNT_SATS``. Injectable so the planner
@@ -279,23 +306,42 @@ OutboundOption = Literal[
 def derive_channel_count(target_capacity_sats: int) -> int:
     """Return the number of channels to open for ``target_capacity_sats``.
 
-    The thresholds mirror the documented heuristics:
+    Robustness-first: prefer **many floor-sized channels across distinct
+    providers** over a few large ones, so one peer going down doesn't take
+    out the wallet's liquidity (and payments can MPP-split):
 
-    * up to 600 k sats → 1 channel
-    * up to 1.5 M sats → 2 channels
-    * larger → split until per-channel ≤ 2 M sats
+    * below ``MULTI_CHANNEL_MIN_SATS`` (2× the floor) → 1 channel — you
+      can't make two viable channels below that;
+    * otherwise → one channel per floor-sized slice
+      (``target // PER_CHANNEL_FLOOR_SATS``), **capped** at
+      ``MAX_CHANNELS_PER_PLAN``.
 
-    The result is clamped to ``MAX_CHANNELS_PER_PLAN`` so a plan can't
-    silently grow into manual-flow territory. The minimum is 1.
+    Past the cap the channel *count* stops growing and the per-channel
+    capacity grows instead (e.g. 6 channels of ~333 k for a 2 M target) —
+    which is also what limited provider diversity forces. ``select_peers``
+    further shrinks the count to the number of distinct providers actually
+    available. The minimum is 1.
     """
     if target_capacity_sats <= 0:
         return 0
-    if target_capacity_sats <= SINGLE_CHANNEL_CEILING_SATS:
+    if target_capacity_sats < MULTI_CHANNEL_MIN_SATS:
         return 1
-    if target_capacity_sats <= TWO_CHANNEL_CEILING_SATS:
-        return 2
-    n = math.ceil(target_capacity_sats / PER_CHANNEL_SOFT_CEILING_SATS)
-    return max(1, min(n, MAX_CHANNELS_PER_PLAN))
+    return max(1, min(target_capacity_sats // PER_CHANNEL_FLOOR_SATS, MAX_CHANNELS_PER_PLAN))
+
+
+def close_reserve_sats(channel_count: int) -> int:
+    """Total on-chain close reserve for ``channel_count`` channels.
+
+    Sub-linear (see :data:`CLOSE_RESERVE_FIRST_CHANNEL_SATS`): the first
+    channel reserves the full amount, each additional adds the smaller
+    increment. Keeps the suggested deposit from ballooning when the plan
+    spreads across many small channels."""
+    if channel_count <= 0:
+        return 0
+    return (
+        CLOSE_RESERVE_FIRST_CHANNEL_SATS
+        + (channel_count - 1) * CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS
+    )
 
 
 # ─── Peer selection ───────────────────────────────────────────────
@@ -327,6 +373,63 @@ def _peer_ppm_score(peer: SmallChannelPeer) -> tuple[int, int]:
         peer.typical.fee_rate_milli_msat,
         peer.typical.fee_base_msat,
     )
+
+
+def _peer_weight(peer: SmallChannelPeer) -> float:
+    """Selection weight (higher = more likely to be picked) used by the
+    seeded weighted-random selection. Favours lower-fee, healthier peers
+    so randomness spreads load among *good* providers rather than picking
+    bad ones."""
+    ppm = peer.typical.fee_rate_milli_msat or 0
+    health = peer.outbound_enabled_ratio
+    health = 0.5 if health is None else health
+    return max(0.05, (1.0 / (1.0 + ppm / 1000.0)) * (0.5 + health))
+
+
+def _pref_key(peer: SmallChannelPeer, rng: Optional[random.Random]):
+    """Preference sort key tail (lower sorts first = preferred).
+
+    * ``rng is None`` → deterministic ``(ppm_score, health_score)`` — byte-
+      identical to the historical behaviour.
+    * seeded → a single weighted-random key (Efraimidis-Spirakis): a peer's
+      key is ``u**(1/weight)``; we negate it so a *higher* (more preferred)
+      value sorts first. This spreads selection across installs (each seeds
+      from its own node key) so a popular app doesn't pile every wallet onto
+      the same handful of providers."""
+    if rng is None:
+        return (_peer_ppm_score(peer), _peer_routing_health_score(peer))
+    return (-(rng.random() ** (1.0 / _peer_weight(peer))),)
+
+
+def peer_selection_seed(
+    *,
+    secret: str | bytes,
+    network: str,
+    peer_mix_mode: str,
+    manual_picks: Sequence[str] = (),
+    include_marginal_routing: bool = False,
+) -> bytes:
+    """Per-wallet, per-selection-inputs seed for weighted-random peer
+    selection.
+
+    Keyed by the node's ``secret`` (so every install fans out across
+    providers — decentralisation) and the selection inputs *excluding the
+    target amount* (so a given wallet gets a stable diverse set regardless
+    of how much it funds, and so the plan→execute token re-derivation
+    reproduces the same peers). Pure: ``secret`` is injected, no config
+    import."""
+    key = secret.encode("utf-8") if isinstance(secret, str) else secret
+    canon = "|".join(
+        [
+            network,
+            peer_mix_mode,
+            ",".join(sorted(manual_picks)),
+            "1" if include_marginal_routing else "0",
+        ]
+    )
+    return hmac.new(
+        key, b"agent-wallet/peer-selection/v1|" + canon.encode("utf-8"), hashlib.sha256
+    ).digest()
 
 
 def _location_bucket(peer: SmallChannelPeer) -> str:
@@ -366,6 +469,7 @@ def select_peers(
     mode: PeerMixMode,
     manual_picks: Sequence[str] = (),
     include_marginal_routing: bool = False,
+    rng_seed: Optional[bytes] = None,
 ) -> tuple[tuple[SmallChannelPeer, ...], tuple[str, ...]]:
     """Pick ``channel_count`` peers from the catalog by the requested
     mode. Returns ``(peers, diversity_axes_satisfied)``.
@@ -386,6 +490,10 @@ def select_peers(
     if channel_count <= 0:
         return (), ()
 
+    # Seeded → weighted-random ordering (decentralises selection across
+    # installs); unseeded → deterministic cheapest/healthiest (unchanged).
+    rng = random.Random(int.from_bytes(rng_seed, "big")) if rng_seed else None
+
     if mode == "manual_picks":
         picked: list[SmallChannelPeer] = []
         all_catalog = {p.node_id_hex.lower(): p for p in all_peers(network=network)}
@@ -405,7 +513,7 @@ def select_peers(
         return (), ()
 
     if mode == "cheapest_only":
-        catalog.sort(key=lambda p: (_peer_ppm_score(p), _peer_routing_health_score(p)))
+        catalog.sort(key=lambda p: _pref_key(p, rng))
         chosen = catalog[:channel_count]
         return tuple(chosen), _diversity_axes(chosen)
 
@@ -414,7 +522,7 @@ def select_peers(
     # diversity, (c) cheapest fee.
     starred = list(recommended_defaults(network=network))
     starred = [p for p in starred if not _peer_has_marginal_routing(p)]
-    starred.sort(key=lambda p: (_peer_ppm_score(p), _peer_routing_health_score(p)))
+    starred.sort(key=lambda p: _pref_key(p, rng))
 
     chosen: list[SmallChannelPeer] = []
     if starred:
@@ -428,15 +536,12 @@ def select_peers(
         used_operators = {_operator_bucket(p) for p in chosen}
 
         def diversity_key(peer: SmallChannelPeer) -> tuple:
-            # Lower tuple sorts first.
+            # Lower tuple sorts first: prefer a new location, then a new
+            # operator, then the preference key (deterministic cheapest, or
+            # weighted-random when seeded).
             same_location = _location_bucket(peer) in used_locations
             same_operator = _operator_bucket(peer) in used_operators
-            return (
-                int(same_location),
-                int(same_operator),
-                _peer_ppm_score(peer),
-                _peer_routing_health_score(peer),
-            )
+            return (int(same_location), int(same_operator)) + _pref_key(peer, rng)
 
         remaining_pool.sort(key=diversity_key)
         chosen.append(remaining_pool.pop(0))
@@ -622,6 +727,7 @@ async def plan_channel_mix(
     custom_inbound_pct: Optional[float] = None,
     manual_picks: Sequence[str] = (),
     include_marginal_routing: bool = False,
+    rng_seed: Optional[bytes] = None,
 ) -> Plan:
     """Build a :class:`Plan` from the user's inputs.
 
@@ -629,6 +735,10 @@ async def plan_channel_mix(
     the catalog is empty (non-mainnet, kill switch, no matching peers)
     the returned plan has no channels and ``per_channel == ()`` — the
     caller surfaces that as "no catalog peers fit your network."
+
+    ``rng_seed`` (when supplied) drives weighted-random peer selection so
+    selection fans out across installs; omitted, selection is the
+    deterministic cheapest/healthiest pick.
     """
     warnings: list[str] = []
 
@@ -639,6 +749,7 @@ async def plan_channel_mix(
         mode=peer_mix_mode,
         manual_picks=manual_picks,
         include_marginal_routing=include_marginal_routing,
+        rng_seed=rng_seed,
     )
     # If the catalog couldn't satisfy the requested count, shrink the
     # plan to what the catalog can support and warn — the alternative
@@ -690,7 +801,7 @@ async def plan_channel_mix(
 
     open_fee_at_medium = _open_fee_sats(channel_count, medium_sat_vb)
     open_fee_at_high = _open_fee_sats(channel_count, high_sat_vb)
-    close_reserve = CLOSE_RESERVE_SATS_PER_CHANNEL * max(0, channel_count)
+    close_reserve = close_reserve_sats(channel_count)
     fee_spike_cushion = _fee_spike_cushion_sats(open_fee_at_medium, open_fee_at_high) if channel_count else 0
     future_slot = FUTURE_CHANNEL_SLOT_SATS if (leave_room_for_one_more and channel_count) else 0
 
@@ -952,11 +1063,29 @@ def derive_bootstrap_schedule(
 
     if target_inbound_sats is not None:
         # Binary-search the minimal deposit that reaches the target.
-        hi = max(int(target_inbound_sats), min_deposit)
+        #
+        # Upper bound: a deposit large enough to drain the FULL target in a
+        # single round is always sufficient (recycling only helps). This must
+        # be included because for small targets the required deposit *exceeds*
+        # the target — one channel's drainable is less than its capacity, so to
+        # drain ``target`` the channel (hence the deposit) must be bigger than
+        # ``target``. Without this, ``hi`` would be too low and the search
+        # would wrongly fall through to the best-effort branch and
+        # under-recommend.
+        single_round_drainable = int(
+            math.ceil(int(target_inbound_sats) * (1.0 + BOOTSTRAP_ROUTING_FEE_PCT))
+        )
+        single_round_deposit = (
+            single_round_drainable
+            + bootstrap_reserve_for_capacity(single_round_drainable)
+            + open_fee_one
+        )
+        hi = max(int(target_inbound_sats), min_deposit, single_round_deposit)
         rounds_hi, inbound_hi, _f, _r = _sim(hi)
         if inbound_hi < target_inbound_sats:
-            # Even a target-sized deposit can't reach it within the round
-            # cap — return best effort with a warning.
+            # Genuinely unreachable within the round cap (a target so large it
+            # needs more than ``max_rounds`` even at this deposit) — best
+            # effort with a warning.
             deposit = hi
             warnings.append(
                 f"Reaches ~{inbound_hi:,} sats inbound in {len(rounds_hi)} round(s) "
@@ -1041,14 +1170,14 @@ def derive_bootstrap_schedule(
 __all__ = [
     "VBYTES_PER_CHANNEL_OPEN",
     "CLOSE_RESERVE_SATS_PER_CHANNEL",
+    "CLOSE_RESERVE_FIRST_CHANNEL_SATS",
+    "CLOSE_RESERVE_ADDITIONAL_CHANNEL_SATS",
     "FEE_SPIKE_CUSHION_PCT",
     "FEE_SPIKE_CUSHION_FLOOR_SATS",
     "FUTURE_CHANNEL_SLOT_SATS",
     "FALLBACK_SAT_PER_VB",
-    "SINGLE_CHANNEL_CEILING_SATS",
-    "TWO_CHANNEL_CEILING_SATS",
-    "PER_CHANNEL_SOFT_CEILING_SATS",
     "PER_CHANNEL_FLOOR_SATS",
+    "MULTI_CHANNEL_MIN_SATS",
     "MAX_CHANNELS_PER_PLAN",
     "BOOTSTRAP_RESERVE_PCT",
     "BOOTSTRAP_RESERVE_FLOOR_SATS",
@@ -1062,6 +1191,7 @@ __all__ = [
     "BOOTSTRAP_CONFIRMATIONS_PER_ROUND",
     "BOOTSTRAP_BLOCK_MINUTES",
     "BOOTSTRAP_STUCK_MINUTES",
+    "CHANNEL_MIX_WAIT_HARD_TIMEOUT_MINUTES",
     "BOOTSTRAP_DEFAULT_BOLTZ_MIN_SATS",
     "BOOTSTRAP_DEFAULT_BOLTZ_MAX_SATS",
     "BOOTSTRAP_HEADROOM_SATS",
@@ -1080,9 +1210,11 @@ __all__ = [
     "bootstrap_drain_for_capacity",
     "bootstrap_reserve_for_capacity",
     "bootstrap_swap_miner_fee_sats",
+    "close_reserve_sats",
     "derive_bootstrap_schedule",
     "derive_channel_count",
     "derive_seed_plan",
+    "peer_selection_seed",
     "plan_channel_mix",
     "select_peers",
 ]

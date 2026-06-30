@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-30
+
+### Added
+
+- **Cancel a running channel-mix plan.** The plan-progress view now has a
+  **Cancel run** control for both strategies (the parallel open and the
+  capital-efficient inbound bootstrap). Cancelling immediately stops the
+  wallet from starting any *new* channel opens or swaps and frees you to
+  start a fresh plan right away; anything already in flight (a broadcast
+  channel open, an in-flight swap) simply finishes on its own — no funds are
+  ever stranded. Previously a plan that got stuck waiting on a slow or
+  abandoned channel could leave you unable to start a new one at all.
+- **Self-healing stuck plans.** A plan that wedges — e.g. on a channel that
+  was force-closed mid-run or whose funding tx never confirmed — now resolves
+  itself without any action from you. The executor detects a genuinely
+  dead/force-closed channel (matched by channel point against LND's pending
+  view) and fails just that round/channel; and, as a last-resort backstop, a
+  single open/swap wait that runs far past any reasonable confirmation window
+  is timed out — so one stuck plan can never pin the wallet indefinitely.
+
+### Changed
+
+- **More resilient channel layout for receive/balanced plans.** Instead of
+  one large channel, a plan now opens several smaller (~150k-sat) channels
+  across different providers, so a single uncooperative peer can't sink the
+  whole plan and liquidity is spread for better routing. Provider selection
+  is now weighted-random — favouring cheaper, healthier peers while varying
+  per wallet, so installs don't all converge on the same few nodes. The
+  on-chain close-cost reserve now grows sub-linearly with channel count
+  rather than charging a full reserve per channel.
+- Hardened against two overlapping plans starting at once: the
+  one-active-plan guard is now atomic, so near-simultaneous requests can't
+  both kick off a run.
+
+### Fixed
+
+- **Fast receive now actually seeds inbound.** Choosing the "Fast" receive
+  option previously opened a single *outbound* channel with no inbound
+  liquidity, defeating the purpose; it now routes through the channel-mix
+  planner so the channel is seeded with receivable capacity as intended.
+- The "just exploring / light" deposit preset no longer shows a confusing
+  "raised to ~150,000" note — the light preset is now sized to open a clean
+  ~150k-sat channel, and the floor-adjustment note only appears for a custom
+  amount the user typed.
+
 ## [0.3.0] - 2026-06-30
 
 ### Added
