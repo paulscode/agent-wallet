@@ -7538,6 +7538,14 @@ document.addEventListener('alpine:init', () => {
             return (this.channelMixRun && this.channelMixRun.error_message) || '';
         },
 
+        /** Underscore→space prettifier for a sub-state string. Done in JS
+         *  because the Alpine CSP build can't parse a regex literal in a
+         *  template expression (``.replace(/_/g, ' ')`` throws a parser
+         *  error). Used by the parallel channel rows. */
+        prettyState(s) {
+            return String(s == null ? '' : s).split('_').join(' ');
+        },
+
         /** Friendly label for one bootstrap round's sub-state. */
         channelMixRoundStateLabel(state) {
             const map = {

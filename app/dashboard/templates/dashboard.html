@@ -627,7 +627,7 @@
                     </template>
 
                     <p class="text-xs text-gray-500 text-center mt-2">
-                        Prefer the regular dashboard?
+                        Prefer to set things up yourself?
                         <button @click="onboardingSkip()" class="text-neon-cyan hover:underline">Skip to dashboard</button>
                     </p>
                 </div>
@@ -1076,9 +1076,9 @@
                                         </div>
                                         <div class="flex items-center justify-between mt-1">
                                             <span class="text-[10px] text-gray-500">
-                                                <span x-text="ch.open_state.replace(/_/g, ' ')"></span>
+                                                <span x-text="prettyState(ch.open_state)"></span>
                                                 <template x-if="ch.seed_state !== 'skipped'">
-                                                    <span> · seed: <span x-text="ch.seed_state.replace(/_/g, ' ')"></span></span>
+                                                    <span> · seed: <span x-text="prettyState(ch.seed_state)"></span></span>
                                                 </template>
                                             </span>
                                             <template x-if="ch.open_state === 'open_active'">

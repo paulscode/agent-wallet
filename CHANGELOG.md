@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-06-30
+
+### Fixed
+
+- The channel-mix progress view's per-channel status labels used a regex-based
+  text transform the dashboard's CSP build can't parse, so they failed to render
+  (with a console error) on the "Building inbound" / parallel-open screens. The
+  labels render correctly now.
+
+### Changed
+
+- Reworded the onboarding "ready to connect" skip link from the unclear "Prefer
+  the regular dashboard?" to "Prefer to set things up yourself?".
+
 ## [0.4.1] - 2026-06-30
 
 ### Fixed
