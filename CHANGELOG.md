@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-06-30
+
+### Fixed
+
+- **Onboarding now carries your chosen plan into the connect step.** After
+  depositing, the post-deposit screen led with the manual "open a single
+  channel" form instead of the plan you picked in the welcome wizard (e.g.
+  Receive → Efficient). The chosen plan was saved correctly, but the connect
+  screen's "you chose …" cards were gated on a value read only from browser
+  storage — with no reactive dependency, that gate evaluated once (at the
+  welcome step, before a plan existed) and never re-ran, so the pre-applied plan
+  was silently dropped. The plan is now held in reactive state (still persisted
+  for reload survival), so the correct card ("build inbound efficiently" for
+  Efficient receive, "open your channels" for spend/both/fast-receive) appears
+  and the manual form stays a collapsed secondary option.
+
 ## [0.4.6] - 2026-06-30
 
 ### Fixed

@@ -1232,6 +1232,14 @@ document.addEventListener('alpine:init', () => {
         // welcome wizard is pre-applied (the prominent path); the manual
         // form is a secondary option then.
         onboardingManualOpen: false,
+        // The funding plan chosen in the welcome wizard, held as REACTIVE
+        // state (persisted to localStorage for reload survival). It must be
+        // reactive — the ready_to_connect green cards gate on it via x-if, and
+        // if the getters read only localStorage the x-if evaluates once (at
+        // the welcome step, before a plan exists) and never re-runs, so the
+        // pre-applied plan is silently lost. Hydrated on init; see
+        // _saveOnboardingPlan / _loadOnboardingPlan / _clearOnboardingPlan.
+        onboardingPlan: null,
         // ── First-screen funding wizard (empty-wallet welcome) ──
         // Which beat of the intent→amount→recommendation flow is showing.
         welcomeBeat: 'use_case',                    // 'use_case' | 'scale' | 'recommend'
@@ -1979,6 +1987,10 @@ document.addEventListener('alpine:init', () => {
         // ── Init ──
         async init() {
             this._loadRuntimeConfig();
+            // Hydrate the reactive onboarding plan from localStorage before
+            // the onboarding block renders, so a reload mid-deposit keeps the
+            // pre-applied plan and the ready_to_connect cards react to it.
+            this._hydrateOnboardingPlan();
             // Onboarding "skip" is scoped to the LND node identity (see
             // _refreshOnboardingSkipped). It can't be hydrated until the
             // summary (hence the node pubkey) loads, so default to false;
@@ -8094,27 +8106,38 @@ document.addEventListener('alpine:init', () => {
         },
 
         _saveOnboardingPlan(card) {
-            try {
-                localStorage.setItem(ONBOARDING_PLAN_KEY, JSON.stringify({
-                    use_case: this.welcomeUseCase,
-                    scale_sats: this.welcomeScaleSats,
-                    strategy: card.strategy,
-                    deposit_sats: card.deposit_sats,
-                    target_capacity_sats: card.target_capacity_sats || null,
-                    target_inbound_sats: card.target_inbound_sats || null,
-                    outbound_option: card.outbound_option || null,
-                }));
-            } catch (_e) {}
+            const plan = {
+                use_case: this.welcomeUseCase,
+                scale_sats: this.welcomeScaleSats,
+                strategy: card.strategy,
+                deposit_sats: card.deposit_sats,
+                target_capacity_sats: card.target_capacity_sats || null,
+                target_inbound_sats: card.target_inbound_sats || null,
+                outbound_option: card.outbound_option || null,
+            };
+            // Reactive state drives the ready_to_connect x-if cards; the
+            // localStorage copy survives a page reload during the deposit wait.
+            this.onboardingPlan = plan;
+            try { localStorage.setItem(ONBOARDING_PLAN_KEY, JSON.stringify(plan)); } catch (_e) {}
         },
 
+        /** Return the reactive plan (so getters/templates re-evaluate when it
+         *  changes). Persistence is via localStorage, hydrated on init. */
         _loadOnboardingPlan() {
+            return this.onboardingPlan;
+        },
+
+        /** One-time hydrate of the reactive plan from localStorage at startup
+         *  (so a reload mid-deposit keeps the pre-applied plan). */
+        _hydrateOnboardingPlan() {
             try {
                 const raw = localStorage.getItem(ONBOARDING_PLAN_KEY);
-                return raw ? JSON.parse(raw) : null;
-            } catch (_e) { return null; }
+                this.onboardingPlan = raw ? JSON.parse(raw) : null;
+            } catch (_e) { this.onboardingPlan = null; }
         },
 
         _clearOnboardingPlan() {
+            this.onboardingPlan = null;
             try { localStorage.removeItem(ONBOARDING_PLAN_KEY); } catch (_e) {}
         },
 
