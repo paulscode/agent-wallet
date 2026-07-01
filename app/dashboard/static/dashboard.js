@@ -1114,6 +1114,9 @@ document.addEventListener('alpine:init', () => {
         // (ext_lightning / ext_onchain) and skipped for self sources.
         braiinsDepositOpen: false,
         braiinsDepositStep: 'form',  // 'form' | 'await_funds' | 'progress' | 'success' | 'failed'
+        // Sub-step within the 'form' step — a 3-card wizard so the (dense)
+        // deposit form isn't one long scroll: source → details → review.
+        braiinsDepositFormStep: 'source',  // 'source' | 'details' | 'review'
         braiinsDepositEnabled: true,
         // Set from the runtime-config island (backend ANONYMIZE_ENABLED). Default
         // false so the experimental Anonymize tab stays hidden unless the backend
@@ -1224,6 +1227,11 @@ document.addEventListener('alpine:init', () => {
         // user-controlled inputs (peer choice, amount, custom URI)
         // and a transient "I just submitted, suppress flicker" flag.
         onboardingSkipped: false,
+        // ready_to_connect: whether the "open a single channel manually"
+        // accordion is expanded. Collapsed by default when a plan from the
+        // welcome wizard is pre-applied (the prominent path); the manual
+        // form is a secondary option then.
+        onboardingManualOpen: false,
         // ── First-screen funding wizard (empty-wallet welcome) ──
         // Which beat of the intent→amount→recommendation flow is showing.
         welcomeBeat: 'use_case',                    // 'use_case' | 'scale' | 'recommend'
@@ -1971,14 +1979,14 @@ document.addEventListener('alpine:init', () => {
         // ── Init ──
         async init() {
             this._loadRuntimeConfig();
-            // Onboarding skip flag — hydrate before fetchAll() so a
-            // returning skipped user never sees the wizard flash.
-            try {
-                this.onboardingSkipped = localStorage.getItem('onboardingSkipped') === '1';
-            } catch (_e) {
-                this.onboardingSkipped = false;
-            }
+            // Onboarding "skip" is scoped to the LND node identity (see
+            // _refreshOnboardingSkipped). It can't be hydrated until the
+            // summary (hence the node pubkey) loads, so default to false;
+            // onboardingStep returns null while summary is null anyway, so
+            // there's no wizard flash before the real value is known.
+            this.onboardingSkipped = false;
             await this.fetchAll();
+            this._refreshOnboardingSkipped();
             this.initIcons();
 
             // Onboarding wizard reactivity. ``$watch`` on the getter
@@ -2207,6 +2215,11 @@ document.addEventListener('alpine:init', () => {
                 this.infoSynced = !!(val && val.synced_to_chain);
                 this.infoBlockHeight = (val && val.block_height) || 0;
             });
+
+            // Keep the node-scoped onboarding-skip flag in sync with the
+            // current node identity (handles LND coming online after init,
+            // or a node swap): a fresh node pubkey → no stale skip.
+            this.$watch('summary', () => this._refreshOnboardingSkipped());
 
             // Cold Storage: auto-fetch Boltz fees + swap history when dialog opens
             this.$watch('showColdStorage', (val) => {
@@ -8121,6 +8134,13 @@ document.addEventListener('alpine:init', () => {
             return this.onboardingSavedStrategy === 'parallel';
         },
 
+        /** True when the welcome wizard pre-applied any plan (bootstrap or
+         *  parallel). Drives whether the manual single-channel form is
+         *  collapsed into an accordion (secondary) on ready_to_connect. */
+        get onboardingHasSavedPlan() {
+            return this.onboardingHasSavedBootstrap || this.onboardingHasSavedParallel;
+        },
+
         get onboardingSavedTargetInbound() {
             const p = this._loadOnboardingPlan();
             if (!p) return 0;
@@ -8224,15 +8244,48 @@ document.addEventListener('alpine:init', () => {
             this.onboardingLoading = false;
         },
 
+        /** localStorage key for the "skip onboarding" flag, scoped to the
+         *  current LND node's identity pubkey. Scoping matters because
+         *  localStorage lives in the browser, not the app's data volume —
+         *  so a global flag survives an Agent Wallet / LND reinstall and
+         *  would wrongly suppress onboarding for a brand-new node. Returns
+         *  '' until the node pubkey is known. */
+        _onboardingSkipKey() {
+            const pk = (this.summary && this.summary.node_info
+                && this.summary.node_info.identity_pubkey) || '';
+            return pk ? ('onboardingSkipped:' + pk) : '';
+        },
+
+        /** Re-read the node-scoped skip flag from localStorage. Called once
+         *  the summary (node pubkey) is available and whenever it changes,
+         *  so a fresh node starts unskipped (onboarding shows) regardless of
+         *  any stale flag left in the browser by a previous install. */
+        _refreshOnboardingSkipped() {
+            const key = this._onboardingSkipKey();
+            if (!key) { this.onboardingSkipped = false; return; }
+            try { this.onboardingSkipped = localStorage.getItem(key) === '1'; }
+            catch (_e) { this.onboardingSkipped = false; }
+        },
+
         onboardingSkip() {
-            try { localStorage.setItem('onboardingSkipped', '1'); } catch (_e) {}
+            const key = this._onboardingSkipKey();
+            try {
+                if (key) localStorage.setItem(key, '1');
+                // Drop the legacy global flag from older builds so it can't
+                // leak across nodes/reinstalls.
+                localStorage.removeItem('onboardingSkipped');
+            } catch (_e) {}
             this.onboardingSkipped = true;
             this._clearOnboardingPlan();
             this._stopOnboardingPoller();
         },
 
         onboardingResume() {
-            try { localStorage.removeItem('onboardingSkipped'); } catch (_e) {}
+            const key = this._onboardingSkipKey();
+            try {
+                if (key) localStorage.removeItem(key);
+                localStorage.removeItem('onboardingSkipped');
+            } catch (_e) {}
             this.onboardingSkipped = false;
             // The watcher will start the poller again on next tick.
         },
@@ -9516,6 +9569,7 @@ document.addEventListener('alpine:init', () => {
             // session so the form doesn't carry forward stale txids
             // / amounts from the previous (terminal) session.
             this.braiinsDepositStep = 'form';
+            this.braiinsDepositFormStep = 'source';  // start the wizard at card 1
             this.braiinsDepositAmountSats = null;
             this.braiinsDepositAddress = '';
             this.braiinsDepositAddressError = '';
@@ -10077,6 +10131,27 @@ document.addEventListener('alpine:init', () => {
             }
         },
 
+        /** Card 2 → 3 gate: an amount is chosen and a valid Braiins address
+         *  is entered. (The amount presets already disable un-affordable /
+         *  fee-infeasible bins, so a chosen amount is viable.) */
+        get braiinsDepositDetailsReady() {
+            return !!(this.braiinsDepositAmountSats
+                && this.braiinsDepositAddress
+                && this.braiinsDepositAddress.trim()
+                && !this.braiinsDepositAddressError);
+        },
+
+        /** Why the details card's Next is disabled (empty when it's ready).
+         *  Address-format errors are shown inline under the field, so this
+         *  only covers the "nothing entered yet" cases. */
+        get braiinsDepositDetailsHint() {
+            if (!this.braiinsDepositAmountSats) return 'Choose an amount above.';
+            if (!this.braiinsDepositAddress || !this.braiinsDepositAddress.trim()) {
+                return 'Paste your Braiins deposit address above.';
+            }
+            return '';
+        },
+
         get braiinsDepositCanStart() {
             if (!this.braiinsDepositAmountSats) return false;
             if (!this.braiinsDepositAddress || !this.braiinsDepositAddress.trim()) return false;
@@ -10123,6 +10198,24 @@ document.addEventListener('alpine:init', () => {
             if (this.braiinsDepositQuote.arrival_feasible === false) {
                 return 'Network fees too high for this bin amount right now. '
                     + 'Pick a larger amount or wait for fees to drop.';
+            }
+            // Channel-open strategy gates. The channel toggle / preflight
+            // lives on card 1 (source), so its reason isn't visible on the
+            // review card — surface it here, or Start would be disabled with
+            // no explanation. Checked before the ext-source early return
+            // because ext_onchain can also use the channel strategy.
+            if (this.braiinsDepositIsChannelStrategy) {
+                if (this.braiinsDepositQuote.channel_eligible === false) {
+                    return 'This amount can’t open a channel. Pick a larger '
+                        + 'amount, or go Back and switch off the channel option.';
+                }
+                if (this.braiinsDepositChannelPeerChecking) {
+                    return 'Checking the channel peer…';
+                }
+                if (this.braiinsDepositChannelPeerReachable === false) {
+                    return 'Can’t reach the channel peer right now. Try again '
+                        + 'shortly, or go Back and switch off the channel option.';
+                }
             }
             // Ext sources never gate on the wallet's own
             // balance — there's nothing to hint about.
@@ -11587,6 +11680,10 @@ document.addEventListener('alpine:init', () => {
             this.braiinsDepositHasActiveSession = false;
             this.braiinsDepositQuote = null;
             this.braiinsDepositStep = 'form';
+            // Amount + address are pre-seeded from the refunded session and
+            // the channel strategy is already chosen, so drop the user on the
+            // review card to confirm + start (no need to re-walk the wizard).
+            this.braiinsDepositFormStep = 'review';
             this.braiinsDepositOpen = true;
             this._debounceBraiinsDepositQuote();
             this._braiinsCheckChannelPeer();

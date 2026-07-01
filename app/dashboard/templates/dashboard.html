@@ -420,7 +420,6 @@
                                     class="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green font-medium hover:bg-neon-green/25 hover:border-neon-green/60 transition-all text-sm">
                                 <i data-lucide="zap" class="w-4 h-4"></i> Review &amp; start building inbound
                             </button>
-                            <p class="text-[11px] text-gray-500 text-center mt-3">or open a single channel manually below</p>
                         </div>
                     </template>
 
@@ -440,11 +439,27 @@
                                     class="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-neon-green/15 border border-neon-green/40 text-neon-green font-medium hover:bg-neon-green/25 hover:border-neon-green/60 transition-all text-sm">
                                 <i data-lucide="zap" class="w-4 h-4"></i> Review &amp; open your channels
                             </button>
-                            <p class="text-[11px] text-gray-500 text-center mt-3">or open a single channel manually below</p>
                         </div>
                     </template>
 
-                    <div class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
+                    <!-- Manual single-channel open. When the welcome wizard
+                         pre-applied a plan (shown above), this is the
+                         secondary path, collapsed into an accordion; with no
+                         pre-applied plan it's the primary path and stays open. -->
+                    <template x-if="onboardingHasSavedPlan">
+                        <div class="max-w-md mx-auto mb-4">
+                            <button @click="onboardingManualOpen = !onboardingManualOpen"
+                                    class="w-full flex items-center justify-between px-4 py-3 rounded-lg bg-navy-900 border border-navy-700 text-sm text-gray-300 hover:text-white hover:border-navy-600 transition-colors">
+                                <span class="flex items-center gap-2">
+                                    <i data-lucide="sliders-horizontal" class="w-4 h-4 text-gray-500"></i>
+                                    Open a single channel manually
+                                </span>
+                                <i :data-lucide="onboardingManualOpen ? 'chevron-up' : 'chevron-down'" class="w-4 h-4 text-gray-500"></i>
+                            </button>
+                        </div>
+                    </template>
+
+                    <div x-show="onboardingManualOpen || !onboardingHasSavedPlan" class="bg-navy-900 border border-navy-700 rounded-lg p-5 max-w-md mx-auto space-y-5">
                         <!-- Amount -->
                         <div>
                             <label class="text-xs uppercase tracking-wider text-gray-500 mb-1.5 block">
@@ -8750,8 +8765,17 @@
                     </span>.
                 </div>
 
-                <!-- ──────── FORM ──────── -->
-                <div x-show="braiinsDepositStep === 'form'" class="space-y-5 mt-3">
+                <!-- ──────── FORM (3-card wizard: source → details → review) ──────── -->
+                <div x-show="braiinsDepositStep === 'form'" class="mt-3">
+                    <!-- progress dots -->
+                    <div class="flex items-center justify-center gap-1.5 mb-4">
+                        <span class="w-2 h-2 rounded-full transition-colors" :class="braiinsDepositFormStep === 'source' ? 'bg-neon-cyan' : 'bg-navy-600'"></span>
+                        <span class="w-2 h-2 rounded-full transition-colors" :class="braiinsDepositFormStep === 'details' ? 'bg-neon-cyan' : 'bg-navy-600'"></span>
+                        <span class="w-2 h-2 rounded-full transition-colors" :class="braiinsDepositFormStep === 'review' ? 'bg-neon-cyan' : 'bg-navy-600'"></span>
+                    </div>
+
+                    <!-- ═══════ Card 1: source ═══════ -->
+                    <div x-show="braiinsDepositFormStep === 'source'" class="space-y-5">
                     <!-- Source picker. Self-sourced (Agent
                          Wallet) and external-sourced (any other wallet)
                          options grouped under two headers, mirroring
@@ -8975,6 +8999,19 @@
                         </details>
                     </div>
 
+                        <!-- nav: source card -->
+                        <div class="flex items-center gap-2 pt-1">
+                            <button @click="closeBraiinsDeposit()"
+                                    class="px-4 py-2.5 rounded-lg border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 text-sm transition-colors">Cancel</button>
+                            <button @click="braiinsDepositFormStep = 'details'"
+                                    class="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-neon-cyan/15 border border-neon-cyan/40 text-neon-cyan font-medium hover:bg-neon-cyan/25 hover:border-neon-cyan/60 text-sm transition-all">Next</button>
+                        </div>
+                    </div>
+                    <!-- /Card 1 -->
+
+                    <!-- ═══════ Card 2: amount + address ═══════ -->
+                    <div x-show="braiinsDepositFormStep === 'details'" class="space-y-5">
+
                     <!-- Amount presets -->
                     <div>
                         <label class="text-xs uppercase tracking-wider text-gray-500 mb-1.5 block">
@@ -9025,6 +9062,23 @@
                             Copy this from your Braiins Hashpower deposit page.
                         </p>
                     </div>
+
+                        <template x-if="braiinsDepositDetailsHint">
+                            <p class="text-[11px] text-gray-500 text-center" x-text="braiinsDepositDetailsHint"></p>
+                        </template>
+
+                        <!-- nav: details card -->
+                        <div class="flex items-center gap-2 pt-1">
+                            <button @click="braiinsDepositFormStep = 'source'"
+                                    class="px-4 py-2.5 rounded-lg border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 text-sm transition-colors">Back</button>
+                            <button @click="braiinsDepositFormStep = 'review'" :disabled="!braiinsDepositDetailsReady"
+                                    class="flex-1 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-neon-cyan/15 border border-neon-cyan/40 text-neon-cyan font-medium hover:bg-neon-cyan/25 hover:border-neon-cyan/60 text-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed">Next</button>
+                        </div>
+                    </div>
+                    <!-- /Card 2 -->
+
+                    <!-- ═══════ Card 3: review & confirm ═══════ -->
+                    <div x-show="braiinsDepositFormStep === 'review'" class="space-y-5">
 
                     <!-- Include-extras toggle —
                          lets the user choose between the dust-safe
@@ -9305,15 +9359,22 @@
                         <p class="text-[11px] text-gray-500 text-center" x-text="braiinsDepositStartHint"></p>
                     </template>
 
-                    <button @click="braiinsDepositStart()" :disabled="!braiinsDepositCanStart || braiinsDepositLoading"
-                        class="w-full inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-neon-cyan/15 border border-neon-cyan/40 text-neon-cyan font-medium hover:bg-neon-cyan/25 hover:border-neon-cyan/60 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
-                        <template x-if="braiinsDepositLoading">
-                            <span class="flex items-center gap-2"><span class="w-4 h-4 border-2 border-neon-cyan border-t-transparent rounded-full animate-spin"></span> Starting…</span>
-                        </template>
-                        <template x-if="!braiinsDepositLoading">
-                            <span class="flex items-center gap-2" x-text="braiinsDepositStartButtonLabel"></span>
-                        </template>
-                    </button>
+                    <!-- nav: review card (Back + Start) -->
+                    <div class="flex items-center gap-2">
+                        <button @click="braiinsDepositFormStep = 'details'" :disabled="braiinsDepositLoading"
+                                class="px-4 py-3 rounded-lg border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 text-sm transition-colors disabled:opacity-40 disabled:cursor-not-allowed">Back</button>
+                        <button @click="braiinsDepositStart()" :disabled="!braiinsDepositCanStart || braiinsDepositLoading"
+                            class="flex-1 inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-neon-cyan/15 border border-neon-cyan/40 text-neon-cyan font-medium hover:bg-neon-cyan/25 hover:border-neon-cyan/60 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
+                            <template x-if="braiinsDepositLoading">
+                                <span class="flex items-center gap-2"><span class="w-4 h-4 border-2 border-neon-cyan border-t-transparent rounded-full animate-spin"></span> Starting…</span>
+                            </template>
+                            <template x-if="!braiinsDepositLoading">
+                                <span class="flex items-center gap-2" x-text="braiinsDepositStartButtonLabel"></span>
+                            </template>
+                        </button>
+                    </div>
+                    </div>
+                    <!-- /Card 3 -->
                 </div>
 
                 <!-- ──────── AWAIT FUNDS (external sources) ──────── -->

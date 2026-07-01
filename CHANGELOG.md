@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-06-30
+
+### Changed
+
+- **Braiins Deposit is now a 3-card wizard.** The previously dense single-scroll
+  form is split into three focused cards — *source* → *amount & address* →
+  *review & confirm* — with progress dots and Back/Next, mirroring the onboarding
+  wizard. All functionality is retained (source picker with tooltips, the
+  advanced open-a-channel option, amount presets, destination address, the
+  include-extras choice, the "what happens next" summary, and the full fee
+  preview); options just live on the card they belong to, so a non-technical user
+  can move through it a step at a time.
+- **The "open a single channel manually" section on the post-deposit connect
+  screen is now a collapsed accordion** whenever the welcome wizard already
+  pre-applied a plan — leading with the recommended path and tucking the manual
+  form behind a header. With no pre-applied plan it stays expanded (it's then the
+  primary path). Applies to every intent (bootstrap and parallel).
+
+### Fixed
+
+- **Onboarding shows again on a fresh node.** The "skip onboarding" preference
+  was stored as a global browser flag, so it survived an Agent Wallet / LND
+  reinstall and wrongly sent a brand-new node straight to the dashboard. It's now
+  scoped to the LND node's identity, so a fresh node shows the welcome wizard
+  again while a deliberate skip still sticks for that node.
+- Braiins Deposit review card now explains a disabled "Start" (e.g. the
+  channel-open peer is unreachable) instead of greying out with no reason, and
+  the amount/address card hints why "Next" is disabled.
+
 ## [0.4.4] - 2026-06-30
 
 ### Fixed
