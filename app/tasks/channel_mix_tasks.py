@@ -54,6 +54,22 @@ BOOTSTRAP_MAX_SWAP_ATTEMPTS = 4
 # escalating to the next eligible peer, so a permanently-down peer can't
 # wedge the round forever (the §7 "stop cleanly, never retry forever" rule).
 BOOTSTRAP_MAX_CONNECT_ATTEMPTS = 3
+# LND's ConnectPeer is fire-and-forget: it returns "connection … initiated"
+# before the TCP + Noise handshake completes (typically ~1s later). The
+# immediately-following OpenChannel would then race ahead and be rejected with
+# "peer … is not online". After connecting we poll ListPeers up to this many
+# times (1s apart) within the same tick so the peer is actually connected
+# before we open. Bounded so a genuinely-unreachable peer still escalates.
+BOOTSTRAP_PEER_CONNECT_WAIT_POLLS = 15
+# LND retains an on-chain "anchor reserve" to fee-bump force-closes: 10k sat per
+# anchor channel, capped at 100k (see LND's AnchorChanReservedValue /
+# maxAnchorChanReservedValue). An open that would leave the wallet below this
+# reserve is rejected with "reserved wallet balance invalidated". The bootstrap
+# loop keeps earlier (drained) channels open, so the reserve grows each round —
+# capacity must leave room for the existing channels PLUS the one being opened,
+# or round 2+ fails.
+BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN = 10_000
+BOOTSTRAP_MAX_ANCHOR_RESERVE = 100_000
 
 
 def _run_async(coro: Any) -> Any:
@@ -63,6 +79,17 @@ def _run_async(coro: Any) -> Any:
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Close the shared LND client on the loop it was created on, before we
+        # tear that loop down. The lnd_service singleton caches an
+        # httpx.AsyncClient bound to this loop; if we left it open it would be
+        # reused on the next tick's (different) loop and raise "Event loop is
+        # closed". A clean aclose() here also avoids leaking the connection pool.
+        try:
+            from app.services.lnd_service import lnd_service
+
+            loop.run_until_complete(lnd_service.close())
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
         pending = asyncio.all_tasks(loop)
         for task in pending:
             task.cancel()
@@ -191,6 +218,25 @@ async def _open_one_channel(db, run: ChannelMixRun, channel_idx: int) -> None:
             channel_idx,
             success=False,
             error_message=f"connect failed: {connect_err}",
+        )
+        return
+
+    # connect_peer only initiates the connection; wait for it to actually land
+    # before opening so OpenChannel doesn't race ahead and hit "peer not
+    # online" (LND's ConnectPeer returns before the handshake completes).
+    if not await _wait_peer_connected(pubkey):
+        entry["open_state"] = "open_failed"
+        entry["open_error"] = "connect failed: peer did not come online"[:512]
+        if entry["seed_state"] == "queued":
+            entry["seed_state"] = "skipped"
+        run.channels[channel_idx] = entry
+        await _audit_channel_open(
+            db,
+            run,
+            entry,
+            channel_idx,
+            success=False,
+            error_message="connect failed: peer did not come online",
         )
         return
 
@@ -749,6 +795,30 @@ def _bootstrap_next_peer(run: ChannelMixRun, round_index: int):
     return peers[round_index % len(peers)]
 
 
+async def _wait_peer_connected(pubkey: str) -> bool:
+    """Poll ListPeers until ``pubkey`` shows as connected, up to
+    ``BOOTSTRAP_PEER_CONNECT_WAIT_POLLS`` times (1s apart).
+
+    connect_peer is asynchronous — it returns "connection … initiated"
+    before the handshake finishes — so opening a channel immediately after
+    races the connection and LND rejects it with "peer … is not online".
+    A short in-tick wait closes that window (the connect completes in ~1s).
+    Returns True once the peer is connected, False if it never appears
+    within the budget (the caller then treats it as a transient connect
+    failure and retries/escalates). A ListPeers error is treated as
+    "not yet" and retried — never a hard failure."""
+    from app.services.lnd_service import lnd_service
+
+    for attempt in range(BOOTSTRAP_PEER_CONNECT_WAIT_POLLS):
+        pubs, err = await lnd_service.list_peer_pubkeys()
+        if not err and pubs is not None and pubkey in pubs:
+            return True
+        # Don't sleep after the final probe.
+        if attempt < BOOTSTRAP_PEER_CONNECT_WAIT_POLLS - 1:
+            await asyncio.sleep(1.0)
+    return False
+
+
 async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
     """Advance one bootstrap round by a single chain-observable step.
 
@@ -802,6 +872,35 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             run.channels[idx] = entry
             return
 
+        # connect_peer only *initiates* the connection (LND returns before the
+        # handshake completes), so wait until the peer is actually connected
+        # before opening — otherwise OpenChannel races ahead and is rejected
+        # with "peer … is not online". If it never comes online within the
+        # in-tick budget, treat it exactly like a connect failure: retry a
+        # bounded number of ticks, then escalate to the next peer (§7.5).
+        if not await _wait_peer_connected(entry["peer_pubkey"]):
+            attempts = int(entry.get("connect_attempts", 0)) + 1
+            entry["connect_attempts"] = attempts
+            if attempts < BOOTSTRAP_MAX_CONNECT_ATTEMPTS:
+                entry["open_error"] = (
+                    f"connect (retry {attempts}): peer did not come online"
+                )[:512]
+                run.channels[idx] = entry
+                return
+            if not _bootstrap_switch_to_next_peer(
+                run, entry, "peer did not come online"
+            ):
+                entry["state"] = "open_failed"
+                entry["open_error"] = "connect: peer did not come online"[:512]
+                run.channels[idx] = entry
+                await _audit_channel_open(
+                    db, run, _bootstrap_audit_entry(entry), idx,
+                    success=False, error_message="connect: peer did not come online",
+                )
+                return
+            run.channels[idx] = entry
+            return
+
         result, open_err = await lnd_service.open_channel(
             entry["peer_pubkey"],
             int(entry["capacity_sats"]),
@@ -809,6 +908,60 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             push_sat=0,
         )
         if open_err or not result or not result.get("funding_txid"):
+            # "peer not online" right after a successful connect is a transient
+            # LND race: the funding manager's connected-peer set can lag the
+            # ConnectPeer RPC return by a moment, so the immediately-following
+            # OpenChannel is rejected even though the peer is reachable. Retry
+            # the SAME peer a bounded number of ticks (reusing the per-peer
+            # connect counter, which _bootstrap_switch_to_next_peer resets)
+            # before escalating — otherwise every fresh-connection open trips
+            # this and the round burns through the whole peer catalog for
+            # nothing. Mirrors the connect-retry policy (plan §7.5).
+            err_text = str(open_err or "").lower()
+            if open_err and "reserved wallet balance" in err_text:
+                # LND's anchor-channel reserve grew (earlier drained channels
+                # stay open), so this round's baked capacity now leaves too
+                # little on-chain. The error is wallet-level, NOT peer-specific,
+                # so cycling peers is futile — shrink capacity by one
+                # anchor-reserve unit and retry the SAME peer, bounded, until it
+                # fits or would drop below the per-channel floor.
+                from app.services.channel_mix_planner import PER_CHANNEL_FLOOR_SATS
+
+                shrinks = int(entry.get("reserve_shrink_attempts", 0)) + 1
+                entry["reserve_shrink_attempts"] = shrinks
+                new_cap = (
+                    int(entry.get("capacity_sats", 0))
+                    - BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN
+                )
+                max_shrinks = (
+                    BOOTSTRAP_MAX_ANCHOR_RESERVE // BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN
+                )
+                if new_cap >= PER_CHANNEL_FLOOR_SATS and shrinks <= max_shrinks:
+                    entry["capacity_sats"] = new_cap
+                    entry["open_error"] = (
+                        f"resizing for LND anchor reserve (retry {shrinks})"
+                    )[:512]
+                    run.channels[idx] = entry
+                    return
+                # Can't fit even at the floor — fail the round cleanly rather
+                # than cycle peers that will all hit the same wallet reserve.
+                entry["state"] = "open_failed"
+                entry["open_error"] = f"open: {open_err}"[:512]
+                run.channels[idx] = entry
+                await _audit_channel_open(
+                    db, run, _bootstrap_audit_entry(entry), idx,
+                    success=False, error_message=f"open: {open_err}",
+                )
+                return
+            if open_err and ("not online" in err_text or "not connected" in err_text):
+                attempts = int(entry.get("connect_attempts", 0)) + 1
+                entry["connect_attempts"] = attempts
+                if attempts < BOOTSTRAP_MAX_CONNECT_ATTEMPTS:
+                    entry["open_error"] = (
+                        f"open (retry {attempts}): peer not online yet"
+                    )[:512]
+                    run.channels[idx] = entry
+                    return
             # Hard, pre-broadcast (no funds moved): try the next eligible
             # peer for this round (plan §7.5), else fail the round.
             if not _bootstrap_switch_to_next_peer(
@@ -976,6 +1129,15 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             run.channels[idx] = entry
             return
 
+        # Surface the drain swap's on-chain txids live so the round card can
+        # link them in the mempool explorer *while they confirm* (Boltz's
+        # lockup and our claim/recycle sweep), not only after settle.
+        if getattr(swap, "lockup_txid", None):
+            entry["swap_lockup_txid"] = swap.lockup_txid
+        if getattr(swap, "claim_txid", None):
+            entry["swap_claim_txid"] = swap.claim_txid
+        run.channels[idx] = entry
+
         if swap.status == SwapStatus.COMPLETED and swap.claim_txid:
             # Claim confirmed on-chain (COMPLETED already requires the
             # claim tx to have its confirmations — see boltz advance_swap).
@@ -1089,7 +1251,19 @@ async def _bootstrap_maybe_start_round(db, run: ChannelMixRun) -> None:
     confirmed = int(bal.get("confirmed_balance", 0) or 0)
     sat_per_vb = await _bootstrap_feerate_sat_vb()
     open_fee = _open_fee_sats(1, sat_per_vb)
-    capacity = confirmed - open_fee - BOOTSTRAP_HEADROOM_SATS
+    # Reserve for LND's anchor-channel fee-bump reserve. It already holds
+    # ``reserved_balance_anchor_chan`` for the existing channels; opening one
+    # more needs another 10k (capped at 100k total). Leaving only the fixed
+    # headroom worked for the first channel but fails from round 2 on, since
+    # the earlier drained channels stay open and keep counting toward the
+    # reserve ("reserved wallet balance invalidated").
+    current_reserved = int(bal.get("reserved_balance_anchor_chan", 0) or 0)
+    anchor_reserve = min(
+        current_reserved + BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN,
+        BOOTSTRAP_MAX_ANCHOR_RESERVE,
+    )
+    headroom = max(BOOTSTRAP_HEADROOM_SATS, anchor_reserve)
+    capacity = confirmed - open_fee - headroom
     # Cap so this round's drainable doesn't exceed the Boltz max — the
     # excess would strand as un-recyclable outbound. Leftover confirmed
     # balance stays on-chain and funds the next round (matches the

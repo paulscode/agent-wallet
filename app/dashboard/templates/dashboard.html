@@ -1047,6 +1047,37 @@
                                             <template x-if="r.expected_inbound_sats > 0">
                                                 <p class="text-[10px] text-gray-500 mt-0.5">+<span x-text="formatSats(r.expected_inbound_sats)"></span> inbound</p>
                                             </template>
+                                            <!-- On-chain transactions for this round, each opening in the
+                                                 configured mempool explorer: the channel-open funding tx,
+                                                 the drain swap's lockup tx (Boltz's on-chain lockup), and
+                                                 the recycle/claim sweep that returns funds on-chain. Shown
+                                                 as each becomes available so there is always a link to
+                                                 whatever tx the round is currently waiting to confirm. -->
+                                            <template x-if="r.open_txid || r.swap_lockup_txid || r.swap_claim_txid">
+                                                <div class="flex flex-wrap items-center gap-3 mt-1">
+                                                    <template x-if="r.open_txid">
+                                                        <a :href="mempoolTxUrl(r.open_txid)" target="_blank" rel="noopener noreferrer"
+                                                           class="inline-flex items-center gap-1 text-[10px] text-neon-cyan hover:underline"
+                                                           title="View the channel-open transaction in mempool explorer">
+                                                            <i data-lucide="external-link" class="w-3 h-3"></i> Channel tx
+                                                        </a>
+                                                    </template>
+                                                    <template x-if="r.swap_lockup_txid">
+                                                        <a :href="mempoolTxUrl(r.swap_lockup_txid)" target="_blank" rel="noopener noreferrer"
+                                                           class="inline-flex items-center gap-1 text-[10px] text-neon-cyan hover:underline"
+                                                           title="View the swap lockup transaction in mempool explorer">
+                                                            <i data-lucide="external-link" class="w-3 h-3"></i> Lockup tx
+                                                        </a>
+                                                    </template>
+                                                    <template x-if="r.swap_claim_txid">
+                                                        <a :href="mempoolTxUrl(r.swap_claim_txid)" target="_blank" rel="noopener noreferrer"
+                                                           class="inline-flex items-center gap-1 text-[10px] text-neon-cyan hover:underline"
+                                                           title="View the recycle (claim) transaction in mempool explorer">
+                                                            <i data-lucide="external-link" class="w-3 h-3"></i> Recycle tx
+                                                        </a>
+                                                    </template>
+                                                </div>
+                                            </template>
                                             <template x-if="r.open_error">
                                                 <p class="text-[10px] text-neon-pink mt-1" x-text="r.open_error"></p>
                                             </template>
@@ -1102,6 +1133,15 @@
                                                 <span class="w-3 h-3 border-2 border-neon-yellow border-t-transparent rounded-full animate-spin"></span>
                                             </template>
                                         </div>
+                                        <!-- Channel-open funding tx (confirming while the channel
+                                             opens) — opens in the configured mempool explorer. -->
+                                        <template x-if="ch.open_txid">
+                                            <a :href="mempoolTxUrl(ch.open_txid)" target="_blank" rel="noopener noreferrer"
+                                               class="inline-flex items-center gap-1 text-[10px] text-neon-cyan hover:underline mt-1"
+                                               title="View the channel-open transaction in mempool explorer">
+                                                <i data-lucide="external-link" class="w-3 h-3"></i> Channel tx
+                                            </a>
+                                        </template>
                                         <template x-if="ch.open_error">
                                             <p class="text-[10px] text-neon-pink mt-1" x-text="ch.open_error"></p>
                                         </template>
@@ -1139,11 +1179,17 @@
                     <template x-if="channelPlanMode === 'executing'">
                         <div class="max-w-md mx-auto mt-4">
                             <template x-if="!channelMixCancelConfirm">
-                                <button @click="channelMixCancelConfirm = true"
-                                        class="w-full px-4 py-2 rounded-lg border text-xs transition-colors"
-                                        :class="channelMixRunNote ? 'border-neon-pink/60 text-neon-pink hover:bg-neon-pink/10' : 'border-navy-700 text-gray-500 hover:text-white hover:border-navy-600'">
-                                    Cancel run
-                                </button>
+                                <div class="space-y-3">
+                                    <button @click="channelMixCancelConfirm = true"
+                                            class="w-full px-4 py-2 rounded-lg border text-xs transition-colors"
+                                            :class="channelMixRunNote ? 'border-neon-pink/60 text-neon-pink hover:bg-neon-pink/10' : 'border-navy-700 text-gray-500 hover:text-white hover:border-navy-600'">
+                                        Cancel run
+                                    </button>
+                                    <p class="text-xs text-gray-500 text-center">
+                                        <button @click="minimizeChannelPlanner()" class="text-neon-cyan hover:underline">Back to dashboard</button>
+                                        <span class="text-gray-600"> — this keeps running in the background</span>
+                                    </p>
+                                </div>
                             </template>
                             <template x-if="channelMixCancelConfirm">
                                 <div class="bg-navy-900 border border-navy-700 rounded-lg p-4 space-y-3">
@@ -1173,7 +1219,7 @@
                 </div>
 
                 <!-- CONNECTING ───────────────────────────────────────── -->
-                <div x-show="onboardingStep === 'connecting'" class="onboarding-fade-up py-10">
+                <div x-show="onboardingStep === 'connecting' && channelPlanMode === 'wizard_choice'" class="onboarding-fade-up py-10">
                     <div class="flex items-center justify-center mb-6">
                         <div class="inline-flex items-center justify-center w-14 h-14 rounded-full bg-neon-yellow/15 border-2 border-neon-yellow/40 animate-pulse-neon">
                             <i data-lucide="zap" class="w-7 h-7 text-neon-yellow"></i>
@@ -1276,6 +1322,53 @@
 
         <template x-if="summary && !onboardingStep && !onboardingCelebrating && !channelPlannerActive">
             <div class="space-y-6">
+
+                <!-- ═══ CHANNEL-BUILD IN PROGRESS BANNER ═══
+                     Shown when a channel-mix run is tracked but its progress
+                     overlay is minimized, so the user always has a way back to
+                     the live view after a refresh or "Back to dashboard". -->
+                <template x-if="channelMixRunActive">
+                    <button @click="viewChannelMixProgress()"
+                            class="w-full flex items-center justify-between gap-3 bg-neon-cyan/10 border border-neon-cyan/40 rounded-lg px-5 py-3 hover:bg-neon-cyan/15 transition-colors text-left">
+                        <span class="flex items-center gap-3">
+                            <i data-lucide="loader" class="w-4 h-4 text-neon-cyan animate-spin"></i>
+                            <span class="text-sm text-white">
+                                <template x-if="channelMixRunIsBootstrap"><span>Building inbound liquidity…</span></template>
+                                <template x-if="!channelMixRunIsBootstrap"><span>Opening your channels…</span></template>
+                            </span>
+                        </span>
+                        <span class="text-xs text-neon-cyan font-medium">View progress →</span>
+                    </button>
+                </template>
+
+                <!-- ═══ LAST BUILD STOPPED BANNER ═══
+                     A previous inbound build ended in a failure state
+                     (partial_failure / stopped_insufficient). Surface it so the
+                     failure isn't silent, with Retry (re-open the planner
+                     pre-filled) and Dismiss. Only shown when no run is active. -->
+                <template x-if="lastFailedRun">
+                    <div class="w-full bg-neon-yellow/10 border border-neon-yellow/40 rounded-lg px-5 py-3">
+                        <div class="flex items-start justify-between gap-3 flex-wrap">
+                            <span class="flex items-start gap-3">
+                                <i data-lucide="alert-triangle" class="w-4 h-4 text-neon-yellow shrink-0 mt-0.5"></i>
+                                <span class="text-sm text-gray-200">
+                                    Your last inbound build stopped early — <span x-text="lastFailedRunReason"></span>.
+                                    <span class="text-gray-400">Your channels and funds are safe.</span>
+                                </span>
+                            </span>
+                            <span class="flex items-center gap-2 shrink-0">
+                                <button @click="retryLastFailedRun()"
+                                        class="px-3 py-1.5 rounded-lg text-xs font-medium bg-neon-cyan/15 border border-neon-cyan/40 text-neon-cyan hover:bg-neon-cyan/25 transition-colors">
+                                    Retry
+                                </button>
+                                <button @click="dismissLastFailedRun()"
+                                        class="px-3 py-1.5 rounded-lg text-xs border border-navy-700 text-gray-400 hover:text-white hover:border-navy-600 transition-colors">
+                                    Dismiss
+                                </button>
+                            </span>
+                        </div>
+                    </div>
+                </template>
 
                 <!-- ═══ BALANCE CARDS ═══ -->
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">

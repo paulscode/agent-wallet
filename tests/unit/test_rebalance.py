@@ -1709,7 +1709,11 @@ class TestSendPaymentV2EdgeCases:
         assert err is None and data is not None
         body = captured["kwargs"]["json"]
         assert body["payment_request"] == "lnbc1..."
-        assert body["outgoing_chan_id"] == "111"
+        # First-hop pin uses the repeated ``outgoing_chan_ids`` field (the
+        # singular is rejected by LND's REST gateway), and forces single-path.
+        assert body["outgoing_chan_ids"] == ["111"]
+        assert "outgoing_chan_id" not in body
+        assert body["max_parts"] == 1
         assert body["fee_limit_sat"] == "25"
         assert body["timeout_seconds"] == 7
         assert body["allow_self_payment"] is True

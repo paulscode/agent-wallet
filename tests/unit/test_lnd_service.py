@@ -1521,6 +1521,44 @@ class TestGetClient:
         assert result is mock_client
 
     @pytest.mark.asyncio
+    async def test_get_client_recreates_on_loop_change(self):
+        """A client cached on a *different* event loop is discarded and rebuilt.
+
+        The lnd_service singleton is reused across the Celery channel-mix
+        executor's per-tick event loops (asyncio.new_event_loop()). httpx binds
+        its pool to the loop it was created on, so a client carried over from a
+        prior, now-closed loop must not be reused (it would raise "Event loop is
+        closed"). _get_client detects the loop change via _client_loop.
+        """
+        import asyncio
+
+        svc = LNDService()
+        # Simulate a client built on a prior tick's loop.
+        stale_client = MagicMock()
+        stale_client.is_closed = False
+        svc._client = stale_client
+        svc._client_loop = asyncio.new_event_loop()  # a *different* loop
+        try:
+            result = await svc._get_client()
+            assert result is not stale_client
+            # The fresh client is bound to the loop we're actually running on.
+            assert svc._client_loop is asyncio.get_running_loop()
+        finally:
+            await svc.close()
+
+    @pytest.mark.asyncio
+    async def test_get_client_reuses_on_same_loop(self):
+        """A tracked client on the current loop is reused (no needless rebuild)."""
+        import asyncio
+
+        svc = LNDService()
+        first = await svc._get_client()
+        assert svc._client_loop is asyncio.get_running_loop()
+        second = await svc._get_client()
+        assert second is first
+        await svc.close()
+
+    @pytest.mark.asyncio
     async def test_close_client(self):
         """close() properly cleans up the client."""
         svc = LNDService()
@@ -2091,3 +2129,78 @@ class TestSendPaymentV2IgnoredPairs:
             )
         assert result is None
         assert err is not None and "hex" in err
+
+    @pytest.mark.asyncio
+    async def test_pins_first_hop_via_outgoing_chan_ids(self):
+        """The first-hop pin must use the repeated ``outgoing_chan_ids`` field
+        (array of decimal strings). The deprecated singular
+        ``outgoing_chan_id`` is dropped from LND's REST gateway on recent
+        versions and gets the whole request rejected with an "unknown field"
+        400 — no payment is ever created."""
+        from app.services.lnd_service import LNDService
+
+        svc = LNDService()
+        captured: dict = {}
+        with (
+            patch.object(
+                svc,
+                "_get_client",
+                new_callable=AsyncMock,
+                return_value=_CapturingStreamClient(_succeeded_stream(), captured),
+            ),
+            patch("app.services.lnd_service._LND_BREAKER.before_call", new_callable=AsyncMock),
+        ):
+            _result, err = await svc.send_payment_v2(
+                payment_request="lnbcrt1drain",
+                outgoing_chan_id="123456789",
+            )
+        assert err is None
+        body = captured["json"]
+        assert body.get("outgoing_chan_ids") == ["123456789"]
+        # The rejected singular form must NOT be sent.
+        assert "outgoing_chan_id" not in body
+        # A pin forces single-path (MPP would drop the pin).
+        assert body.get("max_parts") == 1
+
+    @pytest.mark.asyncio
+    async def test_pin_overrides_requested_mpp(self):
+        """Even if a caller requests MPP, a first-hop pin forces single-path."""
+        from app.services.lnd_service import LNDService
+
+        svc = LNDService()
+        captured: dict = {}
+        with (
+            patch.object(
+                svc,
+                "_get_client",
+                new_callable=AsyncMock,
+                return_value=_CapturingStreamClient(_succeeded_stream(), captured),
+            ),
+            patch("app.services.lnd_service._LND_BREAKER.before_call", new_callable=AsyncMock),
+        ):
+            await svc.send_payment_v2(
+                payment_request="lnbcrt1pin",
+                outgoing_chan_id="987654321",
+                max_parts=8,
+            )
+        assert captured["json"].get("outgoing_chan_ids") == ["987654321"]
+        assert captured["json"].get("max_parts") == 1
+
+    @pytest.mark.asyncio
+    async def test_no_chan_pin_omits_outgoing_fields(self):
+        from app.services.lnd_service import LNDService
+
+        svc = LNDService()
+        captured: dict = {}
+        with (
+            patch.object(
+                svc,
+                "_get_client",
+                new_callable=AsyncMock,
+                return_value=_CapturingStreamClient(_succeeded_stream(), captured),
+            ),
+            patch("app.services.lnd_service._LND_BREAKER.before_call", new_callable=AsyncMock),
+        ):
+            await svc.send_payment_v2(payment_request="lnbcrt1nopin")
+        assert "outgoing_chan_ids" not in captured["json"]
+        assert "outgoing_chan_id" not in captured["json"]

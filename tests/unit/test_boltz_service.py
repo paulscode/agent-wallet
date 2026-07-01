@@ -1330,6 +1330,35 @@ class TestRecoverPendingSwaps:
         assert "boom" in results[0]["error"]
 
     @pytest.mark.asyncio
+    async def test_paying_invoice_requeued_to_process_task(self, db_session):
+        """A pre-payment swap (PAYING_INVOICE) must be re-enqueued through
+        process_boltz_swap — which has the re-entrant pay step — rather than
+        only reconciled via advance_swap (which can't (re)send the payment)."""
+        svc = BoltzSwapService()
+        swap = BoltzSwap(
+            id=uuid4(),
+            api_key_id=uuid4(),
+            boltz_swap_id="stuck-paying",
+            status=SwapStatus.PAYING_INVOICE,
+            invoice_amount_sats=100000,
+            destination_address="bcrt1qdest",
+            status_history=[],
+        )
+        db_session.add(swap)
+        await db_session.commit()
+
+        with (
+            patch.object(svc, "advance_swap", new_callable=AsyncMock) as adv,
+            patch("app.tasks.boltz_tasks.process_boltz_swap") as proc,
+        ):
+            results = await svc.recover_pending_swaps(db_session)
+
+        proc.delay.assert_called_once_with(str(swap.id))
+        adv.assert_not_called()
+        assert len(results) == 1
+        assert results[0].get("requeued") is True
+
+    @pytest.mark.asyncio
     async def test_ignores_terminal_states(self, db_session):
         """Completed/failed/cancelled swaps should not be recovered."""
         svc = BoltzSwapService()

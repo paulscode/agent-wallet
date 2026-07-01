@@ -5,6 +5,120 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.17] - 2026-07-01
+
+### Fixed
+
+- **Retrying a failed inbound build now starts a fresh run.** Re-running an
+  identical plan previously returned the old, already-failed run instead of
+  launching a new one: the execute idempotency check (meant to dedupe browser
+  double-submits) matched the plan-token digest against the terminal run. The
+  `plan_token_digest` UNIQUE constraint is dropped (migration `051`) and
+  idempotency now only folds a re-submission into a **non-terminal** run;
+  double-submits and concurrent runs remain prevented by that lookup plus the
+  one-active-run guard and execute advisory lock.
+
+### Changed
+
+- Refreshed the local test environment to the pinned dependency floors
+  (fastapi, httpx, hypothesis) and updated two stale tests — the onboarding-skip
+  storage test (now asserts the 0.4.6 server-side design) and the Boltz claim
+  subprocess stub (now stubs `asyncio.create_subprocess_exec`).
+
+## [0.4.16] - 2026-07-01
+
+### Added
+
+- **"Last build stopped" dashboard banner.** A failed inbound build
+  (`partial_failure` / `stopped_insufficient`) is surfaced on the summary the
+  SPA already polls, with **Retry** (re-opens the planner pre-filled so you
+  review a fresh plan and confirm) and **Dismiss** (persisted server-side, so it
+  doesn't reappear). Previously a failed build left you on the dashboard with no
+  explanation after a refresh.
+
+## [0.4.15] - 2026-07-01
+
+### Fixed
+
+- **Efficient/bootstrap builds no longer fail from the second channel on with
+  "reserved wallet balance invalidated".** LND keeps an on-chain anchor reserve
+  (~10k sat per channel, capped at 100k) to fee-bump force-closes, and it grows
+  as the builder keeps earlier drained channels open. Each round is now sized to
+  leave that reserve, and an in-flight round that hits the limit self-heals by
+  shrinking its capacity and retrying the same peer instead of cycling the peer
+  catalog.
+
+## [0.4.14] - 2026-07-01
+
+### Added
+
+- **Mempool links for every on-chain step of a bootstrap round.** The round card
+  now surfaces the drain swap's lockup and claim (recycle) txids as they appear —
+  so channel-open, lockup, and recycle each have a live "view in mempool" link
+  during their confirmation wait, not just the channel open.
+
+## [0.4.13] - 2026-07-01
+
+### Fixed
+
+- **First-hop-pinned Lightning payments now work.** The bootstrap "recycle"
+  drain, the Braiins channel-open drain, circular rebalancing, and Anonymize
+  self-pay pinned the outgoing channel with a field recent LND rejects
+  (`outgoing_chan_id`), so the payment was never created and the step stalled at
+  "Sending over Lightning". Pins now use the repeated `outgoing_chan_ids` field
+  and force single-path (LND drops a pin when MPP is enabled).
+
+## [0.4.12] - 2026-07-01
+
+### Added
+
+- **Mempool-explorer link icons on the channel-setup progress views.** Wherever
+  a step waits for an on-chain transaction to confirm (Efficient/bootstrap rounds
+  and multi-channel opens), the transaction opens in the configured mempool
+  explorer. The run-progress poller also re-renders icons each tick.
+
+## [0.4.11] - 2026-07-01
+
+### Fixed
+
+- **Interrupted inbound swaps recover instead of hanging at "Sending over
+  Lightning".** A reverse swap interrupted at the pay step (e.g. an app update
+  restarting the worker) was stranded in `paying_invoice` with no Lightning
+  payment ever sent. The pay step is now re-entrant — it re-sends only when LND
+  confirms no payment is live (never double-paying) — and crash recovery routes
+  pre-payment swaps back through the pay driver.
+
+## [0.4.10] - 2026-07-01
+
+### Fixed
+
+- **The channel-build progress view survives a page refresh.** Reloading
+  mid-build dropped you on the dashboard with no way back to the live progress.
+  The in-flight run is surfaced on the wallet summary and restored on load; the
+  progress view can be minimized ("Back to dashboard") and reopened via a
+  dashboard banner while it runs in the background.
+
+## [0.4.9] - 2026-07-01
+
+### Fixed
+
+- **Automated channel opens wait for the peer to actually connect.** `connect`
+  is asynchronous (it returns before the handshake completes), so `open_channel`
+  raced ahead and was rejected with "peer … is not online". The
+  bootstrap/parallel executors now poll until the peer is connected before
+  opening, then fall back to the next peer if it never comes online.
+
+## [0.4.8] - 2026-07-01
+
+### Fixed
+
+- **Automated channel building no longer wedges with "Event loop is closed".**
+  The shared LND HTTP client was bound to a Celery tick's event loop and reused
+  on the next tick's (closed) loop, permanently stalling a run after the first
+  tick. The client is now rebuilt per worker loop (and closed cleanly at tick
+  end). A transient "peer not online" on open is also retried on the same peer
+  before escalating.
+
 ## [0.4.7] - 2026-06-30
 
 ### Fixed

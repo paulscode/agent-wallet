@@ -149,10 +149,17 @@ class ChannelMixRun(Base):
     # and is mapped to the existing run instead of opening every
     # channel twice. The token itself isn't stored — only its digest,
     # so an attacker reading this column can't replay the token.
+    # Indexed but NOT unique: the execute endpoint folds a *re-submitted*
+    # plan (browser double-submit) into the in-flight run via a lookup scoped
+    # to non-terminal states, and the one-active-run guard + advisory lock
+    # prevent two concurrent runs. A UNIQUE constraint here would instead make
+    # it impossible to ever re-run an identical plan after the previous one
+    # ended (e.g. a user retrying a failed build with the same target), since
+    # the idempotency lookup would return the old terminal run forever.
     plan_token_digest: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        unique=True,
+        index=True,
     )
 
     # Overall lifecycle state — drives the polling endpoint's

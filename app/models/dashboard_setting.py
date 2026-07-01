@@ -25,6 +25,11 @@ from app.core.database import Base
 # Setting key: the node pubkey the onboarding wizard was dismissed for.
 ONBOARDING_DISMISSED_PUBKEY_KEY = "onboarding_dismissed_pubkey"
 
+# Setting key: the id of the most recent failed channel-mix run the user
+# dismissed from the dashboard "last build stopped" banner, so it doesn't
+# reappear after they've acknowledged it.
+LAST_FAILED_MIX_RUN_DISMISSED_KEY = "last_failed_mix_run_dismissed_id"
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -45,4 +50,8 @@ class DashboardSetting(Base):
     )
 
 
-__all__ = ["DashboardSetting", "ONBOARDING_DISMISSED_PUBKEY_KEY"]
+__all__ = [
+    "DashboardSetting",
+    "ONBOARDING_DISMISSED_PUBKEY_KEY",
+    "LAST_FAILED_MIX_RUN_DISMISSED_KEY",
+]

@@ -761,6 +761,76 @@ async def get_summary(db: AsyncSession = Depends(get_db)) -> Any:
         data["onboarding_dismissed"] = await _onboarding_dismissed_for_current_node(
             db, node_pubkey
         )
+        # Surface any in-flight channel-mix run so the SPA can restore its
+        # progress view after a page refresh (the run id lives only in
+        # front-end state otherwise, so a reload would silently orphan a
+        # long-running bootstrap). The one-active-run guard guarantees at most
+        # one non-terminal run. Query the model directly (rather than importing
+        # app.api.channel_mix) to avoid pulling that module's request models
+        # into scope here.
+        from sqlalchemy import select as _select
+
+        from app.models.channel_mix_run import (
+            ChannelMixRun,
+            ChannelMixRunState,
+        )
+        from app.models.dashboard_setting import (
+            LAST_FAILED_MIX_RUN_DISMISSED_KEY,
+        )
+
+        active = (
+            await db.execute(
+                _select(ChannelMixRun)
+                .where(
+                    ChannelMixRun.state.in_(
+                        (
+                            ChannelMixRunState.QUEUED,
+                            ChannelMixRunState.IN_PROGRESS,
+                            ChannelMixRunState.AWAITING_FUNDS,
+                        )
+                    )
+                )
+                .order_by(ChannelMixRun.started_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        data["active_channel_mix_run_id"] = str(active.id) if active else None
+        data["active_channel_mix_run_mode"] = active.mode if active else None
+
+        # Surface the most recent *failed* run (partial_failure /
+        # stopped_insufficient) so the dashboard can show a "last build stopped
+        # — Retry / Dismiss" banner. Only when there's no active run (that
+        # banner takes precedence) and the user hasn't dismissed this run.
+        data["last_failed_channel_mix_run"] = None
+        if active is None:
+            failed = (
+                await db.execute(
+                    _select(ChannelMixRun)
+                    .where(
+                        ChannelMixRun.state.in_(
+                            (
+                                ChannelMixRunState.PARTIAL_FAILURE,
+                                ChannelMixRunState.STOPPED_INSUFFICIENT,
+                            )
+                        )
+                    )
+                    .order_by(ChannelMixRun.started_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if failed is not None:
+                dismissed_id = await _get_dashboard_setting(
+                    db, LAST_FAILED_MIX_RUN_DISMISSED_KEY
+                )
+                if dismissed_id != str(failed.id):
+                    data["last_failed_channel_mix_run"] = {
+                        "id": str(failed.id),
+                        "mode": failed.mode,
+                        "state": failed.state.value,
+                        "target_inbound_sats": failed.target_inbound_sats,
+                        "realized_inbound_sats": int(failed.realized_inbound_sats or 0),
+                        "error_message": failed.error_message,
+                    }
     return data
 
 
@@ -2233,6 +2303,13 @@ class _DashChannelMixStopRequest(BaseModel):
     force: bool = False
 
 
+class _DashChannelMixDismissRequest(BaseModel):
+    """Body for dismissing the "last build stopped" banner — the failed
+    run's id, so the summary stops surfacing that specific run."""
+
+    run_id: UUID
+
+
 async def _dash_build_plan(request: _DashChannelMixPlanRequest):
     """Run the planner on behalf of the dashboard SPA.
 
@@ -2372,22 +2449,34 @@ async def channel_mix_execute(
         )
 
     # Idempotency: a re-submitted execute call carries the same
-    # ``plan_token``. Map duplicates back to the original run so a
-    # browser retry / network hiccup doesn't open every channel twice;
-    # the DB-level ``UNIQUE`` constraint on ``plan_token_digest`` is the
-    # backstop if two requests race past this lookup.
+    # ``plan_token``. Fold duplicates back into the in-flight run so a browser
+    # retry / network hiccup doesn't open every channel twice — but ONLY match
+    # a *non-terminal* run. A terminal run with the same digest means the user
+    # is deliberately re-running that plan (e.g. retrying a failed build with
+    # the same target), which must start fresh rather than return the old dead
+    # run. The one-active-run guard + advisory lock below prevent two
+    # concurrent runs regardless of digest.
     from app.services.channel_mix_plan_token import plan_token_digest
     from sqlalchemy.exc import IntegrityError as _IntegrityError
 
     token_digest = plan_token_digest(body.plan_token)
+    _NON_TERMINAL = (
+        ChannelMixRunState.QUEUED,
+        ChannelMixRunState.IN_PROGRESS,
+        ChannelMixRunState.AWAITING_FUNDS,
+    )
     existing = (
         await db.execute(
-            select(ChannelMixRun).where(ChannelMixRun.plan_token_digest == token_digest)
+            select(ChannelMixRun)
+            .where(
+                ChannelMixRun.plan_token_digest == token_digest,
+                ChannelMixRun.state.in_(_NON_TERMINAL),
+            )
+            .order_by(ChannelMixRun.started_at.desc())
+            .limit(1)
         )
     ).scalar_one_or_none()
     if existing is not None:
-        # Idempotent replay: return 200 OK (the default for this route),
-        # not 201 Created, since no new row was created.
         return {
             "mix_run_id": str(existing.id),
             "state": existing.state.value,
@@ -2398,9 +2487,8 @@ async def channel_mix_execute(
     # executes (recovery plan §2) — no-op on SQLite (tests).
     await _acquire_execute_lock(db)
 
-    # One-active-run guard (plan §6a): never start a second capital-
-    # consuming loop while one is in flight. Return the in-flight run so
-    # the UI resumes its progress view.
+    # One-active-run guard (plan §6a): never start a second capital-consuming
+    # loop while one is in flight. Return the in-flight run so the UI resumes.
     active = await _active_run(db)
     if active is not None:
         return {
@@ -2597,6 +2685,24 @@ async def channel_mix_run_stop(
         "mode": run.mode,
         "stop_requested": bool(run.stop_requested),
     }
+
+
+@router.post(
+    "/channel-mix/last-failed/dismiss",
+    dependencies=[Depends(_require_auth_csrf)],
+)
+async def channel_mix_last_failed_dismiss(
+    body: _DashChannelMixDismissRequest,
+    db: AsyncSession = Depends(get_db),
+) -> Any:
+    """Record that the user dismissed the "last build stopped" banner for a
+    given failed run, so the summary stops surfacing it."""
+    from app.models.dashboard_setting import LAST_FAILED_MIX_RUN_DISMISSED_KEY
+
+    await _set_dashboard_setting(
+        db, LAST_FAILED_MIX_RUN_DISMISSED_KEY, str(body.run_id)
+    )
+    return {"dismissed": str(body.run_id)}
 
 
 # ── Onboarding funding recommender ───────────────────────────────────

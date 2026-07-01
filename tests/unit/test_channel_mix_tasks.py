@@ -42,12 +42,17 @@ class _FakeLnd:
         # behaviour[pubkey] in {"open_ok", "connect_fail", "open_fail"}
         self.behaviour = behaviour
         self.active_pubkeys: list[str] = []
+        self.connected: set[str] = set()
 
     async def connect_peer(self, pubkey: str, host: str):
         outcome = self.behaviour.get(pubkey, "open_ok")
         if outcome == "connect_fail":
             return False, "peer unreachable"
+        self.connected.add(pubkey)
         return True, None
+
+    async def list_peer_pubkeys(self):
+        return set(self.connected), None
 
     async def open_channel(
         self,
@@ -282,9 +287,14 @@ class _StuckParallelLnd:
     def __init__(self, *, dead: bool):
         self.dead = dead
         self.active_pubkeys: list[str] = []
+        self.connected: set[str] = set()
 
     async def connect_peer(self, pubkey, host):
+        self.connected.add(pubkey)
         return True, None
+
+    async def list_peer_pubkeys(self):
+        return set(self.connected), None
 
     async def open_channel(self, node_pubkey_hex, local_funding_amount,
                            sat_per_vbyte=None, push_sat=0, private=False):

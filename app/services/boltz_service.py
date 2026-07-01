@@ -2053,6 +2053,28 @@ class BoltzSwapService:
         results = []
         for swap in pending_swaps:
             try:
+                # Pre-payment states (CREATED / PAYING_INVOICE) need the full
+                # pay driver, not just reconciliation: a swap interrupted at
+                # the pay step (worker restart / app redeploy) has no live LN
+                # payment, and advance_swap can only poll Boltz — which never
+                # progresses because Boltz never saw an HTLC. Re-enqueue
+                # process_boltz_swap so its (re-entrant, double-pay-safe) pay
+                # step runs. advance_swap alone is right for post-payment
+                # states (INVOICE_PAID / CLAIMING / CLAIMED), which only need
+                # reconciliation and the claim.
+                if swap.status in (SwapStatus.CREATED, SwapStatus.PAYING_INVOICE):
+                    from app.tasks.boltz_tasks import process_boltz_swap
+
+                    process_boltz_swap.delay(str(swap.id))
+                    results.append(
+                        {
+                            "boltz_swap_id": swap.boltz_swap_id,
+                            "status": swap.status.value,
+                            "error": None,
+                            "requeued": True,
+                        }
+                    )
+                    continue
                 _, err = await self.advance_swap(db, swap)
                 results.append(
                     {

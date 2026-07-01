@@ -130,6 +130,8 @@ class TestRunProcessSwap:
         swap.invoice_amount_sats = 100000
         swap.boltz_invoice = "lnbcrt1..."
         swap.status_history = []
+        # Un-pinned payment (no first-hop pin) → MPP should be enabled.
+        swap.outgoing_chan_id = None
 
         mock_db = self._make_mock_db(swap=swap)
 
@@ -162,8 +164,9 @@ class TestRunProcessSwap:
 
     @pytest.mark.asyncio
     async def test_pins_outgoing_chan_id_when_set(self):
-        """A swap carrying ``outgoing_chan_id`` (Braiins channel-open
-        pinning) must forward it to send_payment_v2; else None."""
+        """A swap carrying ``outgoing_chan_id`` (bootstrap drain / Braiins
+        channel-open pinning) must forward it to send_payment_v2 AND disable
+        MPP (max_parts=1) — LND drops the pin when max_parts>1."""
         from app.tasks.boltz_tasks import _run_process_swap
 
         swap = MagicMock()
@@ -188,6 +191,76 @@ class TestRunProcessSwap:
 
         _, call_kwargs = mock_lnd.send_payment_v2.call_args
         assert call_kwargs.get("outgoing_chan_id") == "123x456x0"
+        assert int(call_kwargs.get("max_parts") or 0) == 1, "a pinned payment must disable MPP"
+
+    @pytest.mark.asyncio
+    async def test_reattempts_payment_when_paying_invoice_has_no_live_payment(self):
+        """A swap stranded in PAYING_INVOICE (interrupted before the payment
+        registered in LND) must re-attempt the payment when LND confirms no
+        live payment exists — otherwise it hangs at "Sending over Lightning"
+        forever (Boltz never sees an HTLC, so advance_swap can't progress)."""
+        from app.tasks.boltz_tasks import _run_process_swap
+
+        swap = MagicMock()
+        swap.status = SwapStatus.PAYING_INVOICE
+        swap.invoice_amount_sats = 100000
+        swap.boltz_invoice = "lnbcrt1..."
+        swap.lnd_payment_hash = "phX"
+        swap.status_history = []
+
+        mock_db = self._make_mock_db(swap=swap)
+        mock_lnd = MagicMock()
+        # No live payment for this invoice → safe to (re)send.
+        mock_lnd.lookup_payment = AsyncMock(
+            return_value=({"status": "UNKNOWN", "payment_hash": "phX"}, None)
+        )
+        mock_lnd.send_payment_v2 = AsyncMock(return_value=({"payment_hash": "phX"}, None))
+        mock_boltz = MagicMock()
+        mock_boltz.advance_swap = AsyncMock(return_value=(swap, None))
+
+        with (
+            patch("app.core.database.get_db_context", _mock_db_ctx(mock_db)),
+            patch("app.services.lnd_service.LNDService", return_value=mock_lnd),
+            patch("app.services.boltz_service.BoltzSwapService", return_value=mock_boltz),
+        ):
+            await _run_process_swap(str(uuid4()))
+
+        mock_lnd.lookup_payment.assert_called_once_with("phX")
+        mock_lnd.send_payment_v2.assert_called_once()
+        assert swap.status == SwapStatus.INVOICE_PAID
+
+    @pytest.mark.asyncio
+    async def test_does_not_repay_when_payment_in_flight(self):
+        """A PAYING_INVOICE swap whose LN payment is genuinely in-flight must
+        NOT be re-paid — just reconciled — so we never double-pay."""
+        from app.tasks.boltz_tasks import _run_process_swap
+
+        swap = MagicMock()
+        swap.status = SwapStatus.PAYING_INVOICE
+        swap.invoice_amount_sats = 100000
+        swap.boltz_invoice = "lnbcrt1..."
+        swap.lnd_payment_hash = "phX"
+        swap.status_history = []
+
+        mock_db = self._make_mock_db(swap=swap)
+        mock_lnd = MagicMock()
+        mock_lnd.lookup_payment = AsyncMock(
+            return_value=({"status": "IN_FLIGHT", "payment_hash": "phX"}, None)
+        )
+        mock_lnd.send_payment_v2 = AsyncMock(return_value=({"payment_hash": "phX"}, None))
+        mock_boltz = MagicMock()
+        mock_boltz.advance_swap = AsyncMock(return_value=(swap, None))
+
+        with (
+            patch("app.core.database.get_db_context", _mock_db_ctx(mock_db)),
+            patch("app.services.lnd_service.LNDService", return_value=mock_lnd),
+            patch("app.services.boltz_service.BoltzSwapService", return_value=mock_boltz),
+        ):
+            await _run_process_swap(str(uuid4()))
+
+        mock_lnd.send_payment_v2.assert_not_called()
+        assert swap.status == SwapStatus.PAYING_INVOICE
+        mock_boltz.advance_swap.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_definitive_payment_failure_marks_failed(self):

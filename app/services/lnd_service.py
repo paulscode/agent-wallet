@@ -244,6 +244,13 @@ class LNDService:
 
     def __init__(self) -> None:
         self._client: Optional[httpx.AsyncClient] = None
+        # The event loop the cached client is bound to. httpx.AsyncClient ties
+        # its connection pool to the loop it was created on; the Celery
+        # channel-mix executor runs each tick on a fresh loop
+        # (asyncio.new_event_loop()), so a client cached from a prior tick would
+        # raise "Event loop is closed". We recreate the client whenever the
+        # running loop differs from the one it was built on.
+        self._client_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _get_headers(self) -> dict:
         """Build authentication headers for LND REST API."""
@@ -280,7 +287,32 @@ class LNDService:
         return None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the HTTP client."""
+        """Get or create the HTTP client.
+
+        The client is cached, but bound to the event loop it was created on. If
+        the running loop has changed since (e.g. a new Celery-tick loop), the
+        cached client's pool belongs to a now-closed loop and any use raises
+        "Event loop is closed" — so we discard it and build a fresh one.
+        """
+        try:
+            running_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        # Only discard when we KNOW the cached client was built on a *different*
+        # loop (self._client_loop is set and differs). A None _client_loop means
+        # the client wasn't created through this method's tracking path (e.g. a
+        # test-injected mock) — leave it alone.
+        loop_changed = (
+            running_loop is not None
+            and self._client_loop is not None
+            and self._client_loop is not running_loop
+        )
+        if loop_changed and self._client is not None:
+            # Abandon the stale client (its loop is gone — we can't await
+            # aclose() on it). Dropping the reference lets it be GC'd.
+            self._client = None
+
         if self._client is None or self._client.is_closed:
             is_onion = _is_onion_url(settings.lnd_rest_url)
 
@@ -308,6 +340,7 @@ class LNDService:
                 # replayed to a host an upstream 30x points at.
                 follow_redirects=False,
             )
+            self._client_loop = running_loop
         return self._client
 
     async def close(self) -> None:
@@ -315,6 +348,7 @@ class LNDService:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+            self._client_loop = None
 
     async def _request(
         self,
@@ -1335,10 +1369,23 @@ class LNDService:
             "allow_self_payment": bool(allow_self_payment),
             "no_inflight_updates": True,
         }
-        if max_parts is not None and int(max_parts) > 0:
-            body["max_parts"] = int(max_parts)
         if outgoing_chan_id:
-            body["outgoing_chan_id"] = outgoing_chan_id
+            # Pin the first hop. Use the repeated ``outgoing_chan_ids`` field,
+            # NOT the singular ``outgoing_chan_id``: the latter is deprecated in
+            # routerrpc and dropped from LND's REST gateway on recent versions,
+            # which then reject the whole request with
+            # ``unknown field "outgoing_chan_id"`` (HTTP 400) — no payment is
+            # ever created, so a pinned send (bootstrap drain, Braiins
+            # channel-open drain) loops forever as a "transient" error.
+            # Repeated uint64 marshals as an array of decimal strings.
+            body["outgoing_chan_ids"] = [str(outgoing_chan_id)]
+            # A first-hop pin and MPP are mutually exclusive: LND silently
+            # drops the pin when max_parts>1 (parts may need different first
+            # hops), routing the payment off the pinned channel. Force
+            # single-path whenever a pin is set so the pin always holds.
+            body["max_parts"] = 1
+        elif max_parts is not None and int(max_parts) > 0:
+            body["max_parts"] = int(max_parts)
         if ignored_pairs:
             encoded_pairs: list[dict[str, str]] = []
             for from_hex, to_hex in ignored_pairs:

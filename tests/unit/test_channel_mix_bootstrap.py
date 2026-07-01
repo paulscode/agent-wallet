@@ -232,24 +232,43 @@ class _BootLnd:
     """Stub LND for the bootstrap round driver."""
 
     def __init__(self, *, confirmed=600_000, active=True, open_ok=True,
-                 local_balance=400_000):
+                 local_balance=400_000, reserved_anchor=0, open_error_msg=None):
         self.confirmed = confirmed
         self.active = active
         self.open_ok = open_ok
         self.local_balance = local_balance
+        self.reserved_anchor = reserved_anchor
+        # When set, open_channel returns this error (used to simulate LND's
+        # "reserved wallet balance invalidated" rejection). Overrides open_ok.
+        self.open_error_msg = open_error_msg
         self.opened: list[str] = []
+        self.open_attempts: list[int] = []
+        self.connected: set[str] = set()
 
     async def get_wallet_balance(self):
         return (
-            {"confirmed_balance": self.confirmed, "total_balance": self.confirmed},
+            {
+                "confirmed_balance": self.confirmed,
+                "total_balance": self.confirmed,
+                "reserved_balance_anchor_chan": self.reserved_anchor,
+            },
             None,
         )
 
     async def connect_peer(self, pubkey, host):
+        self.connected.add(pubkey)
         return {}, None
+
+    async def list_peer_pubkeys(self):
+        # connect_peer records the peer; the round driver waits on this to
+        # confirm the connection landed before opening.
+        return set(self.connected), None
 
     async def open_channel(self, node_pubkey_hex, local_funding_amount,
                            sat_per_vbyte=None, push_sat=0, private=False):
+        self.open_attempts.append(int(local_funding_amount))
+        if self.open_error_msg is not None:
+            return None, self.open_error_msg
         if not self.open_ok:
             return None, "funding broadcast rejected"
         self.opened.append(node_pubkey_hex)
@@ -356,7 +375,9 @@ def _patch_ctx_and_lnd(monkeypatch, session_factory, lnd):
     )
 
 
-def _make_boltz_swap(swap_id, *, status, claim_txid=None, onchain=None, invoice=300_000):
+def _make_boltz_swap(
+    swap_id, *, status, claim_txid=None, lockup_txid=None, onchain=None, invoice=300_000
+):
     """Persist-ready BoltzSwap row in a given terminal/in-flight status."""
     from app.models.boltz_swap import BoltzSwap
 
@@ -368,6 +389,7 @@ def _make_boltz_swap(swap_id, *, status, claim_txid=None, onchain=None, invoice=
         destination_address="bc1qclaim",
         status=status,
         claim_txid=claim_txid,
+        lockup_txid=lockup_txid,
         onchain_amount_sats=onchain,
     )
 
@@ -447,6 +469,82 @@ class TestBootstrapExecutor:
         assert row.channels[0]["state"] == "open_pending"
         assert row.channels[0]["open_txid"]
         assert lnd.opened, "expected a channel-open call"
+
+    @pytest.mark.asyncio
+    async def test_reserves_for_existing_anchor_channels(
+        self, monkeypatch, session_factory
+    ):
+        """A round opened while earlier anchor channels are still open must
+        leave room for LND's growing anchor reserve (10k per channel) — the
+        capacity is smaller by exactly one reserve unit vs. the first channel,
+        so LND doesn't reject with "reserved wallet balance invalidated"."""
+        from app.tasks import channel_mix_tasks as cmix
+
+        caps = {}
+        for reserved in (0, cmix.BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN):
+            async with session_factory() as s:
+                run = _bootstrap_run(target=100_000_000)
+                s.add(run)
+                await s.commit()
+                await s.refresh(run)
+                run_id = run.id
+            lnd = _BootLnd(confirmed=300_000, active=False, reserved_anchor=reserved)
+            _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+            await cmix._run_one_mix(run_id)
+            async with session_factory() as s:
+                row = (
+                    await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+                ).scalar_one()
+            caps[reserved] = row.channels[0]["capacity_sats"]
+
+        # One existing anchor channel → 10k less capacity than none.
+        assert caps[0] - caps[cmix.BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN] == (
+            cmix.BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN
+        )
+
+    @pytest.mark.asyncio
+    async def test_reserve_error_shrinks_capacity_same_peer(
+        self, monkeypatch, session_factory
+    ):
+        """An in-flight round whose open hits LND's anchor-reserve check must
+        shrink its capacity and retry the SAME peer (the error is wallet-level,
+        not peer-specific — cycling peers would be futile)."""
+        from app.tasks import channel_mix_tasks as cmix
+
+        entry = make_bootstrap_round_entry(
+            round_index=0,
+            peer_alias="p0",
+            peer_pubkey="00" * 33,
+            peer_host="p0:9735",
+            capacity_sats=400_000,
+            drain_target_sats=300_000,
+            spendable_before_sats=500_000,
+            state="opening",
+        )
+        lnd = _BootLnd(
+            open_error_msg=(
+                'LND error (500): {"code":2, "message":"reserved wallet balance '
+                'invalidated: transaction would leave insufficient funds..."}'
+            )
+        )
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[entry])
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            original = run.channels[0]["peer_pubkey"]
+
+            await cmix._advance_bootstrap_round(s, run, 0)
+
+            assert run.channels[0]["peer_pubkey"] == original  # same peer
+            assert run.channels[0]["state"] == "opening"
+            assert run.channels[0]["capacity_sats"] == (
+                400_000 - cmix.BOOTSTRAP_ANCHOR_RESERVE_PER_CHAN
+            )
+            assert run.channels[0]["reserve_shrink_attempts"] == 1
+            assert lnd.opened == []  # never broadcast a funding tx
 
     @pytest.mark.asyncio
     async def test_large_balance_caps_round_capacity(
@@ -543,6 +641,109 @@ class TestBootstrapExecutor:
                 await cmix._advance_bootstrap_round(s, run, 0)
 
             # Escalated to a different (real catalog) peer; still trying.
+            assert run.channels[0]["peer_pubkey"] != original
+            assert run.channels[0]["state"] == "opening"
+
+    @pytest.mark.asyncio
+    async def test_open_peer_not_online_retries_same_peer(
+        self, monkeypatch, session_factory
+    ):
+        """"peer not online" from open (right after a successful connect) is a
+        transient LND race — retry the SAME peer a bounded number of ticks
+        before escalating, rather than burning through the peer catalog."""
+        from app.tasks import channel_mix_tasks as cmix
+
+        class _NotOnlineThenOkLnd(_BootLnd):
+            def __init__(self, *, fail_first: int, **kw):
+                super().__init__(**kw)
+                self._fail_first = fail_first
+                self.open_calls = 0
+
+            async def open_channel(self, node_pubkey_hex, local_funding_amount,
+                                   sat_per_vbyte=None, push_sat=0, private=False):
+                self.open_calls += 1
+                if self.open_calls <= self._fail_first:
+                    return None, "LND error (500): peer 00 is not online"
+                self.opened.append(node_pubkey_hex)
+                return {"funding_txid": "cd" * 32, "output_index": 0}, None
+
+        # Fails "not online" once, then succeeds — should stay on the same peer.
+        lnd = _NotOnlineThenOkLnd(fail_first=1)
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+
+        entry = make_bootstrap_round_entry(
+            round_index=0,
+            peer_alias="p0",
+            peer_pubkey="00" * 33,
+            peer_host="p0:9735",
+            capacity_sats=400_000,
+            drain_target_sats=300_000,
+            spendable_before_sats=500_000,
+            state="opening",
+        )
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[entry])
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            original = run.channels[0]["peer_pubkey"]
+
+            # Tick 1: open rejected "not online" → transient retry, same peer.
+            await cmix._advance_bootstrap_round(s, run, 0)
+            assert run.channels[0]["peer_pubkey"] == original
+            assert run.channels[0]["state"] == "opening"
+            assert run.channels[0]["connect_attempts"] == 1
+
+            # Tick 2: open succeeds → advances to open_pending, same peer.
+            await cmix._advance_bootstrap_round(s, run, 0)
+            assert run.channels[0]["peer_pubkey"] == original
+            assert run.channels[0]["state"] == "open_pending"
+
+    @pytest.mark.asyncio
+    async def test_peer_never_comes_online_escalates(
+        self, monkeypatch, session_factory
+    ):
+        """connect_peer succeeds but the peer never shows in ListPeers (the
+        connection never lands): the in-tick wait must escalate to the next
+        peer after the bounded retries rather than open into a dead peer."""
+        from app.tasks import channel_mix_tasks as cmix
+
+        # Probe once per tick, no sleeps, so the test is fast.
+        monkeypatch.setattr(cmix, "BOOTSTRAP_PEER_CONNECT_WAIT_POLLS", 1)
+
+        class _ConnectButNeverOnlineLnd(_BootLnd):
+            async def connect_peer(self, pubkey, host):
+                # Reports success but never records the peer as connected,
+                # so list_peer_pubkeys keeps returning an empty set.
+                return {}, None
+
+        lnd = _ConnectButNeverOnlineLnd()
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+
+        entry = make_bootstrap_round_entry(
+            round_index=0,
+            peer_alias="p0",
+            peer_pubkey="00" * 33,
+            peer_host="p0:9735",
+            capacity_sats=400_000,
+            drain_target_sats=300_000,
+            spendable_before_sats=500_000,
+            state="opening",
+        )
+        async with session_factory() as s:
+            run = _bootstrap_run(channels=[entry])
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            original = run.channels[0]["peer_pubkey"]
+
+            for _ in range(cmix.BOOTSTRAP_MAX_CONNECT_ATTEMPTS):
+                await cmix._advance_bootstrap_round(s, run, 0)
+
+            # Never opened (opened list empty) and escalated to another peer.
+            assert lnd.opened == []
             assert run.channels[0]["peer_pubkey"] != original
             assert run.channels[0]["state"] == "opening"
 
@@ -807,6 +1008,47 @@ class TestBootstrapDrainFailures:
             ).scalar_one()
         assert row.channels[0]["state"] == "swap_failed"
         assert row.state == ChannelMixRunState.PARTIAL_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_swap_pending_stamps_lockup_and_claim_txids(
+        self, monkeypatch, session_factory
+    ):
+        """While the drain swap is still confirming (not COMPLETED), the round
+        entry surfaces the swap's lockup + claim txids so the progress card can
+        link them in the mempool explorer during their confirmation wait."""
+        from app.models.boltz_swap import SwapStatus
+        from app.tasks import channel_mix_tasks as cmix
+
+        swap_id = uuid4()
+        entry = _seed_round(
+            "swap_pending", swap_id=str(swap_id), expected_inbound_sats=300_000
+        )
+        lnd = _BootLnd()
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+        async with session_factory() as s:
+            # In-flight (claiming), claim broadcast but not yet confirmed.
+            s.add(_make_boltz_swap(
+                swap_id, status=SwapStatus.CLAIMING,
+                lockup_txid="aa" * 32, claim_txid="bb" * 32,
+            ))
+            run = _bootstrap_run(channels=[entry])
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        rnd = row.channels[0]
+        # Still confirming, and both on-chain txids are now surfaced for linking.
+        assert rnd["state"] == "swap_pending"
+        assert rnd["swap_lockup_txid"] == "aa" * 32
+        assert rnd["swap_claim_txid"] == "bb" * 32
 
     @pytest.mark.asyncio
     async def test_swap_status_failed_exhausts_to_swap_failed(

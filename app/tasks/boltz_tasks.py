@@ -195,8 +195,62 @@ async def _run_process_swap(swap_id: str, routing_fee_limit_percent: float = 3.0
                 logger.info("Swap %s already in terminal state: %s", swap_id, swap.status.value)
                 return {"status": swap.status.value}
 
-            # Step 1: Pay the Boltz invoice (if not already paid)
-            if swap.status == SwapStatus.CREATED:
+            # Step 1: Pay the Boltz invoice (if not already paid).
+            #
+            # Normally only CREATED swaps pay. But an interrupted tick — a
+            # worker restart or an app redeploy in the narrow window after
+            # PAYING_INVOICE is committed (below) but before/while
+            # send_payment_v2 actually registers an HTLC in LND — strands the
+            # swap in PAYING_INVOICE with no payment ever sent. The
+            # CREATED-gated block would then never re-run, so Boltz never sees
+            # an HTLC and advance_swap can't progress: the swap hangs at
+            # "Sending over Lightning" until the invoice expires. Re-attempt
+            # the payment when (and ONLY when) LND confirms no payment is live
+            # for this invoice, so we can never double-pay.
+            should_pay = swap.status == SwapStatus.CREATED
+            if swap.status == SwapStatus.PAYING_INVOICE:
+                reentry_hash = swap.lnd_payment_hash or (
+                    payment_hash_from_bolt11(swap.boltz_invoice)
+                    if swap.boltz_invoice else None
+                )
+                if reentry_hash:
+                    lookup, lookup_err = await lnd.lookup_payment(reentry_hash)
+                    if lookup_err is None and lookup is not None:
+                        pay_state = str(lookup.get("status") or "UNKNOWN").upper()
+                        if pay_state in ("FAILED", "UNKNOWN"):
+                            # No in-flight or succeeded HTLC exists — safe to
+                            # (re)send without risk of a duplicate payment.
+                            logger.warning(
+                                "Swap %s stuck in PAYING_INVOICE with no live "
+                                "LND payment (lookup=%s); re-attempting the "
+                                "invoice payment",
+                                swap_id, pay_state,
+                            )
+                            should_pay = True
+                        elif pay_state == "SUCCEEDED":
+                            # A prior tick's payment actually settled but the
+                            # status update was lost — reconcile to INVOICE_PAID
+                            # and let advance_swap carry on to the claim.
+                            swap.lnd_payment_hash = reentry_hash
+                            swap.status = SwapStatus.INVOICE_PAID
+                            if swap.error_message and swap.error_message.startswith(
+                                "Payment attempt encountered a transient"
+                            ):
+                                swap.error_message = None
+                            if swap.status_history is None:
+                                swap.status_history = []
+                            swap.status_history.append({
+                                "status": SwapStatus.INVOICE_PAID.value,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "payment_hash": reentry_hash,
+                                "reconciled": True,
+                            })
+                            await db.commit()
+                        # IN_FLIGHT → a payment is live; leave as-is and let
+                        # advance_swap reconcile against the Boltz side.
+                    # lookup_err → LND flaky; stay conservative (don't re-pay).
+
+            if should_pay:
                 logger.info("Paying Boltz invoice for swap %s", swap_id)
                 swap.status = SwapStatus.PAYING_INVOICE
                 if swap.status_history is None:
@@ -228,14 +282,22 @@ async def _run_process_swap(swap_id: str, routing_fee_limit_percent: float = 3.0
                 # stream open until the HTTP timeout, surfacing a
                 # transient ``Request failed: …`` while LND keeps the
                 # in-flight HTLC alive for reconciliation.
+                pin_chan_id = getattr(swap, "outgoing_chan_id", None) or None
+                # MPP and a first-hop pin are mutually exclusive: LND drops the
+                # pin when max_parts>1 (parts may need different first hops), so
+                # a pinned drain (bootstrap round / Braiins channel-open) MUST
+                # go single-path or it would drain the wrong channels. Only
+                # enable MPP when we are NOT pinning.
+                max_parts = 1 if pin_chan_id else int(settings.boltz_payment_max_parts)
                 pay_result, pay_error = await lnd.send_payment_v2(
                     payment_request=swap.boltz_invoice,
-                    # Pin the first hop when set (Braiins channel-open flow
-                    # drains its freshly-opened channel); None = LND routes.
-                    outgoing_chan_id=getattr(swap, "outgoing_chan_id", None) or None,
+                    # Pin the first hop when set (bootstrap drain / Braiins
+                    # channel-open flow drains its freshly-opened channel);
+                    # None = LND routes.
+                    outgoing_chan_id=pin_chan_id,
                     fee_limit_sats=fee_limit_sats,
                     timeout_seconds=120,
-                    max_parts=int(settings.boltz_payment_max_parts),
+                    max_parts=max_parts,
                 )
 
                 if pay_error:
@@ -383,6 +445,16 @@ def _run_async(coro: Any) -> Any:
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Close the shared LND client on this loop before tearing it down — the
+        # lnd_service singleton caches an httpx.AsyncClient bound to the loop it
+        # was created on, and reusing it on the next tick's loop would raise
+        # "Event loop is closed" (also avoids leaking the connection pool).
+        try:
+            from app.services.lnd_service import lnd_service
+
+            loop.run_until_complete(lnd_service.close())
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
         # Clean up pending tasks
         pending = asyncio.all_tasks(loop)
         for task in pending:

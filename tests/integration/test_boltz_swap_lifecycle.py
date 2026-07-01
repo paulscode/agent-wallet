@@ -56,18 +56,45 @@ async def service(monkeypatch):
 
 
 def _stub_node_claim(monkeypatch, *, returncode: int = 0, txid: str | None = _CLAIM_TXID):
-    """Stub the Node claim subprocess (no real secp256k1 / boltz-core)."""
+    """Stub the Node claim subprocess (no real secp256k1 / boltz-core).
+
+    The claim runs via ``asyncio.create_subprocess_exec`` +
+    ``proc.communicate()`` (moved off the blocking ``subprocess.run`` so the
+    60-120 s wait doesn't freeze the event loop); the synchronous
+    ``subprocess.run`` path is still used for keypair generation. Stub both so
+    no real Node crypto runs.
+    """
+    # Emit only a txid (no txHex) so the claim-output cross-check is skipped —
+    # building a real spendable tx is the Node script's job.
+    stdout_str = json.dumps({"txid": txid}) if returncode == 0 else ""
+    stderr_str = "" if returncode == 0 else "claim script boom"
 
     def _fake_run(cmd, *args, **kwargs):
         result = MagicMock()
         result.returncode = returncode
-        # Emit only a txid (no txHex) so the claim-output cross-check is
-        # skipped — building a real spendable tx is the Node script's job.
-        result.stdout = json.dumps({"txid": txid}) if returncode == 0 else ""
-        result.stderr = "" if returncode == 0 else "claim script boom"
+        result.stdout = stdout_str
+        result.stderr = stderr_str
         return result
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+
+    class _FakeProc:
+        def __init__(self) -> None:
+            self.returncode = returncode
+
+        async def communicate(self, input=None):  # noqa: A002 - mirror asyncio API
+            return stdout_str.encode(), stderr_str.encode()
+
+        def kill(self) -> None:
+            pass
+
+        async def wait(self) -> int:
+            return returncode
+
+    async def _fake_exec(*cmd, **kwargs):
+        return _FakeProc()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
 
 
 async def _persist(db, swap):

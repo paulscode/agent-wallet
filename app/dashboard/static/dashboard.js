@@ -1334,6 +1334,12 @@ document.addEventListener('alpine:init', () => {
         // Inline-confirm gate for the force-cancel ("Cancel run") control.
         channelMixCancelConfirm: false,
         _channelMixPollTimer: null,
+        // One-shot: re-open the progress overlay only on the first restore
+        // per page load (a mid-build refresh brings progress straight back).
+        _channelMixRestored: false,
+        // Failed-run id the user dismissed this session — optimistically hides
+        // the "last build stopped" banner before the summary poll confirms.
+        _dismissedFailedRunId: '',
         // True for a brief window after a channel first goes active
         // so the wizard's celebration view can play before the regular
         // dashboard takes over.
@@ -2070,6 +2076,10 @@ document.addEventListener('alpine:init', () => {
             // ask the server for it rather than pinning to
             // localStorage.
             this._restoreBraiinsDeposit();
+            // Channel-mix run resume — the backend surfaces the single
+            // in-flight run on the summary; restore its progress view so a
+            // refresh mid-build doesn't strand the user on the dashboard.
+            this._restoreChannelMixRun();
             // Listen for browser tab visibility changes so the
             // Braiins-Deposit list poller pauses while the user is on
             // another browser tab and resumes when they come back.
@@ -2089,6 +2099,12 @@ document.addEventListener('alpine:init', () => {
                 if (this.onboardingStep === 'ready_to_connect') {
                     this._maybePrefillOnboardingAmount();
                 }
+                // Late-arriving summary (or one that first reports an active
+                // run after the initial load) still restores the progress view.
+                this._restoreChannelMixRun();
+                // The "last build stopped" banner appears based on the summary;
+                // render its freshly-inserted Lucide icon.
+                this.$nextTick(() => this.initIcons());
             });
 
             // Auto-refresh intervals (guarded pollers)
@@ -7797,6 +7813,10 @@ document.addEventListener('alpine:init', () => {
                         '/channel-mix/runs/' + this.channelMixRunId,
                     );
                     this.channelMixRun = body;
+                    // The per-round / per-channel list re-renders with fresh
+                    // <i data-lucide> nodes (status icons + the mempool-link
+                    // icons); Lucide only processes them on demand.
+                    this.$nextTick(() => this.initIcons());
                     const state = body && body.state;
                     // ``awaiting_funds`` is a transient bootstrap state —
                     // keep polling. The rest are terminal.
@@ -7827,6 +7847,107 @@ document.addEventListener('alpine:init', () => {
                 clearInterval(this._channelMixPollTimer);
                 this._channelMixPollTimer = null;
             }
+        },
+
+        /** Resume tracking an in-flight channel-mix run after a page
+         *  refresh. The run id lives only in front-end state, so a reload
+         *  would otherwise orphan a long-running bootstrap — the backend
+         *  surfaces the active run on the summary the SPA already polls.
+         *  Re-opens the progress view once per page load (so a refresh
+         *  brings it straight back), then leaves it minimizable. */
+        _restoreChannelMixRun() {
+            const activeId = this.summary && this.summary.active_channel_mix_run_id;
+            if (!activeId) return;
+            // Already tracking it (or the user is mid-planner) — don't disturb.
+            if (this.channelMixRunId) return;
+            if (this.channelPlannerActive) return;
+            this.channelMixRunId = activeId;
+            this.channelMixRun = null;
+            // Re-open the progress overlay only on the first restore of this
+            // page load; afterwards the user can minimize and reopen via the
+            // dashboard banner without being re-trapped on every summary poll.
+            if (!this._channelMixRestored) {
+                this._channelMixRestored = true;
+                this.channelPlanMode = 'executing';
+                this.$nextTick(() => this.initIcons());
+            }
+            this._startChannelMixPolling();
+        },
+
+        /** True while a channel-mix run is being tracked — drives the
+         *  "setup in progress" dashboard banner. */
+        get channelMixRunActive() {
+            return !!this.channelMixRunId;
+        },
+
+        /** Re-open the progress view from the dashboard banner. */
+        viewChannelMixProgress() {
+            if (!this.channelMixRunId) return;
+            this.channelPlanMode = 'executing';
+            if (!this._channelMixPollTimer) this._startChannelMixPolling();
+            this.$nextTick(() => this.initIcons());
+        },
+
+        /** Leave the progress overlay without cancelling the run — polling
+         *  continues in the background and the dashboard banner offers a
+         *  way back. Distinct from closeChannelPlanner(), which resets and
+         *  stops tracking. */
+        minimizeChannelPlanner() {
+            this.channelPlanMode = 'wizard_choice';
+            // Render the banner's freshly-inserted Lucide icon.
+            this.$nextTick(() => this.initIcons());
+        },
+
+        /** The most recent *failed* channel-mix run (partial_failure /
+         *  stopped_insufficient), surfaced on the summary so the dashboard can
+         *  show a "last build stopped — Retry / Dismiss" banner. Returns null
+         *  once dismissed (optimistically hidden by id until the next summary
+         *  poll confirms the server-side dismissal). */
+        get lastFailedRun() {
+            const f = this.summary && this.summary.last_failed_channel_mix_run;
+            if (!f) return null;
+            if (f.id && f.id === this._dismissedFailedRunId) return null;
+            return f;
+        },
+
+        /** Human label for the failure reason on the banner. */
+        get lastFailedRunReason() {
+            const f = this.lastFailedRun;
+            if (!f) return '';
+            if (f.state === 'stopped_insufficient') return 'not enough recyclable balance';
+            return 'it stopped before finishing';
+        },
+
+        /** Retry a failed build: re-open the planner pre-filled with the same
+         *  inputs so the user reviews a *fresh* plan (balances/fees have moved
+         *  since the failure) before committing, then confirms as usual. Also
+         *  acknowledges the failed run so its banner won't reappear. */
+        retryLastFailedRun() {
+            const f = this.lastFailedRun;
+            if (!f) return;
+            this._acknowledgeFailedRun(f.id);
+            if (f.mode === 'bootstrap') {
+                this.openInboundBootstrap(f.target_inbound_sats);
+            } else {
+                this.openChannelPlanner();
+            }
+            this.$nextTick(() => this.initIcons());
+        },
+
+        /** Dismiss the failed-build banner without retrying. */
+        dismissLastFailedRun() {
+            const f = this.lastFailedRun;
+            if (!f) return;
+            this._acknowledgeFailedRun(f.id);
+        },
+
+        /** Persist the dismissal server-side (so it doesn't reappear on other
+         *  devices / reloads) and hide the banner immediately. Best-effort:
+         *  the optimistic local hide stands even if the POST fails. */
+        _acknowledgeFailedRun(runId) {
+            this._dismissedFailedRunId = runId;
+            this.api('POST', '/channel-mix/last-failed/dismiss', { run_id: runId })
+                .catch(() => {});
         },
 
         /** Request a cooperative stop of the running bootstrap loop after

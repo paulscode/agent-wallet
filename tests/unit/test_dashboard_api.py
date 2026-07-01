@@ -1082,3 +1082,174 @@ class TestOnboardingSkipState:
                    new_callable=AsyncMock,
                    return_value=({"node_info": {"identity_pubkey": ""}, "totals": {}}, None)):
             assert (await get_summary(db_session))["onboarding_dismissed"] is False
+
+
+class TestSummaryActiveChannelMixRun:
+    """/summary surfaces the single in-flight channel-mix run id so the SPA
+    can restore its progress view after a page refresh."""
+
+    def _make_run(self, state):
+        import hashlib
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        return ChannelMixRun(
+            api_key_id=uuid4(),
+            plan_token_digest=hashlib.sha256(uuid4().bytes).hexdigest(),
+            state=state,
+            mode="bootstrap",
+            minimum_sats=800_000,
+            recommended_sats=900_000,
+            channels=[],
+            warnings=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_active_run_surfaced(self, db_session):
+        from app.dashboard.api import get_summary
+        from app.models.channel_mix_run import ChannelMixRunState
+
+        run = self._make_run(ChannelMixRunState.IN_PROGRESS)
+        db_session.add(run)
+        await db_session.commit()
+
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock,
+                   return_value=({"node_info": {"identity_pubkey": ""}, "totals": {}}, None)):
+            data = await get_summary(db_session)
+        assert data["active_channel_mix_run_id"] == str(run.id)
+        assert data["active_channel_mix_run_mode"] == "bootstrap"
+
+    @pytest.mark.asyncio
+    async def test_terminal_run_not_surfaced(self, db_session):
+        from app.dashboard.api import get_summary
+        from app.models.channel_mix_run import ChannelMixRunState
+
+        run = self._make_run(ChannelMixRunState.COMPLETE)
+        db_session.add(run)
+        await db_session.commit()
+
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock,
+                   return_value=({"node_info": {"identity_pubkey": ""}, "totals": {}}, None)):
+            data = await get_summary(db_session)
+        assert data["active_channel_mix_run_id"] is None
+        assert data["active_channel_mix_run_mode"] is None
+
+
+class TestPlanTokenDigestNotUnique:
+    """After a build ends, an identical plan must be re-runnable — so the
+    plan_token_digest is no longer UNIQUE (two runs may share it when one is
+    terminal). Regression against the retry-returns-the-old-failed-run bug."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_digest_allowed_when_prior_run_terminal(self, db_session):
+        import hashlib
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        digest = hashlib.sha256(b"same-plan").hexdigest()
+        first = ChannelMixRun(
+            api_key_id=uuid4(),
+            plan_token_digest=digest,
+            state=ChannelMixRunState.PARTIAL_FAILURE,
+            minimum_sats=1,
+            recommended_sats=1,
+            channels=[],
+            warnings=[],
+        )
+        db_session.add(first)
+        await db_session.commit()
+
+        # Retry with the identical plan → same digest → must NOT be rejected.
+        second = ChannelMixRun(
+            api_key_id=uuid4(),
+            plan_token_digest=digest,
+            state=ChannelMixRunState.QUEUED,
+            minimum_sats=1,
+            recommended_sats=1,
+            channels=[],
+            warnings=[],
+        )
+        db_session.add(second)
+        await db_session.commit()  # would raise IntegrityError under UNIQUE
+        assert first.id != second.id
+
+
+class TestSummaryLastFailedRun:
+    """/summary surfaces the most recent failed run so the dashboard can show a
+    "last build stopped — Retry / Dismiss" banner, until it's dismissed."""
+
+    def _make_run(self, state, *, target=2_000_000):
+        import hashlib
+
+        from app.models.channel_mix_run import ChannelMixRun, ChannelMixRunState
+
+        return ChannelMixRun(
+            api_key_id=uuid4(),
+            plan_token_digest=hashlib.sha256(uuid4().bytes).hexdigest(),
+            state=state,
+            mode="bootstrap",
+            minimum_sats=800_000,
+            recommended_sats=900_000,
+            target_inbound_sats=target,
+            channels=[],
+            warnings=[],
+        )
+
+    async def _summary(self, db_session):
+        from app.dashboard.api import get_summary
+
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock,
+                   return_value=({"node_info": {"identity_pubkey": ""}, "totals": {}}, None)):
+            return await get_summary(db_session)
+
+    @pytest.mark.asyncio
+    async def test_failed_run_surfaced_then_dismissed(self, db_session):
+        from app.dashboard.api import (
+            _DashChannelMixDismissRequest,
+            channel_mix_last_failed_dismiss,
+        )
+        from app.models.channel_mix_run import ChannelMixRunState
+
+        run = self._make_run(ChannelMixRunState.PARTIAL_FAILURE)
+        db_session.add(run)
+        await db_session.commit()
+
+        data = await self._summary(db_session)
+        assert data["last_failed_channel_mix_run"] is not None
+        assert data["last_failed_channel_mix_run"]["id"] == str(run.id)
+        assert data["last_failed_channel_mix_run"]["target_inbound_sats"] == 2_000_000
+
+        # Dismiss → no longer surfaced.
+        await channel_mix_last_failed_dismiss(
+            _DashChannelMixDismissRequest(run_id=run.id), db_session
+        )
+        data = await self._summary(db_session)
+        assert data["last_failed_channel_mix_run"] is None
+
+    @pytest.mark.asyncio
+    async def test_active_run_suppresses_failed_banner(self, db_session):
+        from app.models.channel_mix_run import ChannelMixRunState
+
+        failed = self._make_run(ChannelMixRunState.STOPPED_INSUFFICIENT)
+        active = self._make_run(ChannelMixRunState.IN_PROGRESS)
+        db_session.add_all([failed, active])
+        await db_session.commit()
+
+        data = await self._summary(db_session)
+        # An in-flight run takes precedence — no failed banner.
+        assert data["active_channel_mix_run_id"] == str(active.id)
+        assert data["last_failed_channel_mix_run"] is None
+
+    @pytest.mark.asyncio
+    async def test_completed_run_is_not_a_failure(self, db_session):
+        from app.models.channel_mix_run import ChannelMixRunState
+
+        run = self._make_run(ChannelMixRunState.COMPLETE)
+        db_session.add(run)
+        await db_session.commit()
+
+        data = await self._summary(db_session)
+        assert data["last_failed_channel_mix_run"] is None

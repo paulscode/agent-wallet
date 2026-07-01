@@ -265,11 +265,23 @@ def test_channel_inbound_swap_state_session_storage_calls_present():
     assert calls, "CHANNEL_INBOUND_LOCALSTORAGE_KEY is not pinned to sessionStorage"
 
 
-def test_onboarding_skipped_remains_in_local_storage():
-    """``onboardingSkipped`` deliberately stays in ``localStorage``
-    so a dismissed wizard does not pop back up on every new tab —
-     is scoped to *ephemeral swap state*, not user preferences."""
+def test_onboarding_skip_is_server_side_not_local_storage():
+    """The onboarding-skip preference is server-side (node-scoped), NOT
+    ``localStorage``. It was moved off the browser in 0.4.6 so a dismissed
+    wizard reappears on a fresh node / fresh install rather than being silenced
+    forever by a stale per-browser flag: ``onboardingSkipped`` is derived from
+    ``summary.onboarding_dismissed`` and toggled via the /onboarding/skip and
+    /onboarding/resume endpoints."""
     text = _dashboard_js_text()
-    assert "localStorage.getItem('onboardingSkipped')" in text or 'localStorage.getItem("onboardingSkipped")' in text, (
-        "onboardingSkipped should remain a localStorage-backed preference (it is not ephemeral swap state)"
+    # Must NOT persist the skip flag in browser storage anymore.
+    assert "onboardingSkipped')" not in text and 'onboardingSkipped")' not in text, (
+        "onboardingSkipped must not be localStorage/sessionStorage-backed — "
+        "it is a server-side, node-scoped preference since 0.4.6"
+    )
+    # Must be driven by the server: the summary flag + the skip/resume API.
+    assert "onboarding_dismissed" in text, (
+        "onboardingSkipped should be derived from summary.onboarding_dismissed"
+    )
+    assert "/onboarding/skip" in text and "/onboarding/resume" in text, (
+        "skip/resume must go through the server endpoints"
     )
