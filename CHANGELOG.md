@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-06-30
+
+### Fixed
+
+- **Onboarding reliably reappears for a fresh node or a fresh install.** The
+  "skip onboarding" preference was previously a browser (`localStorage`) flag,
+  which survived an Agent Wallet / LND reinstall and differed per browser — so a
+  reinstalled or handed-on node could skip straight to the dashboard. The
+  preference is now stored server-side (in the app's database) and scoped to the
+  LND node identity, and surfaced on the wallet summary the dashboard already
+  polls. A new node (different node identity) or a fresh install (the app's data
+  is wiped on uninstall) shows the welcome wizard again, while a deliberate skip
+  still sticks for the current node across reloads, browsers, and devices.
+
+### Added
+
+- A small server-side `dashboard_settings` key/value table (created automatically
+  by a database migration on upgrade) backing the onboarding-skip flag, with
+  `POST /dashboard/api/onboarding/skip` and `/resume` endpoints.
+
 ## [0.4.5] - 2026-06-30
 
 ### Changed

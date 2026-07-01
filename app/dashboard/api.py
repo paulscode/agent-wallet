@@ -693,12 +693,96 @@ async def logout(request: Request) -> Any:
 # ── Read endpoints ───────────────────────────────────────────────────────
 
 
+# ── Server-persisted dashboard settings (tiny KV) ────────────────────────
+#
+# Home for dashboard state that must survive reloads/browser changes but
+# reset on reinstall (the browser's localStorage is the wrong place — it
+# survives an Agent Wallet / LND reinstall and differs per browser). First
+# user: the node-scoped onboarding "skip" flag.
+
+
+async def _get_dashboard_setting(db: AsyncSession, key: str) -> Optional[str]:
+    from app.models.dashboard_setting import DashboardSetting
+
+    row = (
+        await db.execute(select(DashboardSetting).where(DashboardSetting.key == key))
+    ).scalar_one_or_none()
+    return row.value if row is not None else None
+
+
+async def _set_dashboard_setting(db: AsyncSession, key: str, value: str) -> None:
+    from app.models.dashboard_setting import DashboardSetting
+
+    row = (
+        await db.execute(select(DashboardSetting).where(DashboardSetting.key == key))
+    ).scalar_one_or_none()
+    if row is None:
+        db.add(DashboardSetting(key=key, value=value))
+    else:
+        row.value = value
+    await db.commit()
+
+
+async def _delete_dashboard_setting(db: AsyncSession, key: str) -> None:
+    from app.models.dashboard_setting import DashboardSetting
+
+    row = (
+        await db.execute(select(DashboardSetting).where(DashboardSetting.key == key))
+    ).scalar_one_or_none()
+    if row is not None:
+        await db.delete(row)
+        await db.commit()
+
+
+async def _onboarding_dismissed_for_current_node(db: AsyncSession, node_pubkey: str) -> bool:
+    """True when onboarding was dismissed for THIS node. Stored server-side
+    (node-scoped) so a fresh node (different pubkey) or fresh install (empty
+    table) shows the welcome wizard again, independent of the browser."""
+    from app.models.dashboard_setting import ONBOARDING_DISMISSED_PUBKEY_KEY
+
+    if not node_pubkey:
+        return False
+    stored = await _get_dashboard_setting(db, ONBOARDING_DISMISSED_PUBKEY_KEY)
+    return stored == node_pubkey
+
+
 @router.get("/summary", dependencies=[Depends(_require_auth)])
-async def get_summary() -> Any:
+async def get_summary(db: AsyncSession = Depends(get_db)) -> Any:
     data, error = await lnd_service.get_wallet_summary()
     if error:
         return JSONResponse(status_code=502, content={"detail": sanitize_upstream_error(error, "LND")})
+    # Surface the node-scoped onboarding-skip flag on the summary the SPA
+    # already polls, so the welcome-wizard decision is reactive and needs no
+    # separate request. Empty pubkey (LND syncing) → not dismissed → the
+    # wizard shows once the wallet/node are readable.
+    node_pubkey = ""
+    if isinstance(data, dict):
+        node_pubkey = (data.get("node_info") or {}).get("identity_pubkey", "") or ""
+        data["onboarding_dismissed"] = await _onboarding_dismissed_for_current_node(
+            db, node_pubkey
+        )
     return data
+
+
+@router.post("/onboarding/skip", dependencies=[Depends(_require_auth_csrf)])
+async def onboarding_skip(db: AsyncSession = Depends(get_db)) -> Any:
+    """Record that the user dismissed onboarding for the current node."""
+    from app.models.dashboard_setting import ONBOARDING_DISMISSED_PUBKEY_KEY
+
+    info, error = await lnd_service.get_info()
+    pubkey = (info or {}).get("identity_pubkey", "") if not error else ""
+    if pubkey:
+        await _set_dashboard_setting(db, ONBOARDING_DISMISSED_PUBKEY_KEY, pubkey)
+    return {"dismissed": bool(pubkey)}
+
+
+@router.post("/onboarding/resume", dependencies=[Depends(_require_auth_csrf)])
+async def onboarding_resume(db: AsyncSession = Depends(get_db)) -> Any:
+    """Clear the onboarding-dismissed flag so the welcome wizard reappears."""
+    from app.models.dashboard_setting import ONBOARDING_DISMISSED_PUBKEY_KEY
+
+    await _delete_dashboard_setting(db, ONBOARDING_DISMISSED_PUBKEY_KEY)
+    return {"dismissed": False}
 
 
 @router.get("/tor-status", dependencies=[Depends(_require_auth)])

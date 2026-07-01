@@ -1016,3 +1016,69 @@ class TestChannelPeerCheck:
         res = await braiins_deposit_channel_peer_check(BraiinsDepositChannelPeerCheckRequest(amount_sats=10_000))
         assert res["available"] is True and res["reachable"] is False
         assert "range" in (res.get("reason") or "")
+
+
+class TestOnboardingSkipState:
+    """Server-persisted, node-scoped onboarding-skip flag (surfaced on
+    /summary as ``onboarding_dismissed``). Guarantees the welcome wizard
+    reappears on a fresh node / fresh install without any browser state."""
+
+    _PK_A = "aa" * 33
+    _PK_B = "bb" * 33
+
+    @pytest.mark.asyncio
+    async def test_skip_then_resume_roundtrip(self, db_session):
+        from app.dashboard.api import (
+            get_summary,
+            onboarding_resume,
+            onboarding_skip,
+        )
+
+        summary = {"node_info": {"identity_pubkey": self._PK_A}, "totals": {}}
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock, return_value=(summary, None)), \
+             patch("app.dashboard.api.lnd_service.get_info",
+                   new_callable=AsyncMock,
+                   return_value=({"identity_pubkey": self._PK_A}, None)):
+            # Fresh install → not dismissed → wizard shows.
+            assert (await get_summary(db_session))["onboarding_dismissed"] is False
+            # Skip → persisted for this node.
+            assert (await onboarding_skip(db_session))["dismissed"] is True
+            assert (await get_summary(db_session))["onboarding_dismissed"] is True
+            # Resume → cleared.
+            assert (await onboarding_resume(db_session))["dismissed"] is False
+            assert (await get_summary(db_session))["onboarding_dismissed"] is False
+
+    @pytest.mark.asyncio
+    async def test_dismissed_is_node_scoped(self, db_session):
+        """Dismissing for node A must NOT suppress onboarding on node B —
+        the key guarantee for a new node after an LND reinstall."""
+        from app.dashboard.api import get_summary, onboarding_skip
+
+        with patch("app.dashboard.api.lnd_service.get_info",
+                   new_callable=AsyncMock,
+                   return_value=({"identity_pubkey": self._PK_A}, None)):
+            await onboarding_skip(db_session)
+
+        # Node A: dismissed.
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock,
+                   return_value=({"node_info": {"identity_pubkey": self._PK_A}, "totals": {}}, None)):
+            assert (await get_summary(db_session))["onboarding_dismissed"] is True
+
+        # Node B (fresh node): NOT dismissed → wizard shows.
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock,
+                   return_value=({"node_info": {"identity_pubkey": self._PK_B}, "totals": {}}, None)):
+            assert (await get_summary(db_session))["onboarding_dismissed"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_pubkey_is_not_dismissed(self, db_session):
+        """LND syncing (no pubkey yet) → not dismissed, so the wizard isn't
+        wrongly suppressed."""
+        from app.dashboard.api import get_summary
+
+        with patch("app.dashboard.api.lnd_service.get_wallet_summary",
+                   new_callable=AsyncMock,
+                   return_value=({"node_info": {"identity_pubkey": ""}, "totals": {}}, None)):
+            assert (await get_summary(db_session))["onboarding_dismissed"] is False

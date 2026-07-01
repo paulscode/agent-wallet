@@ -8250,43 +8250,40 @@ document.addEventListener('alpine:init', () => {
          *  so a global flag survives an Agent Wallet / LND reinstall and
          *  would wrongly suppress onboarding for a brand-new node. Returns
          *  '' until the node pubkey is known. */
-        _onboardingSkipKey() {
-            const pk = (this.summary && this.summary.node_info
-                && this.summary.node_info.identity_pubkey) || '';
-            return pk ? ('onboardingSkipped:' + pk) : '';
-        },
-
-        /** Re-read the node-scoped skip flag from localStorage. Called once
-         *  the summary (node pubkey) is available and whenever it changes,
-         *  so a fresh node starts unskipped (onboarding shows) regardless of
-         *  any stale flag left in the browser by a previous install. */
+        /** Sync the onboarding-skip flag from the summary. The server stores
+         *  it node-scoped (``onboarding_dismissed`` on /summary), so a fresh
+         *  node (different pubkey) or fresh install (empty table) shows the
+         *  wizard again — no browser localStorage involved, so it can't leak
+         *  across reinstalls. Called after the summary loads and on every
+         *  refresh (cheap — it just reads the already-fetched summary). */
         _refreshOnboardingSkipped() {
-            const key = this._onboardingSkipKey();
-            if (!key) { this.onboardingSkipped = false; return; }
-            try { this.onboardingSkipped = localStorage.getItem(key) === '1'; }
-            catch (_e) { this.onboardingSkipped = false; }
+            this.onboardingSkipped = !!(this.summary && this.summary.onboarding_dismissed);
         },
 
-        onboardingSkip() {
-            const key = this._onboardingSkipKey();
-            try {
-                if (key) localStorage.setItem(key, '1');
-                // Drop the legacy global flag from older builds so it can't
-                // leak across nodes/reinstalls.
-                localStorage.removeItem('onboardingSkipped');
-            } catch (_e) {}
+        async onboardingSkip() {
+            // Optimistic: hide the wizard immediately.
             this.onboardingSkipped = true;
             this._clearOnboardingPlan();
             this._stopOnboardingPoller();
+            try {
+                await this.api('POST', '/onboarding/skip');
+            } catch (_e) {
+                // Best-effort — a later summary refresh reflects the truth.
+            }
+            // Refresh so the persisted flag round-trips into the summary and
+            // the watcher keeps the wizard hidden (guards against a stale
+            // in-flight poll flipping it back).
+            this.fetchSummary();
         },
 
-        onboardingResume() {
-            const key = this._onboardingSkipKey();
-            try {
-                if (key) localStorage.removeItem(key);
-                localStorage.removeItem('onboardingSkipped');
-            } catch (_e) {}
+        async onboardingResume() {
             this.onboardingSkipped = false;
+            try {
+                await this.api('POST', '/onboarding/resume');
+            } catch (_e) {
+                // Best-effort — a later summary refresh reflects the truth.
+            }
+            this.fetchSummary();
             // The watcher will start the poller again on next tick.
         },
         // Single-expression wrapper for the menu item (the CSP build
