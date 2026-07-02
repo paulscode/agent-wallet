@@ -869,6 +869,66 @@ class TestBootstrapExecutor:
         assert rnd["state"] == "settled"
         assert rnd["recycled_sats"] == 297_000
         assert rnd["swap_claim_txid"] == "ef" * 32
+
+    @pytest.mark.asyncio
+    async def test_swap_completed_without_claim_txid_still_settles(
+        self, monkeypatch, session_factory
+    ):
+        """A drain swap can reach COMPLETED with no persisted claim_txid (the
+        claim-broadcast-but-not-committed race). The recycle still succeeded, so
+        the round must settle and credit inbound rather than wedge the run —
+        the txid is only a mempool-link convenience, not a settle gate."""
+        from app.models.boltz_swap import BoltzSwap, SwapStatus
+        from app.tasks import channel_mix_tasks as cmix
+
+        swap_id = uuid4()
+        entry = make_bootstrap_round_entry(
+            round_index=0,
+            peer_alias="alpha",
+            peer_pubkey="aa" * 33,
+            peer_host="alpha:9735",
+            capacity_sats=400_000,
+            drain_target_sats=300_000,
+            spendable_before_sats=500_000,
+            state="swap_pending",
+        )
+        entry["open_txid"] = "cd" * 32
+        entry["open_output_index"] = 0
+        entry["swap_id"] = str(swap_id)
+        entry["expected_inbound_sats"] = 300_000
+        entry["open_fee_sats"] = 2_500
+
+        async with session_factory() as s:
+            s.add(BoltzSwap(
+                id=swap_id,
+                boltz_swap_id="boltz-nocl",
+                api_key_id=UUID("00000000-0000-0000-0000-da5b0a4d0000"),
+                invoice_amount_sats=300_000,
+                destination_address="bc1qclaim",
+                status=SwapStatus.COMPLETED,
+                claim_txid=None,  # never persisted
+                onchain_amount_sats=297_000,
+            ))
+            run = _bootstrap_run(channels=[entry], target=10_000_000)
+            run.state = ChannelMixRunState.IN_PROGRESS
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = run.id
+
+        lnd = _BootLnd(confirmed=5_000)
+        _patch_ctx_and_lnd(monkeypatch, session_factory, lnd)
+
+        await cmix._run_one_mix(run_id)
+
+        async with session_factory() as s:
+            row = (
+                await s.execute(select(ChannelMixRun).where(ChannelMixRun.id == run_id))
+            ).scalar_one()
+        rnd = row.channels[0]
+        assert rnd["state"] == "settled", "COMPLETED swap must settle even without claim_txid"
+        assert rnd["recycled_sats"] == 297_000
+        assert int(row.realized_inbound_sats or 0) == 300_000
         # Inbound credited = the drain amount; fees = open + (drain - recycled).
         assert row.realized_inbound_sats == 300_000
         assert row.total_fees_sats == 2_500 + (300_000 - 297_000)

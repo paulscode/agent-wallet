@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.18] - 2026-07-01
+
+### Fixed
+
+- **A recycled bootstrap round no longer wedges the whole run when its claim
+  txid wasn't recorded.** A drain reverse swap can reach `completed` (Boltz
+  settled, funds recycled on-chain) with no persisted `claim_txid` — the
+  claim-broadcast-but-not-committed race (incident 2026-06-16). The bootstrap
+  round required the txid to settle, so an otherwise-successful round stalled in
+  "recycling (confirming)" indefinitely. The round now settles on `completed`
+  regardless of the txid (which is only a mempool-link convenience); the run
+  continues to the next round with inbound correctly credited.
+
 ## [0.4.17] - 2026-07-01
 
 ### Fixed

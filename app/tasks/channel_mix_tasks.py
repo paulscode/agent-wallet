@@ -1138,13 +1138,22 @@ async def _advance_bootstrap_round(db, run: ChannelMixRun, idx: int) -> None:
             entry["swap_claim_txid"] = swap.claim_txid
         run.channels[idx] = entry
 
-        if swap.status == SwapStatus.COMPLETED and swap.claim_txid:
-            # Claim confirmed on-chain (COMPLETED already requires the
-            # claim tx to have its confirmations — see boltz advance_swap).
+        if swap.status == SwapStatus.COMPLETED:
+            # COMPLETED means Boltz settled our hold invoice — which requires
+            # our claim preimage on-chain — so the recycle succeeded and the
+            # drained funds are back in the wallet. Settle the round even if
+            # ``claim_txid`` was never persisted: a claim-broadcast-but-not-
+            # committed race (a Tor/LND blip after the claim subprocess
+            # broadcasts but before the txid commits, with Boltz settling the
+            # moment the preimage hits chain) leaves a COMPLETED swap with no
+            # recorded txid (incident 2026-06-16). The txid is only a
+            # mempool-link convenience, NOT a settle gate — requiring it wedged
+            # the whole run on an otherwise-successful round.
             recycled = int(swap.onchain_amount_sats or 0)
             drain = int(entry.get("expected_inbound_sats") or 0)
             swap_fee = max(0, drain - recycled)
-            entry["swap_claim_txid"] = swap.claim_txid
+            if swap.claim_txid:
+                entry["swap_claim_txid"] = swap.claim_txid
             entry["recycled_sats"] = recycled
             entry["swap_error"] = None
             _bootstrap_clear_waiting(run, entry)
